@@ -5936,20 +5936,15 @@ ztest_ddt_repair(ztest_ds_t *zd, uint64_t id)
 	dmu_tx_t *tx;
 	abd_t *abd;
 	blkptr_t blk;
-	int copies = 2 * ZIO_DEDUPDITTO_MIN;
 
-	blocksize = ztest_random_blocksize();
-	blocksize = MIN(blocksize, 2048);	/* because we write so many */
-
-	ztest_od_init(&od[0], id, FTAG, 0, DMU_OT_UINT64_OTHER, blocksize,
-	    0, 0);
+	ztest_od_init(&od[0], id, FTAG, 0, DMU_OT_UINT64_OTHER, 0, 0, 0);
 
 	if (ztest_object_init(zd, od, sizeof (od), B_FALSE) != 0)
 		return;
 
 	/*
 	 * Take the name lock as writer to prevent anyone else from changing
-	 * the pool and dataset properies we need to maintain during this test.
+	 * the pool and dataset properties we need to maintain during this test.
 	 */
 	rw_enter(&ztest_name_lock, RW_WRITER);
 
@@ -5969,6 +5964,30 @@ ztest_ddt_repair(ztest_ds_t *zd, uint64_t id)
 	object = od[0].od_object;
 	blocksize = od[0].od_blocksize;
 	pattern = zs->zs_guid ^ dds.dds_guid;
+
+	/*
+	 * The numbers of copies written must always be greater than or
+	 * equal to the threshold set by the dedupditto property.  This
+	 * is initialized in ztest_run() and then randomly changed by
+	 * ztest_spa_prop_get_set(), these function will never set it
+	 * larger than 2 * ZIO_DEDUPDITTO_MIN.
+	 */
+	int copies = 2 * ZIO_DEDUPDITTO_MIN;
+
+	/*
+	 * The block size is limited by DMU_MAX_ACCESS (64MB) which
+	 * caps the maximum transaction size.  A block size of up to
+	 * SPA_OLD_MAXBLOCKSIZE is allowed which results in a maximum
+	 * transaction size of: 128K * 200 (copies) = ~25MB
+	 *
+	 * The actual block size is checked here, rather than requested
+	 * above, because the way ztest_od_init() is implemented it does
+	 * not guarantee the block size requested will be used.
+	 */
+	if (blocksize > SPA_OLD_MAXBLOCKSIZE) {
+		rw_exit(&ztest_name_lock);
+		return;
+	}
 
 	ASSERT(object != 0);
 
