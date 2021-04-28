@@ -481,6 +481,12 @@ vdev_mirror_preferred_child_randomize(zio_t *zio)
 	return (mm->mm_preferred[p]);
 }
 
+static boolean_t
+vdev_mirror_child_readable(mirror_child_t *mc)
+{
+	return (mc->mc_vd != NULL && vdev_readable(mc->mc_vd));
+}
+
 /*
  * Try to find a vdev whose DTL doesn't contain the block we want to read
  * prefering vdevs based on determined load.
@@ -586,6 +592,15 @@ vdev_mirror_io_start(zio_t *zio)
 			 */
 			for (c = 0; c < mm->mm_children; c++) {
 				mc = &mm->mm_child[c];
+
+				/* Don't issue ZIOs to offline children */
+				if (!vdev_mirror_child_readable(mc)) {
+					mc->mc_error = SET_ERROR(ENXIO);
+					mc->mc_tried = 1;
+					mc->mc_skipped = 1;
+					continue;
+				}
+
 				zio_nowait(zio_vdev_child_io(zio, zio->io_bp,
 				    mc->mc_vd, mc->mc_offset,
 				    abd_alloc_sametype(zio->io_abd,
