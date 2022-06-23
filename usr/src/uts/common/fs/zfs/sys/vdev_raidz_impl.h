@@ -110,6 +110,7 @@ typedef struct raidz_col {
 	int rc_error;			/* I/O error for this device */
 	unsigned int rc_tried;		/* Did we attempt this I/O column? */
 	unsigned int rc_skipped;	/* Did we skip this I/O column? */
+	unsigned int rc_force_repair;	/* Write good data to this column */
 } raidz_col_t;
 
 typedef struct raidz_map {
