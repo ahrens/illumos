@@ -1214,8 +1214,6 @@ zvol_strategy(buf_t *bp)
 	os = zv->zv_objset;
 	ASSERT(os != NULL);
 
-	bp_mapin(bp);
-	addr = bp->b_un.b_addr;
 	resid = bp->b_bcount;
 
 	if (resid > 0 && off >= volsize) {
@@ -1223,6 +1221,58 @@ zvol_strategy(buf_t *bp)
 		biodone(bp);
 		return (0);
 	}
+
+	if (zv->zv_flags & ZVOL_DUMPIFIED) {
+		size_t bp_offset = 0;
+
+		smt_begin_unsafe(); /* why? */
+
+		addr = zio_data_buf_alloc(zv->zv_volblocksize);
+		while (resid != 0 && off < volsize) {
+			size_t size = MIN(resid, zvol_maxphys);
+			size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
+
+			if (!doread) {
+				error = bp_copyin(bp, addr, bp_offset, size);
+				if (error) {
+					error = SET_ERROR(EFAULT);
+					break;
+				}
+			}
+
+			error = zvol_dumpio(zv, addr, off, size,
+			    doread, B_FALSE);
+			if (error) {
+				/* convert checksum errors into IO errors */
+				if (error == ECKSUM)
+					error = SET_ERROR(EIO);
+				break;
+			}
+			if (doread) {
+				error = bp_copyout(addr, bp, bp_offset, size);
+				if (error) {
+					error = SET_ERROR(EFAULT);
+					break;
+				}
+			}
+			off += size;
+			resid -= size;
+			bp_offset += size;
+		}
+		zio_data_buf_free(addr, zv->zv_volblocksize);
+
+		if ((bp->b_resid = resid) == bp->b_bcount)
+			bioerror(bp, off > volsize ? EINVAL : error);
+
+		biodone(bp);
+
+		smt_end_unsafe();
+
+		return (0);
+	}
+
+	bp_mapin(bp);
+	addr = bp->b_un.b_addr;
 
 	is_dumpified = zv->zv_flags & ZVOL_DUMPIFIED;
 	commit = ((!(bp->b_flags & B_ASYNC) &&
