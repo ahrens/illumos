@@ -788,6 +788,29 @@ vdev_disk_close(vdev_t *vd)
 }
 
 static int
+vdev_disk_ldi_issue_physio(ldi_handle_t vd_lh, void *data, size_t size,
+    uint64_t offset, int flags)
+{
+	if (vd_lh == NULL)
+		return (SET_ERROR(EINVAL));
+
+	ASSERT(flags & B_READ || flags & B_WRITE);
+
+	buf_t *bp = (buf_t *)data;
+	bp->b_flags = flags | B_BUSY | B_NOCACHE | B_FAILFAST;
+	bp->b_bcount = size;
+	bp->b_lblkno = lbtodb(offset);
+	bp->b_bufsize = size;
+
+	int error = ldi_strategy(vd_lh, bp);
+	ASSERT(error == 0);
+	if ((error = biowait(bp)) == 0 && bp->b_resid != 0)
+		error = SET_ERROR(EIO);
+
+	return (error);
+}
+
+static int
 vdev_disk_ldi_physio(ldi_handle_t vd_lh, caddr_t data,
     size_t size, uint64_t offset, int flags)
 {
@@ -800,18 +823,10 @@ vdev_disk_ldi_physio(ldi_handle_t vd_lh, caddr_t data,
 	ASSERT(flags & B_READ || flags & B_WRITE);
 
 	bp = getrbuf(KM_SLEEP);
-	bp->b_flags = flags | B_BUSY | B_NOCACHE | B_FAILFAST;
-	bp->b_bcount = size;
 	bp->b_un.b_addr = (void *)data;
-	bp->b_lblkno = lbtodb(offset);
-	bp->b_bufsize = size;
 
-	error = ldi_strategy(vd_lh, bp);
-	ASSERT(error == 0);
-	if ((error = biowait(bp)) == 0 && bp->b_resid != 0)
-		error = SET_ERROR(EIO);
+	error = vdev_disk_ldi_issue_physio(vd_lh, bp, size, offset, flags);
 	freerbuf(bp);
-
 	return (error);
 }
 
@@ -845,7 +860,8 @@ vdev_disk_dumpio(vdev_t *vd, caddr_t data, size_t size,
 		    lbtodb(size)));
 	}
 
-	return (vdev_disk_ldi_physio(dvd->vd_lh, data, size, offset, flags));
+	return (vdev_disk_ldi_issue_physio(dvd->vd_lh, data, size, offset,
+	    flags));
 }
 
 static int

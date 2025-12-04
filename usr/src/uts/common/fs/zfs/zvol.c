@@ -1116,7 +1116,7 @@ zvol_log_write(zvol_state_t *zv, dmu_tx_t *tx, offset_t off, ssize_t resid,
 }
 
 static int
-zvol_dumpio_vdev(vdev_t *vd, void *addr, uint64_t offset, uint64_t origoffset,
+zvol_dumpio_vdev(vdev_t *vd, void *buf, uint64_t offset, uint64_t origoffset,
     uint64_t size, boolean_t doread, boolean_t isdump)
 {
 	if (doread && !vdev_readable(vd))
@@ -1126,12 +1126,12 @@ zvol_dumpio_vdev(vdev_t *vd, void *addr, uint64_t offset, uint64_t origoffset,
 	if (vd->vdev_ops->vdev_op_dumpio == NULL)
 		return (SET_ERROR(EIO));
 
-	return (vd->vdev_ops->vdev_op_dumpio(vd, addr, size,
+	return (vd->vdev_ops->vdev_op_dumpio(vd, buf, size,
 	    offset, origoffset, doread, isdump));
 }
 
 static int
-zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t offset, uint64_t size,
+zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t offset, uint64_t size,
     boolean_t doread, boolean_t isdump)
 {
 	vdev_t *vd;
@@ -1161,7 +1161,7 @@ zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t offset, uint64_t size,
 
 	vd = vdev_lookup_top(spa, DVA_GET_VDEV(&ze->ze_dva));
 	offset += DVA_GET_OFFSET(&ze->ze_dva);
-	error = zvol_dumpio_vdev(vd, addr, offset, DVA_GET_OFFSET(&ze->ze_dva),
+	error = zvol_dumpio_vdev(vd, buf, offset, DVA_GET_OFFSET(&ze->ze_dva),
 	    size, doread, isdump);
 
 	if (!ddi_in_panic())
@@ -1177,7 +1177,7 @@ zvol_strategy(buf_t *bp)
 	zvol_state_t *zv;
 	uint64_t off, volsize;
 	size_t resid;
-	char *addr;
+	void *buf;
 	objset_t *os;
 	int error = 0;
 	boolean_t doread = !!(bp->b_flags & B_READ);
@@ -1213,9 +1213,14 @@ zvol_strategy(buf_t *bp)
 
 	os = zv->zv_objset;
 	ASSERT(os != NULL);
+	is_dumpified = zv->zv_flags & ZVOL_DUMPIFIED;
 
-	bp_mapin(bp);
-	addr = bp->b_un.b_addr;
+	if (!is_dumpified) {
+		bp_mapin(bp);
+		buf = bp->b_un.b_addr;
+	} else {
+		buf = bp;
+	}
 	resid = bp->b_bcount;
 
 	if (resid > 0 && off >= volsize) {
@@ -1224,7 +1229,6 @@ zvol_strategy(buf_t *bp)
 		return (0);
 	}
 
-	is_dumpified = zv->zv_flags & ZVOL_DUMPIFIED;
 	commit = ((!(bp->b_flags & B_ASYNC) &&
 	    !(zv->zv_flags & ZVOL_WCE)) ||
 	    zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS) &&
@@ -1243,10 +1247,10 @@ zvol_strategy(buf_t *bp)
 		size_t size = MIN(resid, zvol_maxphys);
 		if (is_dumpified) {
 			size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
-			error = zvol_dumpio(zv, addr, off, size,
+			error = zvol_dumpio(zv, buf, off, size,
 			    doread, B_FALSE);
 		} else if (doread) {
-			error = dmu_read(os, ZVOL_OBJ, off, size, addr,
+			error = dmu_read(os, ZVOL_OBJ, off, size, buf,
 			    DMU_READ_PREFETCH);
 		} else {
 			dmu_tx_t *tx = dmu_tx_create(os);
@@ -1255,7 +1259,7 @@ zvol_strategy(buf_t *bp)
 			if (error) {
 				dmu_tx_abort(tx);
 			} else {
-				dmu_write(os, ZVOL_OBJ, off, size, addr, tx);
+				dmu_write(os, ZVOL_OBJ, off, size, buf, tx);
 				zvol_log_write(zv, tx, off, size, commit);
 				dmu_tx_commit(tx);
 			}
@@ -1267,7 +1271,7 @@ zvol_strategy(buf_t *bp)
 			break;
 		}
 		off += size;
-		addr += size;
+		buf += size;
 		resid -= size;
 	}
 	rangelock_exit(lr);
