@@ -108,10 +108,23 @@ kmutex_t zfsdev_state_lock;
 static uint32_t zvol_minors;
 
 typedef struct zvol_extent {
-	list_node_t	ze_node;
+	avl_node_t	ze_node;	/* avl node link */
 	dva_t		ze_dva;		/* dva associated with this extent */
 	uint64_t	ze_nblks;	/* number of blocks in extent */
+	uint64_t	ze_offset;
 } zvol_extent_t;
+
+/*
+ * AVL comparison function used to order zvol_extent_t
+ */
+static int
+zvol_extent_compare(const void *arg1, const void *arg2)
+{
+	const zvol_extent_t *e1 = (const zvol_extent_t *)arg1;
+	const zvol_extent_t *e2 = (const zvol_extent_t *)arg2;
+
+	return (TREE_CMP(e1->ze_offset, e2->ze_offset));
+}
 
 /*
  * The in-core state of each volume.
@@ -127,7 +140,7 @@ typedef struct zvol_state {
 	uint32_t	zv_open_count[OTYPCNT];	/* open counts */
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
-	list_t		zv_extents;	/* List of extents for dump */
+	avl_tree_t	zv_extents;	/* AVL tree of extents for dump */
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
 } zvol_state_t;
@@ -281,7 +294,7 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	/*
 	 * See if the block is at the end of the previous extent.
 	 */
-	ze = list_tail(&ma->ma_zv->zv_extents);
+	ze = avl_last(&ma->ma_zv->zv_extents);
 	if (ze &&
 	    DVA_GET_VDEV(BP_IDENTITY(bp)) == DVA_GET_VDEV(&ze->ze_dva) &&
 	    DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
@@ -293,10 +306,15 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	dprintf_bp(bp, "%s", "next blkptr:");
 
 	/* start a new extent */
-	ze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
-	ze->ze_dva = bp->blk_dva[0];	/* structure assignment */
-	ze->ze_nblks = 1;
-	list_insert_tail(&ma->ma_zv->zv_extents, ze);
+	zvol_extent_t *nze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
+	nze->ze_dva = bp->blk_dva[0];	/* structure assignment */
+	nze->ze_nblks = 1;
+	if (ze) {
+		nze->ze_offset = ze->ze_offset + ze->ze_nblks * bs;
+	} else {
+		nze->ze_offset = 0;
+	}
+	avl_add(&ma->ma_zv->zv_extents, nze);
 	return (0);
 }
 
@@ -304,9 +322,9 @@ static void
 zvol_free_extents(zvol_state_t *zv)
 {
 	zvol_extent_t *ze;
+	void *cookie = NULL;
 
-	while (ze = list_head(&zv->zv_extents)) {
-		list_remove(&zv->zv_extents, ze);
+	while ((ze = avl_destroy_nodes(&zv->zv_extents, &cookie)) != NULL) {
 		kmem_free(ze, sizeof (zvol_extent_t));
 	}
 }
@@ -555,8 +573,8 @@ zvol_create_minor(const char *name)
 	if (dmu_objset_is_snapshot(os) || !spa_writeable(dmu_objset_spa(os)))
 		zv->zv_flags |= ZVOL_RDONLY;
 	rangelock_init(&zv->zv_rangelock, NULL, NULL);
-	list_create(&zv->zv_extents, sizeof (zvol_extent_t),
-	    offsetof(zvol_extent_t, ze_node));
+	avl_create(&zv->zv_extents, zvol_extent_compare,
+	    sizeof (zvol_extent_t), offsetof(zvol_extent_t, ze_node));
 	/* get and cache the blocksize */
 	error = dmu_object_info(os, ZVOL_OBJ, &doi);
 	ASSERT(error == 0);
@@ -1147,20 +1165,29 @@ zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t offset, uint64_t size,
 	VERIFY3U(size, <=, zv->zv_volblocksize);
 
 	/* Locate the extent this belongs to */
-	for (ze = list_head(&zv->zv_extents);
-	    ze != NULL && offset >= ze->ze_nblks * zv->zv_volblocksize;
-	    ze = list_next(&zv->zv_extents, ze)) {
-		offset -= ze->ze_nblks * zv->zv_volblocksize;
-	}
+	avl_index_t where = (uintptr_t)NULL;
+
+	zvol_extent_t search;
+	search.ze_offset = offset;
+
+	ze = avl_find(&zv->zv_extents, &search, &where);
+
+	if (ze == NULL)
+		ze = avl_nearest(&zv->zv_extents, where, AVL_BEFORE);
 
 	if (ze == NULL)
 		return (SET_ERROR(EINVAL));
+
+	// Validate the found extent contains this offset.
+	VERIFY3U(ze->ze_offset, <=, offset);
+	VERIFY3U((offset - ze->ze_offset), <=,
+	    (ze->ze_nblks * zv->zv_volblocksize));
 
 	if (!ddi_in_panic())
 		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 
 	vd = vdev_lookup_top(spa, DVA_GET_VDEV(&ze->ze_dva));
-	offset += DVA_GET_OFFSET(&ze->ze_dva);
+	offset = offset - ze->ze_offset + DVA_GET_OFFSET(&ze->ze_dva);
 	error = zvol_dumpio_vdev(vd, buf, offset, DVA_GET_OFFSET(&ze->ze_dva),
 	    size, doread, isdump);
 
