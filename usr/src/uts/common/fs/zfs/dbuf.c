@@ -3958,6 +3958,7 @@ dbuf_write_nofill_ready(zio_t *zio)
 static void
 dbuf_write_nofill_done(zio_t *zio)
 {
+	abd_free(zio->io_abd);
 	dbuf_write_done(zio, NULL, zio->io_private);
 }
 
@@ -4236,12 +4237,14 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 	} else if (db->db_state == DB_NOFILL) {
 		ASSERT(zp.zp_checksum == ZIO_CHECKSUM_OFF ||
 		    zp.zp_checksum == ZIO_CHECKSUM_NOPARITY);
+		abd_t *data = abd_alloc_for_io(db->db.db_size, B_FALSE);
+		abd_zero(data, db->db.db_size);
 		dr->dr_zio = zio_write(zio, os->os_spa, txg,
-		    &dr->dr_bp_copy, NULL, db->db.db_size, db->db.db_size, &zp,
+		    &dr->dr_bp_copy, data, db->db.db_size, db->db.db_size, &zp,
 		    dbuf_write_nofill_ready, NULL, NULL,
 		    dbuf_write_nofill_done, db,
 		    ZIO_PRIORITY_ASYNC_WRITE,
-		    ZIO_FLAG_MUSTSUCCEED | ZIO_FLAG_NODATA, &zb);
+		    ZIO_FLAG_MUSTSUCCEED, &zb);
 	} else {
 		ASSERT(arc_released(data));
 
