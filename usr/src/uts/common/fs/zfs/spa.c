@@ -1055,6 +1055,7 @@ spa_taskq_dispatch_ent(spa_t *spa, zio_type_t t, zio_taskq_type_t q,
 	ASSERT3U(tqs->stqs_count, !=, 0);
 
 	if (tqs->stqs_count == 1) {
+		flags &= ~TQ_FRONT;
 		tq = tqs->stqs_taskq[0];
 	} else {
 		tq = tqs->stqs_taskq[gethrtime() % tqs->stqs_count];
