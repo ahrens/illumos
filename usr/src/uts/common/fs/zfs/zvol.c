@@ -1103,31 +1103,28 @@ zvol_dumpio_vdev(vdev_t *vd, void *buf, uint64_t offset, uint64_t origoffset,
 }
 
 static int
-zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t offset, uint64_t size,
+zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t vol_offset, uint64_t size,
     boolean_t doread, boolean_t isdump)
 {
-	vdev_t *vd;
-	int error;
 	spa_t *spa = dmu_objset_spa(zv->zv_objset);
 
 	/* Must be sector aligned, and not stradle a block boundary. */
-	if (P2PHASE(offset, DEV_BSIZE) || P2PHASE(size, DEV_BSIZE) ||
-	    P2BOUNDARY(offset, size, zv->zv_volblocksize)) {
+	if (P2PHASE(vol_offset, DEV_BSIZE) || P2PHASE(size, DEV_BSIZE) ||
+	    P2BOUNDARY(vol_offset, size, zv->zv_volblocksize)) {
 		return (SET_ERROR(EINVAL));
 	}
 	VERIFY3U(size, <=, zv->zv_volblocksize);
 
 	/* Locate the extent this belongs to */
-	dva_t *dva = &zv->zv_dvas[offset / zv->zv_volblocksize];
-	uint64_t dva_offset = offset % zv->zv_volblocksize;
+	dva_t *dva = &zv->zv_dvas[vol_offset / zv->zv_volblocksize];
+	uint64_t dva_offset = vol_offset % zv->zv_volblocksize;
 
 	if (!ddi_in_panic())
 		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 
-	vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
-	offset = DVA_GET_OFFSET(dva) + dva_offset;
-	error = zvol_dumpio_vdev(vd, buf, offset, DVA_GET_OFFSET(dva),
-	    size, doread, isdump);
+	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
+	int error = zvol_dumpio_vdev(vd, buf, DVA_GET_OFFSET(dva) + dva_offset,
+	    DVA_GET_OFFSET(dva), size, doread, isdump);
 
 	if (!ddi_in_panic())
 		spa_config_exit(spa, SCL_STATE, FTAG);
