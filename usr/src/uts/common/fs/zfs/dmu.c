@@ -2306,15 +2306,12 @@ dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp, zio_prop_t *zp)
 		    (level >= zfs_redundant_metadata_most_ditto_level ||
 		    DMU_OT_IS_METADATA(type) || (wp & WP_SPILL))))
 			copies++;
-	} else if (wp & WP_NOFILL) {
+	} else if (wp & WP_ZEROFILL) {
 		ASSERT(level == 0);
 
 		/*
-		 * If we're writing preallocated blocks, we aren't actually
-		 * writing them so don't set any policy properties.  These
-		 * blocks are currently only used by an external subsystem
-		 * outside of zfs (i.e. dump) and not written by the zio
-		 * pipeline.
+		 * We're pre-allocating and zeroing blocks for raw zvols
+		 * (including dump devices).
 		 */
 		compress = ZIO_COMPRESS_OFF;
 		checksum = ZIO_CHECKSUM_NOPARITY;
@@ -2362,7 +2359,7 @@ dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp, zio_prop_t *zp)
 	 * to avoid ambiguity in the dedup code since the DDT does not store
 	 * object types.
 	 */
-	if (os->os_encrypted && (wp & WP_NOFILL) == 0) {
+	if (os->os_encrypted && (wp & WP_ZEROFILL) == 0) {
 		encrypt = B_TRUE;
 
 		if (DMU_OT_IS_ENCRYPTED(type)) {

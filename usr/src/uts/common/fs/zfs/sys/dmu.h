@@ -510,7 +510,7 @@ dmu_write_embedded(objset_t *os, uint64_t object, uint64_t offset,
 /*
  * Decide how to write a block: checksum, compression, number of copies, etc.
  */
-#define	WP_NOFILL	0x1
+#define	WP_ZEROFILL	0x1
 #define	WP_DMU_SYNC	0x2
 #define	WP_SPILL	0x4
 

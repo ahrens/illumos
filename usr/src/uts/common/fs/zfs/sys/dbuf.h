@@ -78,7 +78,7 @@ typedef enum dbuf_states {
 	DB_SEARCH = -1,
 	DB_UNCACHED,
 	DB_FILL,
-	DB_NOFILL,
+	DB_ZEROFILL,
 	DB_READ,
 	DB_CACHED,
 	DB_EVICTING

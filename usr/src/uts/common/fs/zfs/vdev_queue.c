@@ -749,7 +749,8 @@ again:
 	 * deadlock that we could encounter since this I/O will complete
 	 * immediately.
 	 */
-	if (zio->io_flags & ZIO_FLAG_NODATA) {
+	if (zio->io_flags & ZIO_FLAG_NODATA &&
+	    zio->io_flags & ZIO_FLAG_OPTIONAL) {
 		mutex_exit(&vq->vq_lock);
 		zio_vdev_io_bypass(zio);
 		zio_execute(zio);
