@@ -298,7 +298,7 @@ zvol_get_lbas(zvol_state_t *zv)
 	    KM_SLEEP);
 	err = traverse_dataset(dmu_objset_ds(os), 0,
 	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
-	    zvol_map_block2, zv);
+	    zvol_map_block, zv);
 	if (err || DVA_IS_EMPTY(&zv->zv_dvas
 	    [(zv->zv_volsize / zv->zv_volblocksize) - 1])) {
 		zvol_free_dvas(zv);
