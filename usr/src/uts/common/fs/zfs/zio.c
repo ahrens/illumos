@@ -3187,13 +3187,20 @@ zio_allocate_dispatch(spa_t *spa, int allocator)
 
 	mutex_enter(&spa->spa_alloc_locks[allocator]);
 	zio = zio_io_to_allocate(spa, allocator);
-	mutex_exit(&spa->spa_alloc_locks[allocator]);
-	if (zio == NULL)
+	if (zio == NULL) {
+		mutex_exit(&spa->spa_alloc_locks[allocator]);
 		return;
+	}
 
 	ASSERT3U(zio->io_stage, ==, ZIO_STAGE_DVA_THROTTLE);
 	ASSERT0(zio->io_error);
 	zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, B_TRUE);
+	/*
+	 * Hold lock across taskq_dispatch to maintain ordering of zio's
+	 * to allocate (only works if cutinline is ignored, and taskq has
+	 * only 1 thread).
+	 */
+	mutex_exit(&spa->spa_alloc_locks[allocator]);
 }
 
 static int
