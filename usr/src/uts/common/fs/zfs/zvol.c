@@ -1242,8 +1242,8 @@ zvol_strategy(buf_t *bp)
 	 * There must be no buffer changes when doing a dmu_sync() because
 	 * we can't change the data whilst calculating the checksum.
 	 */
-	locked_range_t *lr = rangelock_enter(&zv->zv_rangelock, off,
-		    resid, doread ? RL_READER : RL_WRITER);
+	locked_range_t *lr = rangelock_enter(&zv->zv_rangelock, off, resid,
+	    doread ? RL_READER : RL_WRITER);
 
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
