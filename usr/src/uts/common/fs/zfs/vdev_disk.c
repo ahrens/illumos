@@ -57,7 +57,6 @@ boolean_t zfs_nocacheflush = B_FALSE;
  */
 
 extern ldi_ident_t zfs_li;
-extern boolean_t zvol_raw_copy;
 
 static void vdev_disk_close(vdev_t *);
 
@@ -861,13 +860,8 @@ vdev_disk_dumpio(vdev_t *vd, caddr_t data, size_t size,
 		    lbtodb(size)));
 	}
 
-	if (zvol_raw_copy) {
-		return (vdev_disk_ldi_physio(dvd->vd_lh, data, size, offset,
-		    flags));
-	} else {
-		return (vdev_disk_ldi_issue_physio(dvd->vd_lh, data, size, offset,
-		    flags));
-	}
+	return (vdev_disk_ldi_issue_physio(dvd->vd_lh, data, size, offset,
+	    flags));
 }
 
 static int
