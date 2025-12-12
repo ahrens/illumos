@@ -1135,8 +1135,6 @@ zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t offset, uint64_t size,
 	return (error);
 }
 
-int zvol_raw_copy = B_TRUE;
-
 int
 zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 {
@@ -1151,29 +1149,12 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 
 	smt_begin_unsafe(); /* why? */
 
-	if (zvol_raw_copy) {
-		addr = zio_data_buf_alloc(zv->zv_volblocksize);
-	}
-
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
 		size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
 
-		if (zvol_raw_copy) {
-			if (!doread) {
-				error = bp_copyin(bp, addr, bp_offset, size);
-				if (error) {
-					error = SET_ERROR(EFAULT);
-					break;
-				}
-			}
-
-			error = zvol_dumpio(zv, addr, off, size,
-			    doread, B_FALSE);
-		} else {
-			error = zvol_dumpio(zv, bp, off, size,
-			    doread, B_FALSE);
-		}
+		error = zvol_dumpio(zv, bp, off, size,
+		    doread, B_FALSE);
 
 		if (error) {
 			/* convert checksum errors into IO errors */
@@ -1182,20 +1163,9 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 			break;
 		}
 
-		if (zvol_raw_copy && doread) {
-			error = bp_copyout(addr, bp, bp_offset, size);
-			if (error) {
-				error = SET_ERROR(EFAULT);
-				break;
-			}
-		}
 		off += size;
 		resid -= size;
 		bp_offset += size;
-	}
-
-	if (zvol_raw_copy) {
-		zio_data_buf_free(addr, zv->zv_volblocksize);
 	}
 
 	if ((bp->b_resid = resid) == bp->b_bcount)
