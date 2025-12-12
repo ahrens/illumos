@@ -1248,7 +1248,7 @@ dmu_object_remap_indirects(objset_t *os, uint64_t object,
 }
 
 void
-dmu_prealloc(objset_t *os, uint64_t object, uint64_t offset, uint64_t size,
+dmu_zero(objset_t *os, uint64_t object, uint64_t offset, uint64_t size,
     dmu_tx_t *tx)
 {
 	dmu_buf_t **dbp;
