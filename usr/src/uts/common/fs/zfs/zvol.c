@@ -107,6 +107,8 @@ static char *zvol_tag = "zvol_tag";
 kmutex_t zfsdev_state_lock;
 static uint32_t zvol_minors;
 
+boolean_t zvol_dump_array = B_FALSE;
+
 typedef struct zvol_extent {
 	avl_node_t	ze_node;	/* avl node link */
 	dva_t		ze_dva;		/* dva associated with this extent */
@@ -141,6 +143,7 @@ typedef struct zvol_state {
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
 	avl_tree_t	zv_extents;	/* AVL tree of extents for dump */
+	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
 } zvol_state_t;
@@ -271,6 +274,29 @@ struct maparg {
 
 /*ARGSUSED*/
 static int
+zvol_map_block2(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
+{
+	zvol_state_t *zv = arg;
+
+	if (bp == NULL || BP_IS_HOLE(bp) ||
+	    zb->zb_object != ZVOL_OBJ || zb->zb_level != 0)
+		return (0);
+
+	VERIFY(!BP_IS_EMBEDDED(bp));
+
+	/* Abort immediately if we have encountered gang blocks */
+	if (BP_IS_GANG(bp))
+		return (SET_ERROR(EFRAGS));
+
+	VERIFY3U(zb->zb_blkid, <, zv->zv_volsize / zv->zv_volblocksize);
+	zv->zv_dvas[zb->zb_blkid] = bp->blk_dva[0];
+
+	return (0);
+}
+
+/*ARGSUSED*/
+static int
 zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
     const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
 {
@@ -329,24 +355,50 @@ zvol_free_extents(zvol_state_t *zv)
 	}
 }
 
+static void
+zvol_free_extents2(zvol_state_t *zv)
+{
+	if (zv->zv_dvas != NULL) {
+		kmem_free(zv->zv_dvas,
+		    zv->zv_volsize / zv->zv_volblocksize * sizeof (dva_t));
+	}
+}
+
+
 static int
 zvol_get_lbas(zvol_state_t *zv)
 {
 	objset_t *os = zv->zv_objset;
-	struct maparg	ma;
 	int		err;
 
-	ma.ma_zv = zv;
-	ma.ma_blks = 0;
 	zvol_free_extents(zv);
+	zvol_free_extents2(zv);
 
 	/* commit any in-flight changes before traversing the dataset */
 	txg_wait_synced(dmu_objset_pool(os), 0);
-	err = traverse_dataset(dmu_objset_ds(os), 0,
-	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA, zvol_map_block, &ma);
-	if (err || ma.ma_blks != (zv->zv_volsize / zv->zv_volblocksize)) {
-		zvol_free_extents(zv);
-		return (err ? err : EIO);
+	if (zvol_dump_array) {
+		zv->zv_dvas = kmem_zalloc(
+		    zv->zv_volsize / zv->zv_volblocksize * sizeof (dva_t),
+		    KM_SLEEP);
+		err = traverse_dataset(dmu_objset_ds(os), 0,
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
+		    zvol_map_block2, zv);
+		if (err || DVA_IS_EMPTY(&zv->zv_dvas
+		    [(zv->zv_volsize / zv->zv_volblocksize) - 1])) {
+			zvol_free_extents2(zv);
+			return (err ? err : EIO);
+		}
+	} else {
+		struct maparg	ma;
+		ma.ma_zv = zv;
+		ma.ma_blks = 0;
+		err = traverse_dataset(dmu_objset_ds(os), 0,
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
+		    zvol_map_block, &ma);
+		if (err || ma.ma_blks != (zv->zv_volsize / zv->zv_volblocksize)) {
+			zvol_free_extents(zv);
+			return (err ? err : EIO);
+		}
 	}
 
 	return (0);
@@ -719,6 +771,7 @@ zvol_prealloc(zvol_state_t *zv)
 
 	/* Free old extents if they exist */
 	zvol_free_extents(zv);
+	zvol_free_extents2(zv);
 
 	while (resid != 0) {
 		int error;
@@ -1154,7 +1207,6 @@ zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t offset, uint64_t size,
 {
 	vdev_t *vd;
 	int error;
-	zvol_extent_t *ze;
 	spa_t *spa = dmu_objset_spa(zv->zv_objset);
 
 	/* Must be sector aligned, and not stradle a block boundary. */
@@ -1164,31 +1216,41 @@ zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t offset, uint64_t size,
 	}
 	VERIFY3U(size, <=, zv->zv_volblocksize);
 
+	dva_t dva;
+	uint64_t dva_offset;
 	/* Locate the extent this belongs to */
-	avl_index_t where = (uintptr_t)NULL;
+	if (zvol_dump_array) {
+		dva = zv->zv_dvas[offset / zv->zv_volblocksize];
+		dva_offset = offset % zv->zv_volblocksize;
+	} else {
+		avl_index_t where = (uintptr_t)NULL;
 
-	zvol_extent_t search;
-	search.ze_offset = offset;
+		zvol_extent_t search;
+		search.ze_offset = offset;
 
-	ze = avl_find(&zv->zv_extents, &search, &where);
+		zvol_extent_t *ze = avl_find(&zv->zv_extents, &search, &where);
 
-	if (ze == NULL)
-		ze = avl_nearest(&zv->zv_extents, where, AVL_BEFORE);
+		if (ze == NULL)
+			ze = avl_nearest(&zv->zv_extents, where, AVL_BEFORE);
 
-	if (ze == NULL)
-		return (SET_ERROR(EINVAL));
+		if (ze == NULL)
+			return (SET_ERROR(EINVAL));
 
-	// Validate the found extent contains this offset.
-	VERIFY3U(ze->ze_offset, <=, offset);
-	VERIFY3U((offset - ze->ze_offset), <=,
-	    (ze->ze_nblks * zv->zv_volblocksize));
+		// Validate the found extent contains this offset.
+		VERIFY3U(ze->ze_offset, <=, offset);
+		VERIFY3U((offset - ze->ze_offset), <=,
+		(ze->ze_nblks * zv->zv_volblocksize));
+
+		dva = ze->ze_dva;
+		dva_offset = offset - ze->ze_offset;
+	}
 
 	if (!ddi_in_panic())
 		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 
-	vd = vdev_lookup_top(spa, DVA_GET_VDEV(&ze->ze_dva));
-	offset = offset - ze->ze_offset + DVA_GET_OFFSET(&ze->ze_dva);
-	error = zvol_dumpio_vdev(vd, buf, offset, DVA_GET_OFFSET(&ze->ze_dva),
+	vd = vdev_lookup_top(spa, DVA_GET_VDEV(&dva));
+	offset = DVA_GET_OFFSET(&dva) + dva_offset;
+	error = zvol_dumpio_vdev(vd, buf, offset, DVA_GET_OFFSET(&dva),
 	    size, doread, isdump);
 
 	if (!ddi_in_panic())
@@ -2270,6 +2332,7 @@ zvol_dump_fini(zvol_state_t *zv)
 	nvlist_free(nv);
 
 	zvol_free_extents(zv);
+	zvol_free_extents2(zv);
 	zv->zv_flags &= ~ZVOL_DUMPIFIED;
 	(void) dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
 	/* wait for dmu_free_long_range to actually free the blocks */
