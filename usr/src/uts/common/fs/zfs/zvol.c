@@ -133,6 +133,7 @@ typedef struct zvol_state {
 #define	ZVOL_DUMPIFIED	0x2
 #define	ZVOL_EXCL	0x4
 #define	ZVOL_WCE	0x8
+#define	ZVOL_RAW	0x10
 
 /*
  * zvol maximum transfer in one DMU tx.
@@ -297,8 +298,7 @@ zvol_get_lbas(zvol_state_t *zv)
 	    zv->zv_volsize / zv->zv_volblocksize * sizeof (dva_t),
 	    KM_SLEEP);
 	err = traverse_dataset(dmu_objset_ds(os), 0,
-	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA,
-	    zvol_map_block, zv);
+	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA, zvol_map_block, zv);
 	if (err || DVA_IS_EMPTY(&zv->zv_dvas
 	    [(zv->zv_volsize / zv->zv_volblocksize) - 1])) {
 		zvol_free_dvas(zv);
@@ -1088,7 +1088,7 @@ zvol_log_write(zvol_state_t *zv, dmu_tx_t *tx, offset_t off, ssize_t resid,
 }
 
 static int
-zvol_dumpio_vdev(vdev_t *vd, void *buf, uint64_t offset, uint64_t origoffset,
+zvol_dumpio_vdev(vdev_t *vd, void *addr, uint64_t offset, uint64_t origoffset,
     uint64_t size, boolean_t doread, boolean_t isdump)
 {
 	if (doread && !vdev_readable(vd))
@@ -1098,12 +1098,25 @@ zvol_dumpio_vdev(vdev_t *vd, void *buf, uint64_t offset, uint64_t origoffset,
 	if (vd->vdev_ops->vdev_op_dumpio == NULL)
 		return (SET_ERROR(EIO));
 
-	return (vd->vdev_ops->vdev_op_dumpio(vd, buf, size,
+	return (vd->vdev_ops->vdev_op_dumpio(vd, addr, size,
 	    offset, origoffset, doread, isdump));
 }
 
 static int
-zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t vol_offset, uint64_t size,
+zvol_rawio_vdev(vdev_t *vd, buf_t *buf, uint64_t offset, uint64_t size)
+{
+	if ((buf->b_flags & B_READ) && !vdev_readable(vd))
+		return (SET_ERROR(EIO));
+	if (!(buf->b_flags & B_READ) && !vdev_writeable(vd))
+		return (SET_ERROR(EIO));
+	if (vd->vdev_ops->vdev_op_rawio == NULL)
+		return (SET_ERROR(EIO));
+
+	return (vd->vdev_ops->vdev_op_rawio(vd, buf, size, offset));
+}
+
+static int
+zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t vol_offset, uint64_t size,
     boolean_t doread, boolean_t isdump)
 {
 	spa_t *spa = dmu_objset_spa(zv->zv_objset);
@@ -1123,7 +1136,7 @@ zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t vol_offset, uint64_t size,
 		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
 
 	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
-	int error = zvol_dumpio_vdev(vd, buf, DVA_GET_OFFSET(dva) + dva_offset,
+	int error = zvol_dumpio_vdev(vd, addr, DVA_GET_OFFSET(dva) + dva_offset,
 	    DVA_GET_OFFSET(dva), size, doread, isdump);
 
 	if (!ddi_in_panic())
@@ -1132,16 +1145,41 @@ zvol_dumpio(zvol_state_t *zv, void *buf, uint64_t vol_offset, uint64_t size,
 	return (error);
 }
 
+static int
+zvol_rawio(zvol_state_t *zv, buf_t *buf, uint64_t vol_offset, uint64_t size)
+{
+	spa_t *spa = dmu_objset_spa(zv->zv_objset);
+
+	/* Must be sector aligned, and not stradle a block boundary. */
+	if (P2PHASE(vol_offset, DEV_BSIZE) || P2PHASE(size, DEV_BSIZE) ||
+	    P2BOUNDARY(vol_offset, size, zv->zv_volblocksize)) {
+		return (SET_ERROR(EINVAL));
+	}
+	VERIFY3U(size, <=, zv->zv_volblocksize);
+
+	/* Locate the extent this belongs to */
+	dva_t *dva = &zv->zv_dvas[vol_offset / zv->zv_volblocksize];
+	uint64_t dva_offset = vol_offset % zv->zv_volblocksize;
+
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+
+	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
+	int error = zvol_rawio_vdev(vd, buf, DVA_GET_OFFSET(dva) + dva_offset,
+	    size);
+
+	spa_config_exit(spa, SCL_STATE, FTAG);
+
+	return (error);
+}
+
 int
 zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 {
 	ASSERT(zv->zv_flags & ZVOL_DUMPIFIED);
-	char *addr = NULL;
 	size_t bp_offset = 0;
 	size_t resid = bp->b_bcount;
 	uint64_t off = ldbtob(bp->b_blkno);
 	uint64_t volsize = zv->zv_volsize;
-	boolean_t doread = !!(bp->b_flags & B_READ);
 	int error = 0;
 
 	smt_begin_unsafe(); /* why? */
@@ -1150,8 +1188,7 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 		size_t size = MIN(resid, zvol_maxphys);
 		size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
 
-		error = zvol_dumpio(zv, bp, off, size,
-		    doread, B_FALSE);
+		error = zvol_rawio(zv, bp, off, size);
 
 		if (error) {
 			/* convert checksum errors into IO errors */
@@ -1167,7 +1204,6 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 
 	if ((bp->b_resid = resid) == bp->b_bcount)
 		bioerror(bp, off > volsize ? EINVAL : error);
-
 
 	biodone(bp);
 	smt_end_unsafe();
@@ -1224,9 +1260,10 @@ zvol_strategy(buf_t *bp)
 		return (0);
 	}
 
-	if (zv->zv_flags & ZVOL_DUMPIFIED) {
+	if (zv->zv_flags & ZVOL_RAW) {
 		return (zvol_raw_strategy(zv, bp));
 	}
+	boolean_t is_dumpified = (zv->zv_flags & ZVOL_DUMPIFIED) != 0;
 
 	bp_mapin(bp);
 	addr = bp->b_un.b_addr;
@@ -1234,7 +1271,7 @@ zvol_strategy(buf_t *bp)
 	commit = ((!(bp->b_flags & B_ASYNC) &&
 	    !(zv->zv_flags & ZVOL_WCE)) ||
 	    zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS) &&
-	    !doread;
+	    !doread && !is_dumpified;
 
 	smt_begin_unsafe();
 
@@ -1247,7 +1284,11 @@ zvol_strategy(buf_t *bp)
 
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
-		if (doread) {
+		if (is_dumpified) {
+			size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
+			error = zvol_dumpio(zv, addr, off, size,
+			    doread, B_FALSE);
+		} else if (doread) {
 			error = dmu_read(os, ZVOL_OBJ, off, size, addr,
 			    DMU_READ_PREFETCH);
 		} else {
@@ -2108,6 +2149,7 @@ zvol_dumpify(zvol_state_t *zv)
 	}
 
 	zv->zv_flags |= ZVOL_DUMPIFIED;
+	zv->zv_flags |= ZVOL_RAW; /* XXX need to distinguish between rawvol and dump, because rawvol doesn't support raidz/mirror */
 	error = zap_update(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, 8, 1,
 	    &zv->zv_volsize, tx);
 	dmu_tx_commit(tx);

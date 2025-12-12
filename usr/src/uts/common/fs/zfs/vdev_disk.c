@@ -788,16 +788,15 @@ vdev_disk_close(vdev_t *vd)
 }
 
 static int
-vdev_disk_ldi_issue_physio(ldi_handle_t vd_lh, void *data, size_t size,
-    uint64_t offset, int flags)
+vdev_disk_ldi_issue_physio(ldi_handle_t vd_lh, buf_t *bp, size_t size,
+    uint64_t offset)
 {
 	if (vd_lh == NULL)
 		return (SET_ERROR(EINVAL));
 
 	ASSERT(flags & B_READ || flags & B_WRITE);
 
-	buf_t *bp = (buf_t *)data;
-	bp->b_flags = flags | B_BUSY | B_NOCACHE | B_FAILFAST;
+	bp->b_flags |= B_BUSY | B_NOCACHE | B_FAILFAST;
 	bp->b_bcount = size;
 	bp->b_lblkno = lbtodb(offset);
 	bp->b_bufsize = size;
@@ -812,7 +811,7 @@ vdev_disk_ldi_issue_physio(ldi_handle_t vd_lh, void *data, size_t size,
 
 static int
 vdev_disk_ldi_physio(ldi_handle_t vd_lh, caddr_t data,
-    size_t size, uint64_t offset, int flags)
+    size_t size, uint64_t offset, boolean_t doread)
 {
 	buf_t *bp;
 	int error = 0;
@@ -823,9 +822,10 @@ vdev_disk_ldi_physio(ldi_handle_t vd_lh, caddr_t data,
 	ASSERT(flags & B_READ || flags & B_WRITE);
 
 	bp = getrbuf(KM_SLEEP);
+	bp->b_flags |= doread ? B_READ : B_WRITE;
 	bp->b_un.b_addr = (void *)data;
 
-	error = vdev_disk_ldi_issue_physio(vd_lh, bp, size, offset, flags);
+	error = vdev_disk_ldi_issue_physio(vd_lh, bp, size, offset);
 	freerbuf(bp);
 	return (error);
 }
@@ -836,7 +836,6 @@ vdev_disk_dumpio(vdev_t *vd, caddr_t data, size_t size,
     boolean_t isdump)
 {
 	vdev_disk_t *dvd = vd->vdev_tsd;
-	int flags = doread ? B_READ : B_WRITE;
 
 	/*
 	 * If the vdev is closed, it's likely in the REMOVED or FAULTED state.
@@ -860,8 +859,27 @@ vdev_disk_dumpio(vdev_t *vd, caddr_t data, size_t size,
 		    lbtodb(size)));
 	}
 
-	return (vdev_disk_ldi_issue_physio(dvd->vd_lh, data, size, offset,
-	    flags));
+	return (vdev_disk_ldi_physio(dvd->vd_lh, data, size, offset, doread));
+}
+
+static int
+vdev_disk_rawio(vdev_t *vd, buf_t *bp, size_t size, uint64_t offset)
+{
+	vdev_disk_t *dvd = vd->vdev_tsd;
+
+	/*
+	 * If the vdev is closed, it's likely in the REMOVED or FAULTED state.
+	 * Nothing to be done here but return failure.
+	 */
+	if (dvd == NULL || dvd->vd_ldi_offline) {
+		return (SET_ERROR(ENXIO));
+	}
+
+	ASSERT(vd->vdev_ops == &vdev_disk_ops);
+
+	offset += VDEV_LABEL_START_SIZE;
+
+	return (vdev_disk_ldi_issue_physio(dvd->vd_lh, bp, size, offset));
 }
 
 static int
@@ -1115,6 +1133,7 @@ vdev_ops_t vdev_disk_ops = {
 	.vdev_op_remap = NULL,
 	.vdev_op_xlate = vdev_default_xlate,
 	.vdev_op_dumpio = vdev_disk_dumpio,
+	.vdev_op_rawio = vdev_disk_rawio,
 	.vdev_op_type = VDEV_TYPE_DISK,		/* name of this vdev type */
 	.vdev_op_leaf = B_TRUE			/* leaf vdev */
 };
