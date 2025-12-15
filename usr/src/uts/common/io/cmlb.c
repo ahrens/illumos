@@ -1194,6 +1194,7 @@ cmlb_ioctl(cmlb_handle_t cmlbhandle, dev_t dev, int cmd, intptr_t arg,
 			break;
 		case DKIOCFREE:
 			/* do not force-validate geometry */
+			mutex_exit(CMLB_MUTEX(cl));
 			return (ENOTTY);
 			break;
 		default:
