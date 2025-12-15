@@ -1541,10 +1541,6 @@ bd_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *credp, int *rvalp)
 		return (ENXIO);
 	}
 
-	rv = cmlb_ioctl(bd->d_cmlbh, dev, cmd, arg, flag, credp, rvalp, 0);
-	if (rv != ENOTTY)
-		return (rv);
-
 	if (rvalp != NULL) {
 		/* the return value of the ioctl is 0 by default */
 		*rvalp = 0;
@@ -1712,8 +1708,10 @@ bd_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *credp, int *rvalp)
 	}
 
 	default:
+		rv = cmlb_ioctl(bd->d_cmlbh, dev, cmd, arg, flag, credp, rvalp, 0);
+		if (rv != ENOTTY)
+			return (rv);
 		break;
-
 	}
 	return (ENOTTY);
 }
