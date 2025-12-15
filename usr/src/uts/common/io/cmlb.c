@@ -1192,6 +1192,10 @@ cmlb_ioctl(cmlb_handle_t cmlbhandle, dev_t dev, int cmd, intptr_t arg,
 				return (EOVERFLOW);
 			}
 			break;
+		case DKIOCFREE:
+			/* do not force-validate geometry */
+			return (ENOTTY);
+			break;
 		default:
 			(void) cmlb_validate_geometry(cl, 1, CMLB_SILENT,
 			    tg_cookie);
