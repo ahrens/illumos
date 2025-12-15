@@ -121,7 +121,7 @@ typedef struct zvol_state {
 	uint32_t	zv_open_count[OTYPCNT];	/* open counts */
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
-	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
+	dva_t		*zv_dvas;	/* block -> dva mapping for raw/dump */
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
 } zvol_state_t;
@@ -283,9 +283,8 @@ zvol_free_dvas(zvol_state_t *zv)
 	}
 }
 
-
 static int
-zvol_get_lbas(zvol_state_t *zv)
+zvol_get_dvas(zvol_state_t *zv)
 {
 	objset_t *os = zv->zv_objset;
 	int		err;
@@ -686,6 +685,7 @@ zvol_prealloc(zvol_state_t *zv)
 			(void) dmu_free_long_range(os, ZVOL_OBJ, 0, off);
 			return (error);
 		}
+		/* XXX do we care that this makes dumpinit much slower? */
 		dmu_zero(os, ZVOL_OBJ, off, bytes, tx);
 		dmu_tx_commit(tx);
 		off += bytes;
@@ -1182,7 +1182,7 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 	uint64_t volsize = zv->zv_volsize;
 	int error = 0;
 
-	smt_begin_unsafe(); /* why? */
+	smt_begin_unsafe(); /* XXX why? */
 
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
@@ -1191,9 +1191,6 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 		error = zvol_rawio(zv, bp, off, size);
 
 		if (error) {
-			/* convert checksum errors into IO errors */
-			if (error == ECKSUM)
-				error = SET_ERROR(EIO);
 			break;
 		}
 
@@ -2133,7 +2130,7 @@ zvol_dumpify(zvol_state_t *zv)
 	/*
 	 * Build up our lba mapping.
 	 */
-	error = zvol_get_lbas(zv);
+	error = zvol_get_dvas(zv);
 	if (error) {
 		(void) zvol_dump_fini(zv);
 		return (error);

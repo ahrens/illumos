@@ -819,8 +819,6 @@ vdev_disk_ldi_physio(ldi_handle_t vd_lh, caddr_t data,
 	if (vd_lh == NULL)
 		return (SET_ERROR(EINVAL));
 
-	ASSERT(flags & B_READ || flags & B_WRITE);
-
 	bp = getrbuf(KM_SLEEP);
 	bp->b_flags |= doread ? B_READ : B_WRITE;
 	bp->b_un.b_addr = (void *)data;
