@@ -1196,20 +1196,28 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 
 	smt_begin_unsafe(); /* XXX why? */
 
+	buf_t child_bp;
+	bioinit(&child_bp);
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
 		size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
 
-		error = zvol_rawio(zv, bp, off, size);
+		bioclone(bp, bp_offset, size,
+		    0, 0, NULL, &child_bp, KM_SLEEP);
+
+		error = zvol_rawio(zv, &child_bp, off, size);
 
 		if (error) {
 			break;
 		}
+		/* XXX we could issue these all concurrently */
+		biowait(&child_bp);
 
 		off += size;
 		resid -= size;
 		bp_offset += size;
 	}
+	biofini(&child_bp);
 
 	if ((bp->b_resid = resid) == bp->b_bcount)
 		bioerror(bp, off > volsize ? EINVAL : error);

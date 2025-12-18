@@ -803,8 +803,6 @@ vdev_disk_ldi_issue_physio(ldi_handle_t vd_lh, buf_t *bp, size_t size,
 
 	int error = ldi_strategy(vd_lh, bp);
 	ASSERT(error == 0);
-	if ((error = biowait(bp)) == 0 && bp->b_resid != 0)
-		error = SET_ERROR(EIO);
 
 	return (error);
 }
@@ -824,6 +822,8 @@ vdev_disk_ldi_physio(ldi_handle_t vd_lh, caddr_t data,
 	bp->b_un.b_addr = (void *)data;
 
 	error = vdev_disk_ldi_issue_physio(vd_lh, bp, size, offset);
+	if ((error = biowait(bp)) == 0 && bp->b_resid != 0)
+		error = SET_ERROR(EIO);
 	freerbuf(bp);
 	return (error);
 }
