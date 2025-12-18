@@ -121,7 +121,7 @@ typedef struct zvol_state {
 	uint32_t	zv_open_count[OTYPCNT];	/* open counts */
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
-	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
+	dva_t		*zv_dvas;	/* block -> dva mapping for raw/dump */
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
 } zvol_state_t;
@@ -133,6 +133,7 @@ typedef struct zvol_state {
 #define	ZVOL_DUMPIFIED	0x2
 #define	ZVOL_EXCL	0x4
 #define	ZVOL_WCE	0x8
+#define	ZVOL_RAW	0x10
 
 /*
  * zvol maximum transfer in one DMU tx.
@@ -1114,6 +1115,19 @@ zvol_dumpio_vdev(vdev_t *vd, void *addr, uint64_t offset, uint64_t origoffset,
 }
 
 static int
+zvol_rawio_vdev(vdev_t *vd, buf_t *buf, uint64_t offset, uint64_t size)
+{
+	if ((buf->b_flags & B_READ) && !vdev_readable(vd))
+		return (SET_ERROR(EIO));
+	if (!(buf->b_flags & B_READ) && !vdev_writeable(vd))
+		return (SET_ERROR(EIO));
+	if (vd->vdev_ops->vdev_op_rawio == NULL)
+		return (SET_ERROR(EIO));
+
+	return (vd->vdev_ops->vdev_op_rawio(vd, buf, size, offset));
+}
+
+static int
 zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t vol_offset, uint64_t size,
     boolean_t doread, boolean_t isdump)
 {
@@ -1138,9 +1152,71 @@ zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t vol_offset, uint64_t size,
 	    DVA_GET_OFFSET(dva), size, doread, isdump);
 
 	if (!ddi_in_panic())
+		spa_config_exit(spa, SCL_STATE, FTAG);
+
+	return (error);
+}
+
+static int
+zvol_rawio(zvol_state_t *zv, buf_t *buf, uint64_t vol_offset, uint64_t size)
+{
+	spa_t *spa = dmu_objset_spa(zv->zv_objset);
+
+	/* Must be sector aligned, and not stradle a block boundary. */
+	if (P2PHASE(vol_offset, DEV_BSIZE) || P2PHASE(size, DEV_BSIZE) ||
+	    P2BOUNDARY(vol_offset, size, zv->zv_volblocksize)) {
+		return (SET_ERROR(EINVAL));
+	}
+	VERIFY3U(size, <=, zv->zv_volblocksize);
+
+	/* Locate the extent this belongs to */
+	dva_t *dva = &zv->zv_dvas[vol_offset / zv->zv_volblocksize];
+	uint64_t dva_offset = vol_offset % zv->zv_volblocksize;
+
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+
+	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
+	int error = zvol_rawio_vdev(vd, buf, DVA_GET_OFFSET(dva) + dva_offset,
+	    size);
+
 	spa_config_exit(spa, SCL_STATE, FTAG);
 
 	return (error);
+}
+
+int
+zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
+{
+	ASSERT(zv->zv_flags & ZVOL_DUMPIFIED);
+	size_t bp_offset = 0;
+	size_t resid = bp->b_bcount;
+	uint64_t off = ldbtob(bp->b_blkno);
+	uint64_t volsize = zv->zv_volsize;
+	int error = 0;
+
+	smt_begin_unsafe(); /* XXX why? */
+
+	while (resid != 0 && off < volsize) {
+		size_t size = MIN(resid, zvol_maxphys);
+		size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
+
+		error = zvol_rawio(zv, bp, off, size);
+
+		if (error) {
+			break;
+		}
+
+		off += size;
+		resid -= size;
+		bp_offset += size;
+	}
+
+	if ((bp->b_resid = resid) == bp->b_bcount)
+		bioerror(bp, off > volsize ? EINVAL : error);
+
+	biodone(bp);
+	smt_end_unsafe();
+	return (0);
 }
 
 int
@@ -1154,7 +1230,6 @@ zvol_strategy(buf_t *bp)
 	objset_t *os;
 	int error = 0;
 	boolean_t doread = !!(bp->b_flags & B_READ);
-	boolean_t is_dumpified;
 	boolean_t commit;
 
 	if (getminor(bp->b_edev) == 0) {
@@ -1187,17 +1262,21 @@ zvol_strategy(buf_t *bp)
 	os = zv->zv_objset;
 	ASSERT(os != NULL);
 
-	bp_mapin(bp);
-	addr = bp->b_un.b_addr;
 	resid = bp->b_bcount;
-
 	if (resid > 0 && off >= volsize) {
 		bioerror(bp, EIO);
 		biodone(bp);
 		return (0);
 	}
 
-	is_dumpified = zv->zv_flags & ZVOL_DUMPIFIED;
+	if (zv->zv_flags & ZVOL_RAW) {
+		return (zvol_raw_strategy(zv, bp));
+	}
+	boolean_t is_dumpified = (zv->zv_flags & ZVOL_DUMPIFIED) != 0;
+
+	bp_mapin(bp);
+	addr = bp->b_un.b_addr;
+
 	commit = ((!(bp->b_flags & B_ASYNC) &&
 	    !(zv->zv_flags & ZVOL_WCE)) ||
 	    zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS) &&
@@ -2079,6 +2158,7 @@ zvol_dumpify(zvol_state_t *zv)
 	}
 
 	zv->zv_flags |= ZVOL_DUMPIFIED;
+	zv->zv_flags |= ZVOL_RAW; /* XXX need to distinguish between rawvol and dump, because rawvol doesn't support raidz/mirror */
 	error = zap_update(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, 8, 1,
 	    &zv->zv_volsize, tx);
 	dmu_tx_commit(tx);
