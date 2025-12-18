@@ -697,7 +697,7 @@ zvol_prealloc(zvol_state_t *zv)
 			(void) dmu_free_long_range(os, ZVOL_OBJ, 0, off);
 			return (error);
 		}
-		dmu_prealloc(os, ZVOL_OBJ, off, bytes, tx);
+		dmu_zero(os, ZVOL_OBJ, off, bytes, tx);
 		dmu_tx_commit(tx);
 		off += bytes;
 		resid -= bytes;
@@ -1138,7 +1138,7 @@ zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t vol_offset, uint64_t size,
 	    DVA_GET_OFFSET(dva), size, doread, isdump);
 
 	if (!ddi_in_panic())
-		spa_config_exit(spa, SCL_STATE, FTAG);
+	spa_config_exit(spa, SCL_STATE, FTAG);
 
 	return (error);
 }
