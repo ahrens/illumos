@@ -122,6 +122,7 @@ typedef struct zvol_state {
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
 	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
+	size_t		zv_ndvas;	/* number of dvas allocated */
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
 } zvol_state_t;
@@ -283,8 +284,13 @@ static void
 zvol_free_dvas(zvol_state_t *zv)
 {
 	if (zv->zv_dvas != NULL) {
-		kmem_free(zv->zv_dvas, zvol_num_blocks(zv) * sizeof (dva_t));
+		/*
+		 * Note, ndvas may differ from zvol_num_blocks() if the volume
+		 * size was changed (see zvol_size_changed()).
+		 */
+		kmem_free(zv->zv_dvas, zv->zv_ndvas * sizeof (dva_t));
 		zv->zv_dvas = NULL;
+		zv->zv_ndvas = 0;
 	}
 }
 
@@ -298,8 +304,8 @@ zvol_get_dvas(zvol_state_t *zv)
 
 	/* commit any in-flight changes before traversing the dataset */
 	txg_wait_synced(dmu_objset_pool(os), 0);
-	zv->zv_dvas = kmem_zalloc(zvol_num_blocks(zv) * sizeof (dva_t),
-	    KM_SLEEP);
+	zv->zv_ndvas = zvol_num_blocks(zv);
+	zv->zv_dvas = kmem_zalloc(zv->zv_ndvas * sizeof (dva_t), KM_SLEEP);
 	err = traverse_dataset(dmu_objset_ds(os), 0,
 	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA, zvol_map_block, zv);
 	if (err == 0) {
