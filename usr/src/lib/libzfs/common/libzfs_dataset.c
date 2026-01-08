@@ -2304,6 +2304,7 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 	case ZFS_PROP_NORMALIZE:
 	case ZFS_PROP_UTF8ONLY:
 	case ZFS_PROP_CASE:
+	case ZFS_PROP_RAWVOL:
 		if (zcmd_alloc_dst_nvlist(zhp->zfs_hdl, &zc, 0) != 0)
 			return (-1);
 		(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));

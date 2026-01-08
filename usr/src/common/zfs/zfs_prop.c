@@ -389,6 +389,9 @@ zfs_prop_init(void)
 	zprop_register_index(ZFS_PROP_UTF8ONLY, "utf8only", 0, PROP_ONETIME,
 	    ZFS_TYPE_FILESYSTEM | ZFS_TYPE_SNAPSHOT,
 	    "on | off", "UTF8ONLY", boolean_table);
+	zprop_register_index(ZFS_PROP_RAWVOL, "rawvol", 0, PROP_ONETIME,
+	    ZFS_TYPE_VOLUME | ZFS_TYPE_SNAPSHOT,
+	    "on | off", "RAWVOL", boolean_table);
 
 	/* string properties */
 	zprop_register_string(ZFS_PROP_ORIGIN, "origin", NULL, PROP_READONLY,

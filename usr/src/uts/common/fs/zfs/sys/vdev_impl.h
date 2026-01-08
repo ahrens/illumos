@@ -85,6 +85,8 @@ typedef void	vdev_remap_func_t(vdev_t *vd, uint64_t offset, uint64_t size,
     vdev_remap_cb_t callback, void *arg);
 typedef int	vdev_dumpio_func_t(vdev_t *vd, caddr_t data, size_t size,
     uint64_t offset, uint64_t origoffset, boolean_t doread, boolean_t isdump);
+typedef int	vdev_rawio_func_t(vdev_t *vd, buf_t *bp, size_t size,
+    uint64_t offset);
 /*
  * Given a target vdev, translates the logical range "in" to the physical
  * range "res"
@@ -109,6 +111,7 @@ typedef struct vdev_ops {
 	 */
 	vdev_xlation_func_t		*vdev_op_xlate;
 	vdev_dumpio_func_t		*vdev_op_dumpio;
+	vdev_rawio_func_t		*vdev_op_rawio;
 	char				vdev_op_type[16];
 	boolean_t			vdev_op_leaf;
 } vdev_ops_t;
