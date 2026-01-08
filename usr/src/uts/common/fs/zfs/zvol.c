@@ -116,9 +116,15 @@ enum zio_flags {
 	ZVOL_EXCL		= 1 << 2,
 	ZVOL_WCE		= 1 << 3,
 	ZVOL_RAW		= 1 << 4,
-	ZVOL_RAW_INITIALIZED	= 1 << 5,
-	ZVOL_CLOSE_NEEDED	= 1 << 6
+	ZVOL_RAW_INITIALIZED	= 1 << 5
 };
+
+/*
+ * For raw volumes we must keep the device open while the initialization
+ * is running. Track this extra open reference as the last element
+ * in the zv_open_count array.
+ */
+#define	OTYP_INITIALIZING	OTYPCNT
 
 /*
  * The in-core state of each volume.
@@ -131,7 +137,7 @@ typedef struct zvol_state {
 	uint8_t		zv_min_bs;	/* minimum addressable block shift */
 	enum zio_flags	zv_flags;	/* readonly, dumpified, etc. */
 	objset_t	*zv_objset;	/* objset handle */
-	uint32_t	zv_open_count[OTYPCNT];	/* open counts */
+	uint32_t	zv_open_count[OTYPCNT + 1];	/* open counts */
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
 	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
@@ -139,7 +145,6 @@ typedef struct zvol_state {
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
 	boolean_t	zv_zero_exit_wanted;
-	int		zv_zero_otyp;
 	kmutex_t	zv_state_lock;
 	kcondvar_t	zv_state_cv;
 	kthread_t	*zv_zero_thread;
@@ -580,7 +585,6 @@ zvol_create_minor(const char *name)
 	zv->zv_min_bs = DEV_BSHIFT;
 	zv->zv_minor = minor;
 	zv->zv_objset = os;
-	zv->zv_zero_otyp = OTYPCNT;
 
 	if (dmu_objset_is_snapshot(os) || !spa_writeable(dmu_objset_spa(os)))
 		zv->zv_flags |= ZVOL_RDONLY;
@@ -724,14 +728,12 @@ zvol_last_close(zvol_state_t *zv)
 	if (zv->zv_flags & ZVOL_RAW) {
 		zvol_free_dvas(zv);
 		zv->zv_flags &= ~ZVOL_RAW;
-		zv->zv_flags &= ~ZVOL_CLOSE_NEEDED;
 		zv->zv_zero_error = 0;
 		zfs_dbgmsg("zvol_last_close zv %p, flags %d", zv, zv->zv_flags);
 	}
 
 	dnode_rele(zv->zv_dn, zvol_tag);
 	zv->zv_dn = NULL;
-	zv->zv_zero_otyp = OTYPCNT;
 
 	/*
 	 * Evict cached data
@@ -826,33 +828,35 @@ zvol_zero_thread(void *arg)
 {
 	zvol_state_t *zv = arg;
 
-	int error = zvol_zero(zv);
 	mutex_enter(&zv->zv_state_lock);
 
+	/*
+	 * We are about to start the initialization of the raw volume so
+	 * add a special open count to ensure that we don't disown the
+	 * objset when the device is closed.
+	 */
+	VERIFY0(zv->zv_open_count[OTYP_INITIALIZING]);
+	zv->zv_total_opens++;
+	zv->zv_open_count[OTYP_INITIALIZING]++;
+	mutex_exit(&zv->zv_state_lock);
+
+	int error = zvol_zero(zv);
+
+	mutex_enter(&zv->zv_state_lock);
 	if (error == 0) {
 		zv->zv_flags |= ZVOL_RAW_INITIALIZED;
+	}
 
-		/*
-		 * If zvol_close deferred the close, then the zvol_zero_thread
-		 * must perform the close once the initialization thread
-		 * exits. If zvol_zero() returned back EINTR, then the
-		 * initialization was stopped via the administration
-		 * interface. The thread that made the request will perform
-		 * the last close when it exits so don't do it here.
-		 */
-		if (zv->zv_flags & ZVOL_CLOSE_NEEDED) {
-			zfs_dbgmsg("zvol_zero last close: zv %p, "
-			    "flags %d, opens %u", zv,
-			    zv->zv_flags, zv->zv_total_opens);
+	zfs_dbgmsg("zvol_zero last close: zv %p, "
+	    "flags %d, opens %u", zv,
+	    zv->zv_flags, zv->zv_total_opens);
 
-			zv->zv_flags &= ~ZVOL_CLOSE_NEEDED;
-
-			zv->zv_total_opens--;
-			zv->zv_open_count[zv->zv_zero_otyp]--;
-			VERIFY3S(zv->zv_total_opens, >=, 0);
-			if (zv->zv_total_opens == 0)
-				zvol_last_close(zv);
-		}
+	zv->zv_total_opens--;
+	zv->zv_open_count[OTYP_INITIALIZING]--;
+	VERIFY3S(zv->zv_total_opens, >=, 0);
+	VERIFY3S(zv->zv_open_count[OTYP_INITIALIZING], >=, 0);
+	if (zv->zv_total_opens == 0) {
+		zvol_last_close(zv);
 	} else {
 		zfs_dbgmsg("zvol_zero exiting: zv %p, "
 		    "flags %d, opens %u", zv,
@@ -1142,26 +1146,7 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 	VERIFY3S(zv->zv_total_opens, >=, 0);
 
 	if (zv->zv_total_opens == 0) {
-		if ((zv->zv_flags & ZVOL_RAW) && zv->zv_zero_thread != NULL) {
-			/*
-			 * We have an active raw volume that is being
-			 * zeroed. Keep a reference open for that zvol.
-			 * We will drop these references when the zeroing
-			 * process completes.
-			 */
-			zv->zv_open_count[otyp]++;
-			zv->zv_total_opens++;
-			zv->zv_zero_otyp = otyp;
-
-			/*
-			 * Indicates that the raw volume initialization
-			 * should perform the last close if it's the
-			 * only remaining reference.
-			 */
-			zv->zv_flags |= ZVOL_CLOSE_NEEDED;
-		} else {
-			zvol_last_close(zv);
-		}
+		zvol_last_close(zv);
 	}
 	mutex_exit(&zv->zv_state_lock);
 	mutex_exit(&zfsdev_state_lock);
