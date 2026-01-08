@@ -232,8 +232,17 @@ zvol_get_stats(objset_t *os, nvlist_t *nv)
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &val);
 	if (error)
 		return (error);
-
 	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_VOLSIZE, val);
+
+	error = zap_lookup(os, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_RAWVOL), 8, 1, &val);
+	if (error == ENOENT) {
+		val = B_FALSE;
+		error = 0;
+	} else if (error) {
+		return (error);
+	}
+	dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_RAWVOL, val);
 
 	error = dmu_object_info(os, ZVOL_OBJ, &doi);
 
