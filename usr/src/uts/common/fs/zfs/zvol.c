@@ -125,7 +125,6 @@ enum zio_flags {
  * in the zv_open_count array.
  */
 #define	OTYP_INITIALIZING	OTYPCNT
-#define	OTYP_LOCKED		OTYPCNT + 1
 
 /*
  * The in-core state of each volume.
@@ -138,7 +137,7 @@ typedef struct zvol_state {
 	uint8_t		zv_min_bs;	/* minimum addressable block shift */
 	enum zio_flags	zv_flags;	/* readonly, dumpified, etc. */
 	objset_t	*zv_objset;	/* objset handle */
-	uint32_t	zv_open_count[OTYPCNT + 2];	/* open counts */
+	uint32_t	zv_open_count[OTYPCNT + 1];	/* open counts */
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
 	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
@@ -1036,7 +1035,7 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	if (zv->zv_objset == NULL) {
 		dev = makedevice(ddi_driver_major(zfs_dip), zv->zv_minor);
 		mutex_exit(&zfsdev_state_lock);
-		error = zvol_open(&dev, FWRITE, OTYP_LOCKED, NULL);
+		error = zvol_open(&dev, FWRITE, OTYP_LYR, NULL);
 		if (error) {
 			return (SET_ERROR(error));
 		}
@@ -1063,7 +1062,7 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 out:
 	mutex_exit(&zfsdev_state_lock);
 	if (opened) {
-		error = zvol_close(dev, FWRITE, OTYP_LOCKED, NULL);
+		error = zvol_close(dev, FWRITE, OTYP_LYR, NULL);
 	}
 	return (error);
 }
