@@ -125,6 +125,7 @@ enum zio_flags {
  * in the zv_open_count array.
  */
 #define	OTYP_INITIALIZING	OTYPCNT
+#define	OTYP_LOCKED		OTYPCNT + 1
 
 /*
  * The in-core state of each volume.
@@ -137,7 +138,7 @@ typedef struct zvol_state {
 	uint8_t		zv_min_bs;	/* minimum addressable block shift */
 	enum zio_flags	zv_flags;	/* readonly, dumpified, etc. */
 	objset_t	*zv_objset;	/* objset handle */
-	uint32_t	zv_open_count[OTYPCNT + 1];	/* open counts */
+	uint32_t	zv_open_count[OTYPCNT + 2];	/* open counts */
 	uint32_t	zv_total_opens;	/* total open count */
 	zilog_t		*zv_zilog;	/* ZIL handle */
 	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
@@ -850,6 +851,7 @@ zvol_zero_thread(void *arg)
 	zv->zv_open_count[OTYP_INITIALIZING]--;
 	VERIFY3S(zv->zv_total_opens, >=, 0);
 	VERIFY3S(zv->zv_open_count[OTYP_INITIALIZING], >=, 0);
+
 	if (zv->zv_total_opens == 0) {
 		zvol_last_close(zv);
 	} else {
@@ -1010,11 +1012,11 @@ int
 zvol_set_volsize(const char *name, uint64_t volsize)
 {
 	zvol_state_t *zv = NULL;
-	objset_t *os;
 	int error;
 	dmu_object_info_t doi;
 	uint64_t readonly;
-	boolean_t owned = B_FALSE;
+	boolean_t opened = B_FALSE;
+	dev_t dev;
 
 	error = dsl_prop_get_integer(name,
 	    zfs_prop_to_name(ZFS_PROP_READONLY), &readonly, NULL);
@@ -1026,42 +1028,43 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	mutex_enter(&zfsdev_state_lock);
 	zv = zvol_minor_lookup(name);
 
-	if (zv == NULL || zv->zv_objset == NULL) {
-		if ((error = dmu_objset_own(name, DMU_OST_ZVOL, B_FALSE, B_TRUE,
-		    FTAG, &os)) != 0) {
-			mutex_exit(&zfsdev_state_lock);
-			return (error);
-		}
-		owned = B_TRUE;
-		if (zv != NULL)
-			zv->zv_objset = os;
-	} else {
-		os = zv->zv_objset;
+	if (zv == NULL) {
+		mutex_exit(&zfsdev_state_lock);
+		return (SET_ERROR(ENOENT));
 	}
 
-	if ((error = dmu_object_info(os, ZVOL_OBJ, &doi)) != 0 ||
+	if (zv->zv_objset == NULL) {
+		dev = makedevice(ddi_driver_major(zfs_dip), zv->zv_minor);
+		mutex_exit(&zfsdev_state_lock);
+		error = zvol_open(&dev, FWRITE, OTYP_LOCKED, NULL);
+		if (error) {
+			return (SET_ERROR(error));
+		}
+		mutex_enter(&zfsdev_state_lock);
+		opened = B_TRUE;
+	}
+
+	if ((error = dmu_object_info(zv->zv_objset, ZVOL_OBJ, &doi)) != 0 ||
 	    (error = zvol_check_volsize(volsize, doi.doi_data_block_size)) != 0)
 		goto out;
 
 	uint64_t rawvol;
-	error = zap_lookup(os, ZVOL_ZAP_OBJ, zfs_prop_to_name(ZFS_PROP_RAWVOL),
-	    8, 1, &rawvol);
+	error = zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
+	    zfs_prop_to_name(ZFS_PROP_RAWVOL), 8, 1, &rawvol);
 	if (error == 0 && rawvol) {
 		error = SET_ERROR(ERANGE);
 		goto out;
 	}
 
-	error = zvol_update_volsize(os, volsize);
+	error = zvol_update_volsize(zv->zv_objset, volsize);
 
 	if (error == 0 && zv != NULL)
 		error = zvol_update_live_volsize(zv, volsize);
 out:
-	if (owned) {
-		dmu_objset_disown(os, B_TRUE, FTAG);
-		if (zv != NULL)
-			zv->zv_objset = NULL;
-	}
 	mutex_exit(&zfsdev_state_lock);
+	if (opened) {
+		error = zvol_close(dev, FWRITE, OTYP_LOCKED, NULL);
+	}
 	return (error);
 }
 
