@@ -835,18 +835,6 @@ zvol_zero_thread(void *arg)
 {
 	zvol_state_t *zv = arg;
 
-	mutex_enter(&zv->zv_state_lock);
-
-	/*
-	 * We are about to start the initialization of the raw volume so
-	 * add a special open count to ensure that we don't disown the
-	 * objset when the device is closed.
-	 */
-	VERIFY0(zv->zv_open_count[OTYP_INITIALIZING]);
-	zv->zv_total_opens++;
-	zv->zv_open_count[OTYP_INITIALIZING]++;
-	mutex_exit(&zv->zv_state_lock);
-
 	int error = zvol_zero(zv);
 
 	mutex_enter(&zv->zv_state_lock);
@@ -903,6 +891,15 @@ zvol_prealloc(zvol_state_t *zv)
 	}
 
 	if (zv->zv_zero_thread == NULL) {
+		/*
+		 * We are about to start the initialization of the raw volume
+		 * so add a special open count to ensure that we don't disown
+		 * the objset when the device is closed.
+		 */
+		VERIFY0(zv->zv_open_count[OTYP_INITIALIZING]);
+		zv->zv_total_opens++;
+		zv->zv_open_count[OTYP_INITIALIZING]++;
+
 		zv->zv_zero_thread = thread_create(NULL, 0,
 		    zvol_zero_thread, zv, 0, &p0, TS_RUN, maxclsyspri);
 	}
