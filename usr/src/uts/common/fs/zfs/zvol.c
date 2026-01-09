@@ -175,7 +175,7 @@ static int zvol_get_data(void *arg, lr_write_t *lr, char *buf,
 static int zvol_dumpify(zvol_state_t *zv);
 static int zvol_dump_fini(zvol_state_t *zv);
 static int zvol_dump_init(zvol_state_t *zv, boolean_t resize);
-int zvol_prealloc(zvol_state_t *zv);
+static int zvol_prealloc(zvol_state_t *zv);
 
 static void
 zvol_size_changed(zvol_state_t *zv, uint64_t volsize)
@@ -581,6 +581,7 @@ zvol_create_minor(const char *name)
 	zs->zss_type = ZSST_ZVOL;
 	zv = zs->zss_data = kmem_zalloc(sizeof (zvol_state_t), KM_SLEEP);
 	(void) strlcpy(zv->zv_name, name, MAXPATHLEN);
+	/* XXX for raw vol, should we get this from the underlying device? */
 	zv->zv_min_bs = DEV_BSHIFT;
 	zv->zv_minor = minor;
 	zv->zv_objset = os;
@@ -624,6 +625,10 @@ zvol_remove_zv(zvol_state_t *zv)
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 	if (zv->zv_total_opens != 0)
 		return (SET_ERROR(EBUSY));
+
+	/* zvol_last_close() should have cleaned these up already */
+	ASSERT(zv->zv_objset == NULL);
+	ASSERT(zv->zv_dvas == NULL);
 
 	(void) snprintf(nmbuf, sizeof (nmbuf), "%u,raw", minor);
 	ddi_remove_minor_node(zfs_dip, nmbuf);
@@ -723,7 +728,6 @@ zvol_last_close(zvol_state_t *zv)
 	zv->zv_zilog = NULL;
 
 	VERIFY(MUTEX_HELD(&zv->zv_state_lock));
-	/* XXX - should we do this when we remove the zv? */
 	if (zv->zv_flags & ZVOL_RAW) {
 		zvol_free_dvas(zv);
 		zv->zv_flags &= ~ZVOL_RAW;
@@ -784,11 +788,12 @@ zvol_zero(zvol_state_t *zv)
 		error = dmu_tx_assign(tx, TXG_WAIT);
 		if (error) {
 			dmu_tx_abort(tx);
+			/* XXX for rawvol, not sure it makes sense to free the object on failure; we can try to continue on next open */
 			(void) dmu_free_long_range(os, ZVOL_OBJ,
 			    0, off);
 			zfs_dbgmsg("zvol_zero failed: %d", error);
 			mutex_enter(&zv->zv_state_lock);
-			goto out;
+			break;
 		}
 		dmu_zero(os, ZVOL_OBJ, off, bytes, tx);
 
@@ -799,22 +804,25 @@ zvol_zero(zvol_state_t *zv)
 
 		mutex_enter(&zv->zv_state_lock);
 	}
-out:
 	if (bytes_zeroed > 0)
 		txg_wait_synced(dmu_objset_pool(os), 0);
 
-	zfs_dbgmsg("zvol_zero complete zv %p, "
-	    "flags %d, resid %llu, bytes_zeroed %llu, opens %u", zv,
-	    zv->zv_flags, resid, bytes_zeroed, zv->zv_total_opens);
 
 	if (zv->zv_zero_exit_wanted) {
 		zfs_dbgmsg("zvol_zero shutting down: zv %p, flags %d, "
 		    "resid %llu, off %llu, bytes_zeroed %llu", zv,
 		    zv->zv_flags, resid, off, bytes_zeroed);
 		error = EINTR;
+	} else {
+		zfs_dbgmsg("zvol_zero complete zv %p, "
+		    "flags %d, resid %llu, bytes_zeroed %llu, opens %u", zv,
+		    zv->zv_flags, resid, bytes_zeroed, zv->zv_total_opens);
 	}
+
+	/* XXX move this cleanup to zvol_zero_thread()? */
 	zv->zv_zero_exit_wanted = B_FALSE;
 	zv->zv_zero_thread = NULL;
+
 	if (error == 0)
 		VERIFY0(resid);
 
@@ -868,18 +876,18 @@ zvol_zero_thread(void *arg)
 	thread_exit();
 }
 
-int
+static int
 zvol_prealloc(zvol_state_t *zv)
 {
 	objset_t *os = zv->zv_objset;
 	uint64_t refd, avail, usedobjs, availobjs;
 	uint64_t off;
 	uint64_t volsize;
-	uint64_t resid;
+	uint64_t size;
 
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 
-	int error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &resid);
+	int error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &size);
 	if (error) {
 		return (SET_ERROR(EINVAL));
 	}
@@ -888,9 +896,9 @@ zvol_prealloc(zvol_state_t *zv)
 
 	/* Check the space usage before attempting to allocate the space */
 	dmu_objset_space(os, &refd, &avail, &usedobjs, &availobjs);
-	if (avail < (resid - off)) {
-		zfs_dbgmsg("zvol_prealloc ENOSPC avail %llu, resid %llu, "
-		    "offset %llu", avail, resid, off);
+	if (avail < (size - off)) {
+		zfs_dbgmsg("zvol_prealloc ENOSPC avail %llu, size %llu, "
+		    "offset %llu", avail, size, off);
 		return (SET_ERROR(ENOSPC));
 	}
 
@@ -1380,6 +1388,7 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 	if (!(zv->zv_flags & ZVOL_RAW_INITIALIZED))
 		return (SET_ERROR(EINPROGRESS));
 
+	/* XXX Maybe we should zvol_get_dvas() before setting ZVOL_RAW_INITIALIZED? */
 	mutex_enter(&zv->zv_state_lock);
 	if (zv->zv_dvas == NULL) {
 		zfs_dbgmsg("zvol_rawio get DVAs, zv %p", zv);
@@ -1450,7 +1459,8 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 	}
 	biofini(&child_bp);
 
-	if ((bp->b_resid = resid) == bp->b_bcount)
+	bp->b_resid = resid;
+	if (bp->b_resid == bp->b_bcount)
 		bioerror(bp, off > volsize ? EINVAL : error);
 
 	biodone(bp);
@@ -2295,7 +2305,7 @@ zfs_mvdev_dump_activate_feature_sync(void *arg, dmu_tx_t *tx)
 }
 
 int
-zvol_raw_volume_init(objset_t *os, boolean_t resize)
+zvol_raw_volume_init(objset_t *os)
 {
 	dmu_tx_t *tx;
 	int error;
@@ -2305,47 +2315,34 @@ zvol_raw_volume_init(objset_t *os, boolean_t resize)
 
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 
-	error = dmu_free_long_range(os, ZVOL_OBJ, 0,
-	    DMU_OBJECT_END);
-	if (error != 0)
-		return (error);
-	/* wait for dmu_free_long_range to actually free the blocks */
-	txg_wait_synced(dmu_objset_pool(os), 0);
-
 	/*
-	 * We only need to update the zvol's property if we are initializing
-	 * for the first time.
+	 * If MULTI_VDEV_CRASH_DUMP is active, use the NOPARITY checksum
+	 * function.  Otherwise, use the old default -- OFF.
 	 */
-	if (!resize) {
-		/*
-		 * If MULTI_VDEV_CRASH_DUMP is active, use the NOPARITY checksum
-		 * function.  Otherwise, use the old default -- OFF.
-		 */
-		uint64_t checksum = spa_feature_is_active(spa,
-		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP) ? ZIO_CHECKSUM_NOPARITY :
-		    ZIO_CHECKSUM_OFF;
+	uint64_t checksum = spa_feature_is_active(spa,
+	    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP) ? ZIO_CHECKSUM_NOPARITY :
+	    ZIO_CHECKSUM_OFF;
 
-		VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+	VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+	VERIFY(nvlist_add_uint64(nv,
+	    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 0) == 0);
+	VERIFY(nvlist_add_uint64(nv,
+	    zfs_prop_to_name(ZFS_PROP_COMPRESSION),
+	    ZIO_COMPRESS_OFF) == 0);
+	VERIFY(nvlist_add_uint64(nv,
+	    zfs_prop_to_name(ZFS_PROP_CHECKSUM),
+	    checksum) == 0);
+	if (version >= SPA_VERSION_DEDUP) {
 		VERIFY(nvlist_add_uint64(nv,
-		    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 0) == 0);
-		VERIFY(nvlist_add_uint64(nv,
-		    zfs_prop_to_name(ZFS_PROP_COMPRESSION),
-		    ZIO_COMPRESS_OFF) == 0);
-		VERIFY(nvlist_add_uint64(nv,
-		    zfs_prop_to_name(ZFS_PROP_CHECKSUM),
-		    checksum) == 0);
-		if (version >= SPA_VERSION_DEDUP) {
-			VERIFY(nvlist_add_uint64(nv,
-			    zfs_prop_to_name(ZFS_PROP_DEDUP),
-			    ZIO_CHECKSUM_OFF) == 0);
-		}
-
-		char osname[ZFS_MAX_DATASET_NAME_LEN];
-		dmu_objset_name(os, osname);
-		error = zfs_set_prop_nvlist(osname, ZPROP_SRC_LOCAL,
-		    nv, NULL);
-		nvlist_free(nv);
+		    zfs_prop_to_name(ZFS_PROP_DEDUP),
+		    ZIO_CHECKSUM_OFF) == 0);
 	}
+
+	char osname[ZFS_MAX_DATASET_NAME_LEN];
+	dmu_objset_name(os, osname);
+	error = zfs_set_prop_nvlist(osname, ZPROP_SRC_LOCAL,
+	    nv, NULL);
+	nvlist_free(nv);
 	return (error);
 }
 
@@ -2361,6 +2358,14 @@ zvol_dump_init(zvol_state_t *zv, boolean_t resize)
 	uint64_t checksum, compress, refresrv, vbs, dedup;
 
 	ASSERT(vd->vdev_ops == &vdev_root_ops);
+
+	error = dmu_free_long_range(os, ZVOL_OBJ, 0,
+	    DMU_OBJECT_END);
+	if (error != 0)
+		return (error);
+	/* wait for dmu_free_long_range to actually free the blocks */
+	txg_wait_synced(dmu_objset_pool(os), 0);
+
 
 	/*
 	 * If the pool on which the dump device is being initialized has more
@@ -2418,7 +2423,7 @@ zvol_dump_init(zvol_state_t *zv, boolean_t resize)
 	}
 
 	/*
-	 * If we are resizing the device then we only need to
+	 * If we are resizing the dump device then we only need to
 	 * update the refreservation to match the newly updated
 	 * zvolsize. Otherwise, we save off the original state of the
 	 * zvol so that we can restore them if the zvol is ever undumpified.
@@ -2461,7 +2466,14 @@ zvol_dump_init(zvol_state_t *zv, boolean_t resize)
 		}
 	}
 	dmu_tx_commit(tx);
-	return (zvol_raw_volume_init(zv->zv_objset, resize));
+	/*
+	* We only need to update the zvol's property if we are initializing
+	* the dump area for the first time.
+	*/
+	if (!resize) {
+		return (zvol_raw_volume_init(zv->zv_objset));
+	}
+	return (0);
 }
 
 static int
@@ -2537,14 +2549,6 @@ zvol_dumpify(zvol_state_t *zv)
 	return (0);
 }
 
-static void
-zvol_raw_volume_fini(objset_t *os)
-{
-	(void) dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
-	/* wait for dmu_free_long_range to actually free the blocks */
-	txg_wait_synced(dmu_objset_pool(os), 0);
-}
-
 static int
 zvol_dump_fini(zvol_state_t *zv)
 {
@@ -2603,7 +2607,9 @@ zvol_dump_fini(zvol_state_t *zv)
 	zv->zv_flags &= ~ZVOL_DUMPIFIED;
 	mutex_exit(&zv->zv_state_lock);
 
-	zvol_raw_volume_fini(zv->zv_objset);
+	(void) dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
+	/* wait for dmu_free_long_range to actually free the blocks */
+	txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_bonus(tx, ZVOL_OBJ);
