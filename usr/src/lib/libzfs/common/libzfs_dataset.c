@@ -1745,6 +1745,11 @@ zfs_setprop_error(libzfs_handle_t *hdl, zfs_prop_t prop, int err,
 			    "property setting is not allowed on "
 			    "root pools"));
 			(void) zfs_error(hdl, EZFS_NOTSUP, errbuf);
+		} else if (prop == ZFS_PROP_VOLSIZE) {
+			(void) zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			   "property setting is not allowed on "
+			   "raw volumes"));
+			(void) zfs_error(hdl, EZFS_NOTSUP, errbuf);
 		} else {
 			(void) zfs_standard_error(hdl, err, errbuf);
 		}

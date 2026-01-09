@@ -1039,6 +1039,14 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	    (error = zvol_check_volsize(volsize, doi.doi_data_block_size)) != 0)
 		goto out;
 
+	uint64_t rawvol;
+	error = zap_lookup(os, ZVOL_ZAP_OBJ, zfs_prop_to_name(ZFS_PROP_RAWVOL),
+	    8, 1, &rawvol);
+	if (error == 0 && rawvol) {
+		error = SET_ERROR(ERANGE);
+		goto out;
+	}
+
 	error = zvol_update_volsize(os, volsize);
 
 	if (error == 0 && zv != NULL)
