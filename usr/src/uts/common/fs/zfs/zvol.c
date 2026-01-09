@@ -175,7 +175,6 @@ static int zvol_get_data(void *arg, lr_write_t *lr, char *buf,
 static int zvol_dumpify(zvol_state_t *zv);
 static int zvol_dump_fini(zvol_state_t *zv);
 static int zvol_dump_init(zvol_state_t *zv, boolean_t resize);
-static int zvol_raw_volume_fini(objset_t *os);
 int zvol_prealloc(zvol_state_t *zv);
 
 static void
@@ -2301,9 +2300,8 @@ zvol_raw_volume_init(objset_t *os, boolean_t resize)
 	dmu_tx_t *tx;
 	int error;
 	spa_t *spa = dmu_objset_spa(os);
-	nvlist_t *nv = NULL;
 	uint64_t version = spa_version(spa);
-	uint64_t checksum, compress, refresrv, vbs, dedup;
+	nvlist_t *nv = NULL;
 
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 
@@ -2314,25 +2312,97 @@ zvol_raw_volume_init(objset_t *os, boolean_t resize)
 	/* wait for dmu_free_long_range to actually free the blocks */
 	txg_wait_synced(dmu_objset_pool(os), 0);
 
+	/*
+	 * We only need to update the zvol's property if we are initializing
+	 * for the first time.
+	 */
 	if (!resize) {
-		error = dsl_prop_get_int_ds(dmu_objset_ds(os),
-		    zfs_prop_to_name(ZFS_PROP_COMPRESSION), &compress);
+		/*
+		 * If MULTI_VDEV_CRASH_DUMP is active, use the NOPARITY checksum
+		 * function.  Otherwise, use the old default -- OFF.
+		 */
+		uint64_t checksum = spa_feature_is_active(spa,
+		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP) ? ZIO_CHECKSUM_NOPARITY :
+		    ZIO_CHECKSUM_OFF;
+
+		VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_SLEEP) == 0);
+		VERIFY(nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 0) == 0);
+		VERIFY(nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_COMPRESSION),
+		    ZIO_COMPRESS_OFF) == 0);
+		VERIFY(nvlist_add_uint64(nv,
+		    zfs_prop_to_name(ZFS_PROP_CHECKSUM),
+		    checksum) == 0);
+		if (version >= SPA_VERSION_DEDUP) {
+			VERIFY(nvlist_add_uint64(nv,
+			    zfs_prop_to_name(ZFS_PROP_DEDUP),
+			    ZIO_CHECKSUM_OFF) == 0);
+		}
+
+		char osname[ZFS_MAX_DATASET_NAME_LEN];
+		dmu_objset_name(os, osname);
+		error = zfs_set_prop_nvlist(osname, ZPROP_SRC_LOCAL,
+		    nv, NULL);
+		nvlist_free(nv);
+	}
+	return (error);
+}
+
+static int
+zvol_dump_init(zvol_state_t *zv, boolean_t resize)
+{
+	dmu_tx_t *tx;
+	int error = 0;
+	objset_t *os = zv->zv_objset;
+	spa_t *spa = dmu_objset_spa(os);
+	vdev_t *vd = spa->spa_root_vdev;
+	uint64_t version = spa_version(spa);
+	uint64_t checksum, compress, refresrv, vbs, dedup;
+
+	ASSERT(vd->vdev_ops == &vdev_root_ops);
+
+	/*
+	 * If the pool on which the dump device is being initialized has more
+	 * than one child vdev, check that the MULTI_VDEV_CRASH_DUMP feature is
+	 * enabled.  If so, bump that feature's counter to indicate that the
+	 * feature is active. We also check the vdev type to handle the
+	 * following case:
+	 *   # zpool create test raidz disk1 disk2 disk3
+	 *   Now have spa_root_vdev->vdev_children == 1 (the raidz vdev),
+	 *   the raidz vdev itself has 3 children.
+	 */
+	if (vd->vdev_children > 1 || vd->vdev_ops == &vdev_raidz_ops) {
+		if (!spa_feature_is_enabled(spa,
+		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP))
+			return (SET_ERROR(ENOTSUP));
+		(void) dsl_sync_task(spa_name(spa),
+		    zfs_mvdev_dump_feature_check,
+		    zfs_mvdev_dump_activate_feature_sync, NULL,
+		    2, ZFS_SPACE_CHECK_RESERVED);
+	}
+
+	if (!resize) {
+		error = dsl_prop_get_integer(zv->zv_name,
+		    zfs_prop_to_name(ZFS_PROP_COMPRESSION), &compress, NULL);
 		if (error == 0) {
-			error = dsl_prop_get_int_ds(dmu_objset_ds(os),
-			    zfs_prop_to_name(ZFS_PROP_CHECKSUM), &checksum);
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_CHECKSUM), &checksum,
+			    NULL);
 		}
 		if (error == 0) {
-			error = dsl_prop_get_int_ds(dmu_objset_ds(os),
+			error = dsl_prop_get_integer(zv->zv_name,
 			    zfs_prop_to_name(ZFS_PROP_REFRESERVATION),
-			    &refresrv);
+			    &refresrv, NULL);
 		}
 		if (error == 0) {
-			error = dsl_prop_get_int_ds(dmu_objset_ds(os),
-			    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), &vbs);
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), &vbs,
+			    NULL);
 		}
 		if (version >= SPA_VERSION_DEDUP && error == 0) {
-			error = dsl_prop_get_int_ds(dmu_objset_ds(os),
-			    zfs_prop_to_name(ZFS_PROP_DEDUP), &dedup);
+			error = dsl_prop_get_integer(zv->zv_name,
+			    zfs_prop_to_name(ZFS_PROP_DEDUP), &dedup, NULL);
 		}
 	}
 	if (error != 0)
@@ -2391,72 +2461,6 @@ zvol_raw_volume_init(objset_t *os, boolean_t resize)
 		}
 	}
 	dmu_tx_commit(tx);
-
-	/*
-	 * We only need to update the zvol's property if we are initializing
-	 * for the first time.
-	 */
-	if (error == 0 && !resize) {
-		/*
-		 * If MULTI_VDEV_CRASH_DUMP is active, use the NOPARITY checksum
-		 * function.  Otherwise, use the old default -- OFF.
-		 */
-		checksum = spa_feature_is_active(spa,
-		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP) ? ZIO_CHECKSUM_NOPARITY :
-		    ZIO_CHECKSUM_OFF;
-
-		VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_SLEEP) == 0);
-		VERIFY(nvlist_add_uint64(nv,
-		    zfs_prop_to_name(ZFS_PROP_REFRESERVATION), 0) == 0);
-		VERIFY(nvlist_add_uint64(nv,
-		    zfs_prop_to_name(ZFS_PROP_COMPRESSION),
-		    ZIO_COMPRESS_OFF) == 0);
-		VERIFY(nvlist_add_uint64(nv,
-		    zfs_prop_to_name(ZFS_PROP_CHECKSUM),
-		    checksum) == 0);
-		if (version >= SPA_VERSION_DEDUP) {
-			VERIFY(nvlist_add_uint64(nv,
-			    zfs_prop_to_name(ZFS_PROP_DEDUP),
-			    ZIO_CHECKSUM_OFF) == 0);
-		}
-
-		char osname[ZFS_MAX_DATASET_NAME_LEN];
-		dmu_objset_name(os, osname);
-		error = zfs_set_prop_nvlist(osname, ZPROP_SRC_LOCAL,
-		    nv, NULL);
-		nvlist_free(nv);
-	}
-	return (error);
-}
-
-static int
-zvol_dump_init(zvol_state_t *zv, boolean_t resize)
-{
-	spa_t *spa = dmu_objset_spa(zv->zv_objset);
-	vdev_t *vd = spa->spa_root_vdev;
-
-	ASSERT(vd->vdev_ops == &vdev_root_ops);
-
-	/*
-	 * If the pool on which the dump device is being initialized has more
-	 * than one child vdev, check that the MULTI_VDEV_CRASH_DUMP feature is
-	 * enabled.  If so, bump that feature's counter to indicate that the
-	 * feature is active. We also check the vdev type to handle the
-	 * following case:
-	 *   # zpool create test raidz disk1 disk2 disk3
-	 *   Now have spa_root_vdev->vdev_children == 1 (the raidz vdev),
-	 *   the raidz vdev itself has 3 children.
-	 */
-	if (vd->vdev_children > 1 || vd->vdev_ops == &vdev_raidz_ops) {
-		if (!spa_feature_is_enabled(spa,
-		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP))
-			return (SET_ERROR(ENOTSUP));
-		(void) dsl_sync_task(spa_name(spa),
-		    zfs_mvdev_dump_feature_check,
-		    zfs_mvdev_dump_activate_feature_sync, NULL,
-		    2, ZFS_SPACE_CHECK_RESERVED);
-	}
-
 	return (zvol_raw_volume_init(zv->zv_objset, resize));
 }
 
@@ -2533,21 +2537,40 @@ zvol_dumpify(zvol_state_t *zv)
 	return (0);
 }
 
-static int
+static void
 zvol_raw_volume_fini(objset_t *os)
 {
+	(void) dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
+	/* wait for dmu_free_long_range to actually free the blocks */
+	txg_wait_synced(dmu_objset_pool(os), 0);
+}
+
+static int
+zvol_dump_fini(zvol_state_t *zv)
+{
 	dmu_tx_t *tx;
+	objset_t *os = zv->zv_objset;
 	nvlist_t *nv;
 	int error = 0;
 	uint64_t checksum, compress, refresrv, vbs, dedup;
 	uint64_t version = spa_version(dmu_objset_spa(os));
 
 	/*
-	 * Attempt to restore the zvol back to a standard zvol.
+	 * Attempt to restore the zvol back to its pre-dumpified state.
 	 * This is a best-effort attempt as it's possible that not all
-	 * of these properties were initialized during the conversion process
-	 * (i.e. error during zvol_raw_volume_init).
+	 * of these properties were initialized during the dumpify process
+	 * (i.e. error during zvol_dump_init).
 	 */
+
+	tx = dmu_tx_create(os);
+	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
+	error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error) {
+		dmu_tx_abort(tx);
+		return (error);
+	}
+	(void) zap_remove(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, tx);
+	dmu_tx_commit(tx);
 
 	(void) zap_lookup(os, ZVOL_ZAP_OBJ,
 	    zfs_prop_to_name(ZFS_PROP_CHECKSUM), 8, 1, &checksum);
@@ -2571,15 +2594,17 @@ zvol_raw_volume_fini(objset_t *os)
 		(void) nvlist_add_uint64(nv,
 		    zfs_prop_to_name(ZFS_PROP_DEDUP), dedup);
 	}
-	char osname[ZFS_MAX_DATASET_NAME_LEN];
-	dmu_objset_name(os, osname);
-	(void) zfs_set_prop_nvlist(osname, ZPROP_SRC_LOCAL,
+	(void) zfs_set_prop_nvlist(zv->zv_name, ZPROP_SRC_LOCAL,
 	    nv, NULL);
 	nvlist_free(nv);
 
-	(void) dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
-	/* wait for dmu_free_long_range to actually free the blocks */
-	txg_wait_synced(dmu_objset_pool(os), 0);
+	mutex_enter(&zv->zv_state_lock);
+	zvol_free_dvas(zv);
+	zv->zv_flags &= ~ZVOL_DUMPIFIED;
+	mutex_exit(&zv->zv_state_lock);
+
+	zvol_raw_volume_fini(zv->zv_objset);
+
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_bonus(tx, ZVOL_OBJ);
 	error = dmu_tx_assign(tx, TXG_WAIT);
@@ -2588,48 +2613,9 @@ zvol_raw_volume_fini(objset_t *os)
 		return (error);
 	}
 
-	zfs_dbgmsg("dmu_object_set_blocksize vbs %llu", vbs);
-	VERIFY0(dmu_object_set_blocksize(os, ZVOL_OBJ, vbs, 0, tx));
+	if (dmu_object_set_blocksize(os, ZVOL_OBJ, vbs, 0, tx) == 0)
+		zv->zv_volblocksize = vbs;
 	dmu_tx_commit(tx);
 
 	return (0);
-}
-
-static int
-zvol_dump_fini(zvol_state_t *zv)
-{
-	int error = 0;
-
-	/*
-	 * Attempt to restore the zvol back to its pre-dumpified state.
-	 * This is a best-effort attempt as it's possible that not all
-	 * of these properties were initialized during the dumpify process
-	 * (i.e. error during zvol_dump_init).
-	 */
-
-	dmu_tx_t *tx = dmu_tx_create(zv->zv_objset);
-	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
-	error = dmu_tx_assign(tx, TXG_WAIT);
-	if (error) {
-		dmu_tx_abort(tx);
-		return (error);
-	}
-	(void) zap_remove(zv->zv_objset, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, tx);
-	dmu_tx_commit(tx);
-
-	error = zvol_raw_volume_fini(zv->zv_objset);
-	if (error == 0) {
-		uint64_t vbs;
-		mutex_enter(&zv->zv_state_lock);
-		zvol_free_dvas(zv);
-		zv->zv_flags &= ~ZVOL_DUMPIFIED;
-		mutex_exit(&zv->zv_state_lock);
-
-		if ((error = dsl_prop_get_integer(zv->zv_name,
-		    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), &vbs,
-		    NULL))) {
-			zv->zv_volblocksize = vbs;
-		}
-	}
-	return (error);
 }
