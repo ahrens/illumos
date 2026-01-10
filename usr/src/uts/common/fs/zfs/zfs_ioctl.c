@@ -7163,7 +7163,7 @@ zfsdev_open(dev_t *devp, int flag, int otyp, cred_t *cr)
 	int error = 0;
 
 	if (getminor(*devp) != 0)
-		return (zvol_open(devp, flag, otyp, cr));
+		return (zvol_open(*devp, flag, otyp, cr));
 
 	/* This is the control device. Allocate a new minor if requested. */
 	if (flag & FEXCL) {

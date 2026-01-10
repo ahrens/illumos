@@ -47,7 +47,7 @@ extern int zvol_set_volsize(const char *, uint64_t);
 
 extern int zvol_raw_volume_init(objset_t *os);
 
-extern int zvol_open(dev_t *devp, int flag, int otyp, cred_t *cr);
+extern int zvol_open(dev_t dev, int flag, int otyp, cred_t *cr);
 extern int zvol_dump(dev_t dev, caddr_t addr, daddr_t offset, int nblocks);
 extern int zvol_close(dev_t dev, int flag, int otyp, cred_t *cr);
 extern int zvol_strategy(buf_t *bp);

@@ -176,6 +176,8 @@ static int zvol_dumpify(zvol_state_t *zv);
 static int zvol_dump_fini(zvol_state_t *zv);
 static int zvol_dump_init(zvol_state_t *zv, boolean_t resize);
 static int zvol_prealloc(zvol_state_t *zv);
+static int zvol_open_impl(zvol_state_t *zv, int flag, int otyp);
+static void zvol_close_impl(zvol_state_t *zv, int otyp);
 
 static void
 zvol_size_changed(zvol_state_t *zv, uint64_t volsize)
@@ -842,10 +844,10 @@ zvol_zero_thread(void *arg)
 		zv->zv_flags |= ZVOL_RAW_INITIALIZED;
 	}
 
-	zfs_dbgmsg("zvol_zero last close: zv %p, "
-	    "flags %d, opens %u", zv,
-	    zv->zv_flags, zv->zv_total_opens);
+	zfs_dbgmsg("zvol_zero done: zv %p, flags %d, opens %u",
+	    zv, zv->zv_flags, zv->zv_total_opens);
 
+	/*
 	zv->zv_total_opens--;
 	zv->zv_open_count[OTYP_INITIALIZING]--;
 	VERIFY3S(zv->zv_total_opens, >=, 0);
@@ -858,10 +860,13 @@ zvol_zero_thread(void *arg)
 		    "flags %d, opens %u", zv,
 		    zv->zv_flags, zv->zv_total_opens);
 	}
+	*/
 
 	zv->zv_zero_error = error;
 	cv_broadcast(&zv->zv_state_cv);
 	mutex_exit(&zv->zv_state_lock);
+
+	zvol_close_impl(zv, OTYP_INITIALIZING);
 	thread_exit();
 }
 
@@ -974,8 +979,8 @@ zvol_update_live_volsize(zvol_state_t *zv, uint64_t volsize)
 	 * Reinitialize the dump area to the new size. If we
 	 * failed to resize the dump area then restore it back to
 	 * its original size.  We must set the new volsize prior
-	 * to calling dumpvp_resize() to ensure that the devices'
-	 * size(9P) is not visible by the dump subsystem.
+	 * to calling dumpvp_resize() to ensure that the device's
+	 * size(9P) is visible by the dump subsystem.
 	 */
 	old_volsize = zv->zv_volsize;
 	zvol_size_changed(zv, volsize);
@@ -1012,17 +1017,7 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 {
 	zvol_state_t *zv = NULL;
 	int error;
-	dmu_object_info_t doi;
 	uint64_t readonly;
-	boolean_t opened = B_FALSE;
-	dev_t dev;
-
-	error = dsl_prop_get_integer(name,
-	    zfs_prop_to_name(ZFS_PROP_READONLY), &readonly, NULL);
-	if (error != 0)
-		return (error);
-	if (readonly)
-		return (SET_ERROR(EROFS));
 
 	mutex_enter(&zfsdev_state_lock);
 	zv = zvol_minor_lookup(name);
@@ -1032,62 +1027,40 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 		return (SET_ERROR(ENOENT));
 	}
 
-	if (zv->zv_objset == NULL) {
-		dev = makedevice(ddi_driver_major(zfs_dip), zv->zv_minor);
-		mutex_exit(&zfsdev_state_lock);
-		error = zvol_open(&dev, FWRITE, OTYP_LYR, NULL);
-		if (error) {
-			return (SET_ERROR(error));
-		}
-		mutex_enter(&zfsdev_state_lock);
-		opened = B_TRUE;
-	}
+	error = zvol_open_impl(zv, FWRITE, OTYP_LYR);
+	if (error)
+		return (SET_ERROR(error));
 
-	if ((error = dmu_object_info(zv->zv_objset, ZVOL_OBJ, &doi)) != 0 ||
-	    (error = zvol_check_volsize(volsize, doi.doi_data_block_size)) != 0)
+	if (error = zvol_check_volsize(volsize, zv->zv_volblocksize) != 0)
 		goto out;
 
-	uint64_t rawvol;
-	error = zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
-	    zfs_prop_to_name(ZFS_PROP_RAWVOL), 8, 1, &rawvol);
-	if (error == 0 && rawvol) {
+	if (zv->zv_flags & ZVOL_RAW) {
 		error = SET_ERROR(ERANGE);
 		goto out;
 	}
 
 	error = zvol_update_volsize(zv->zv_objset, volsize);
 
-	if (error == 0 && zv != NULL)
+	if (error == 0)
 		error = zvol_update_live_volsize(zv, volsize);
 out:
+	zvol_close_impl(zv, OTYP_LYR);
 	mutex_exit(&zfsdev_state_lock);
-	if (opened) {
-		error = zvol_close(dev, FWRITE, OTYP_LYR, NULL);
-	}
 	return (error);
 }
 
-/*ARGSUSED*/
-int
-zvol_open(dev_t *devp, int flag, int otyp, cred_t *cr)
+static int
+zvol_open_impl(zvol_state_t *zv, int flag, int otyp)
 {
-	zvol_state_t *zv;
 	int err = 0;
 
-	mutex_enter(&zfsdev_state_lock);
-
-	zv = zfsdev_get_soft_state(getminor(*devp), ZSST_ZVOL);
-	if (zv == NULL) {
-		mutex_exit(&zfsdev_state_lock);
-		return (SET_ERROR(ENXIO));
-	}
+	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 
 	mutex_enter(&zv->zv_state_lock);
 	if (zv->zv_total_opens == 0)
 		err = zvol_first_open(zv, !(flag & FWRITE));
 	if (err) {
 		mutex_exit(&zv->zv_state_lock);
-		mutex_exit(&zfsdev_state_lock);
 		return (err);
 	}
 
@@ -1112,33 +1085,36 @@ zvol_open(dev_t *devp, int flag, int otyp, cred_t *cr)
 		zv->zv_total_opens++;
 	}
 	mutex_exit(&zv->zv_state_lock);
-	mutex_exit(&zfsdev_state_lock);
 
 	return (err);
 out:
 	if (zv->zv_total_opens == 0)
 		zvol_last_close(zv);
 	mutex_exit(&zv->zv_state_lock);
-	mutex_exit(&zfsdev_state_lock);
 	return (err);
 }
 
 /*ARGSUSED*/
 int
-zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
+zvol_open(dev_t dev, int flag, int otyp, cred_t *cr)
 {
-	minor_t minor = getminor(dev);
-	zvol_state_t *zv;
-	int error = 0;
-
 	mutex_enter(&zfsdev_state_lock);
 
-	zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
+	zvol_state_t *zv = zfsdev_get_soft_state(getminor(dev), ZSST_ZVOL);
 	if (zv == NULL) {
 		mutex_exit(&zfsdev_state_lock);
 		return (SET_ERROR(ENXIO));
 	}
 
+	int err = zvol_open_impl(zv, flag, otyp);
+
+	mutex_exit(&zfsdev_state_lock);
+	return (err);
+}
+
+static void
+zvol_close_impl(zvol_state_t *zv, int otyp)
+{
 	mutex_enter(&zv->zv_state_lock);
 	if (zv->zv_flags & ZVOL_EXCL) {
 		ASSERT(zv->zv_total_opens == 1);
@@ -1163,6 +1139,24 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 		zvol_last_close(zv);
 	}
 	mutex_exit(&zv->zv_state_lock);
+}
+
+/*ARGSUSED*/
+int
+zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
+{
+	minor_t minor = getminor(dev);
+	zvol_state_t *zv;
+	int error = 0;
+
+	mutex_enter(&zfsdev_state_lock);
+
+	zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
+	if (zv == NULL) {
+		mutex_exit(&zfsdev_state_lock);
+		return (SET_ERROR(ENXIO));
+	}
+	zvol_close_impl(zv, otyp);
 	mutex_exit(&zfsdev_state_lock);
 	return (error);
 }
