@@ -331,6 +331,7 @@ zvol_get_dvas(zvol_state_t *zv)
 
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 	zvol_free_dvas(zv);
+	VERIFY(!(zv->zv_flags & ZVOL_RAW_INITIALIZED));
 
 	/* commit any in-flight changes before traversing the dataset */
 	txg_wait_synced(dmu_objset_pool(os), 0);
@@ -878,6 +879,14 @@ zvol_prealloc(zvol_state_t *zv)
 
 	if (zv->zv_zero_thread == NULL) {
 		/*
+		 * We're going to initialize the raw volume. The flag may
+		 * already be set, so turn it off to prevent any I/Os
+		 * from startint until we've completed initialization
+		 * process.
+		 */
+		zv->zv_flags &= ~ZVOL_RAW_INITIALIZED;
+
+		/*
 		 * We are about to start the initialization of the raw volume
 		 * so add a special open count to ensure that we don't disown
 		 * the objset when the device is closed.
@@ -1364,8 +1373,12 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 	/*
 	 * This indicates that the zvol is initializing.
 	 */
-	if (!(zv->zv_flags & ZVOL_RAW_INITIALIZED))
+	mutex_enter(&zv->zv_state_lock);
+	if (!(zv->zv_flags & ZVOL_RAW_INITIALIZED)) {
+		mutex_exit(&zv->zv_state_lock);
 		return (SET_ERROR(EINPROGRESS));
+	}
+	mutex_exit(&zv->zv_state_lock);
 
 	VERIFY3P(zv->zv_dvas, !=, NULL);
 	VERIFY3U(vol_offset / zv->zv_volblocksize, <, zv->zv_ndvas);
