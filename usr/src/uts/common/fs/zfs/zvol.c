@@ -999,6 +999,8 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	int error;
 	uint64_t readonly;
 
+	(void) zvol_create_minor(name);
+
 	mutex_enter(&zfsdev_state_lock);
 	zv = zvol_minor_lookup(name);
 
@@ -1007,6 +1009,10 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 		return (SET_ERROR(ENOENT));
 	}
 
+	/*
+	 * Multiple OTYP_LYR opens are treated independently (each
+	 * incrementing zv_total_opens).
+	 */
 	error = zvol_open_impl(zv, FWRITE, OTYP_LYR);
 	if (error)
 		return (SET_ERROR(error));
