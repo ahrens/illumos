@@ -311,7 +311,7 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 static void
 zvol_free_dvas(zvol_state_t *zv)
 {
-	VERIFY(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 	if (zv->zv_dvas != NULL) {
 		/*
 		 * Note, ndvas may differ from zvol_num_blocks() if the volume
@@ -329,7 +329,7 @@ zvol_get_dvas(zvol_state_t *zv)
 	objset_t *os = zv->zv_objset;
 	int		err;
 
-	VERIFY(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 	zvol_free_dvas(zv);
 
 	/* commit any in-flight changes before traversing the dataset */
@@ -702,7 +702,6 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	    8, 1, &rawvol);
 	if (error == 0 && rawvol) {
 		zv->zv_flags |= ZVOL_RAW;
-		zfs_dbgmsg("zvol_first_open prealloc, zv %p", zv);
 		error = zvol_prealloc(zv);
 		if (error) {
 			dmu_objset_disown(os, 1, zv);
@@ -729,12 +728,11 @@ zvol_last_close(zvol_state_t *zv)
 	zil_close(zv->zv_zilog);
 	zv->zv_zilog = NULL;
 
-	VERIFY(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 	if (zv->zv_flags & ZVOL_RAW) {
 		zvol_free_dvas(zv);
 		zv->zv_flags &= ~ZVOL_RAW;
 		zv->zv_zero_error = 0;
-		zfs_dbgmsg("zvol_last_close zv %p, flags %d", zv, zv->zv_flags);
 	}
 
 	dnode_rele(zv->zv_dn, zvol_tag);
@@ -790,10 +788,6 @@ zvol_zero(zvol_state_t *zv)
 		error = dmu_tx_assign(tx, TXG_WAIT);
 		if (error) {
 			dmu_tx_abort(tx);
-			/* XXX for rawvol, not sure it makes sense to free the object on failure; we can try to continue on next open */
-			(void) dmu_free_long_range(os, ZVOL_OBJ,
-			    0, off);
-			zfs_dbgmsg("zvol_zero failed: %d", error);
 			mutex_enter(&zv->zv_state_lock);
 			break;
 		}
@@ -821,10 +815,6 @@ zvol_zero(zvol_state_t *zv)
 		    zv->zv_flags, resid, bytes_zeroed, zv->zv_total_opens);
 	}
 
-	/* XXX move this cleanup to zvol_zero_thread()? */
-	zv->zv_zero_exit_wanted = B_FALSE;
-	zv->zv_zero_thread = NULL;
-
 	if (error == 0)
 		VERIFY0(resid);
 
@@ -841,7 +831,10 @@ zvol_zero_thread(void *arg)
 
 	mutex_enter(&zv->zv_state_lock);
 	if (error == 0) {
-		zv->zv_flags |= ZVOL_RAW_INITIALIZED;
+		error = zvol_get_dvas(zv);
+		if (error == 0) {
+			zv->zv_flags |= ZVOL_RAW_INITIALIZED;
+		}
 	}
 
 	zfs_dbgmsg("zvol_zero done: zv %p, flags %d, opens %u",
@@ -863,6 +856,8 @@ zvol_zero_thread(void *arg)
 	*/
 
 	zv->zv_zero_error = error;
+	zv->zv_zero_exit_wanted = B_FALSE;
+	zv->zv_zero_thread = NULL;
 	cv_broadcast(&zv->zv_state_cv);
 	mutex_exit(&zv->zv_state_lock);
 
@@ -1380,18 +1375,6 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 	 */
 	if (!(zv->zv_flags & ZVOL_RAW_INITIALIZED))
 		return (SET_ERROR(EINPROGRESS));
-
-	/* XXX Maybe we should zvol_get_dvas() before setting ZVOL_RAW_INITIALIZED? */
-	mutex_enter(&zv->zv_state_lock);
-	if (zv->zv_dvas == NULL) {
-		zfs_dbgmsg("zvol_rawio get DVAs, zv %p", zv);
-		error = zvol_get_dvas(zv);
-		if (error) {
-			mutex_exit(&zv->zv_state_lock);
-			return (SET_ERROR(error));
-		}
-	}
-	mutex_exit(&zv->zv_state_lock);
 
 	VERIFY3P(zv->zv_dvas, !=, NULL);
 	VERIFY3U(vol_offset / zv->zv_volblocksize, <, zv->zv_ndvas);
@@ -2460,9 +2443,9 @@ zvol_dump_init(zvol_state_t *zv, boolean_t resize)
 	}
 	dmu_tx_commit(tx);
 	/*
-	* We only need to update the zvol's property if we are initializing
-	* the dump area for the first time.
-	*/
+	 * We only need to update the zvol's property if we are initializing
+	 * the dump area for the first time.
+	 */
 	if (!resize) {
 		return (zvol_raw_volume_init(zv->zv_objset));
 	}
@@ -2502,17 +2485,6 @@ zvol_dumpify(zvol_state_t *zv)
 		}
 		error = zv->zv_zero_error;
 	}
-	mutex_exit(&zv->zv_state_lock);
-	if (error) {
-		(void) zvol_dump_fini(zv);
-		return (error);
-	}
-
-	/*
-	 * Build up our lba mapping.
-	 */
-	mutex_enter(&zv->zv_state_lock);
-	error = zvol_get_dvas(zv);
 	mutex_exit(&zv->zv_state_lock);
 	if (error) {
 		(void) zvol_dump_fini(zv);
