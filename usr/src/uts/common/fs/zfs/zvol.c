@@ -1015,7 +1015,7 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	 */
 	error = zvol_open_impl(zv, FWRITE, OTYP_LYR);
 	if (error)
-		return (SET_ERROR(error));
+		goto out;
 
 	if (error = zvol_check_volsize(volsize, zv->zv_volblocksize) != 0)
 		goto out;
