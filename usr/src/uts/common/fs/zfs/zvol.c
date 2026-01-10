@@ -840,21 +840,6 @@ zvol_zero_thread(void *arg)
 	zfs_dbgmsg("zvol_zero done: zv %p, flags %d, opens %u",
 	    zv, zv->zv_flags, zv->zv_total_opens);
 
-	/*
-	zv->zv_total_opens--;
-	zv->zv_open_count[OTYP_INITIALIZING]--;
-	VERIFY3S(zv->zv_total_opens, >=, 0);
-	VERIFY3S(zv->zv_open_count[OTYP_INITIALIZING], >=, 0);
-
-	if (zv->zv_total_opens == 0) {
-		zvol_last_close(zv);
-	} else {
-		zfs_dbgmsg("zvol_zero exiting: zv %p, "
-		    "flags %d, opens %u", zv,
-		    zv->zv_flags, zv->zv_total_opens);
-	}
-	*/
-
 	zv->zv_zero_error = error;
 	zv->zv_zero_exit_wanted = B_FALSE;
 	zv->zv_zero_thread = NULL;
