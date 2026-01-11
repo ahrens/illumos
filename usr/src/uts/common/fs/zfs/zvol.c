@@ -1023,8 +1023,10 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	 * incrementing zv_total_opens).
 	 */
 	error = zvol_open_impl(zv, FWRITE, OTYP_LYR);
-	if (error)
-		goto out;
+	if (error) {
+		mutex_exit(&zfsdev_state_lock);
+		return (SET_ERROR(error));
+	}
 
 	if (error = zvol_check_volsize(volsize, zv->zv_volblocksize) != 0)
 		goto out;
