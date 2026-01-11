@@ -116,7 +116,8 @@ enum zio_flags {
 	ZVOL_EXCL		= 1 << 2,
 	ZVOL_WCE		= 1 << 3,
 	ZVOL_RAW		= 1 << 4,
-	ZVOL_RAW_INITIALIZED	= 1 << 5
+	ZVOL_RAW_INITIALIZED	= 1 << 5,
+	ZVOL_RAW_READY		= 1 << 6
 };
 
 /*
@@ -312,6 +313,7 @@ static void
 zvol_free_dvas(zvol_state_t *zv)
 {
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	zv->zv_flags &= ~ZVOL_RAW_READY;
 	if (zv->zv_dvas != NULL) {
 		/*
 		 * Note, ndvas may differ from zvol_num_blocks() if the volume
@@ -330,8 +332,8 @@ zvol_get_dvas(zvol_state_t *zv)
 	int		err;
 
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	VERIFY(zv->zv_flags & ZVOL_RAW_INITIALIZED);
 	zvol_free_dvas(zv);
-	VERIFY(!(zv->zv_flags & ZVOL_RAW_INITIALIZED));
 
 	/* commit any in-flight changes before traversing the dataset */
 	txg_wait_synced(dmu_objset_pool(os), 0);
@@ -353,6 +355,7 @@ zvol_get_dvas(zvol_state_t *zv)
 		zvol_free_dvas(zv);
 		return (err);
 	}
+	zv->zv_flags |= ZVOL_RAW_READY;
 
 	return (0);
 }
@@ -816,8 +819,10 @@ zvol_zero(zvol_state_t *zv)
 		    zv->zv_flags, resid, bytes_zeroed, zv->zv_total_opens);
 	}
 
-	if (error == 0)
+	if (error == 0) {
 		VERIFY0(resid);
+		zv->zv_flags |= ZVOL_RAW_INITIALIZED;
+	}
 
 	mutex_exit(&zv->zv_state_lock);
 	return (error);
@@ -833,9 +838,6 @@ zvol_zero_thread(void *arg)
 	mutex_enter(&zv->zv_state_lock);
 	if (error == 0) {
 		error = zvol_get_dvas(zv);
-		if (error == 0) {
-			zv->zv_flags |= ZVOL_RAW_INITIALIZED;
-		}
 	}
 
 	zfs_dbgmsg("zvol_zero done: zv %p, flags %d, opens %u",
@@ -879,10 +881,9 @@ zvol_prealloc(zvol_state_t *zv)
 
 	if (zv->zv_zero_thread == NULL) {
 		/*
-		 * We're going to initialize the raw volume. The flag may
-		 * already be set, so turn it off to prevent any I/Os
-		 * from startint until we've completed initialization
-		 * process.
+		 * We are getting ready to initialize the raw volume so
+		 * disable the ZVOL_RAW_INITIALIZED flag to prevent any
+		 * I/Os from progressing.
 		 */
 		zv->zv_flags &= ~ZVOL_RAW_INITIALIZED;
 
@@ -1374,12 +1375,30 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 
 	/*
 	 * This indicates that the zvol is initializing.
+	 * I/O to raw volumes requires the ZVOL_RAW_READY
+	 * flag to be set. The zvol requires two phases
+	 * to be considered ready -- first it must initialize
+	 * the space and then build the dva map. The first
+	 * phase is considered complete when the zvol sets the
+	 * ZVOL_RAW_INITIALIZED. This phase can take a while
+	 * to complete so we return an error immediately to all
+	 * the user to retry. Once the zvol is initialized, the dva
+	 * map creations happens quickly so it's okay to block.
 	 */
-	mutex_enter(&zv->zv_state_lock);
 	if (!(zv->zv_flags & ZVOL_RAW_INITIALIZED)) {
-		mutex_exit(&zv->zv_state_lock);
 		return (SET_ERROR(EINPROGRESS));
+	} else {
+		mutex_enter(&zv->zv_state_lock);
+		while (!(zv->zv_flags & ZVOL_RAW_READY)) {
+			if (!cv_wait_sig(&zv->zv_state_cv,
+			    &zv->zv_state_lock)) {
+				mutex_exit(&zv->zv_state_lock);
+				return (SET_ERROR(EINTR));
+			}
+		}
+		mutex_exit(&zv->zv_state_lock);
 	}
+	mutex_enter(&zv->zv_state_lock);
 	mutex_exit(&zv->zv_state_lock);
 
 	VERIFY3P(zv->zv_dvas, !=, NULL);
