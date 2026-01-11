@@ -1398,8 +1398,6 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 		}
 		mutex_exit(&zv->zv_state_lock);
 	}
-	mutex_enter(&zv->zv_state_lock);
-	mutex_exit(&zv->zv_state_lock);
 
 	VERIFY3P(zv->zv_dvas, !=, NULL);
 	VERIFY3U(vol_offset / zv->zv_volblocksize, <, zv->zv_ndvas);
