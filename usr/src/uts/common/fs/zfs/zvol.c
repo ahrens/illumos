@@ -2067,7 +2067,11 @@ zvol_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *cr, int *rvalp)
 
 		bzero(&dkmext, sizeof (dkmext));
 		dkmext.dki_lbsize = 1U << zv->zv_min_bs;
-		dkmext.dki_pbsize = zv->zv_volblocksize;
+		if (zv->zv_flags & ZVOL_RAW) {
+			dkmext.dki_pbsize = dkmext.dki_lbsize;
+		} else {
+			dkmext.dki_pbsize = zv->zv_volblocksize;
+		}
 		dkmext.dki_capacity = zv->zv_volsize >> zv->zv_min_bs;
 		dkmext.dki_media_type = DK_UNKNOWN;
 		mutex_exit(&zfsdev_state_lock);
@@ -2173,6 +2177,8 @@ zvol_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *cr, int *rvalp)
 
 		if (!zvol_unmap_enabled)
 			break;
+		if (zv->zv_flags & ZVOL_RAW)
+			break;
 
 		if (!(flag & FKIOCTL)) {
 			error = dfl_copyin((void *)arg, &dfl, flag, KM_SLEEP);
@@ -2252,6 +2258,8 @@ zvol_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *cr, int *rvalp)
 
 	case DKIOC_CANFREE:
 		i = zvol_unmap_enabled ? 1 : 0;
+		if (zv->zv_flags & ZVOL_RAW)
+			i = 0;
 		if (ddi_copyout(&i, (void *)arg, sizeof (int), flag) != 0) {
 			error = EFAULT;
 		} else {
