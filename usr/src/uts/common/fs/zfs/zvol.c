@@ -706,6 +706,12 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	    8, 1, &rawvol);
 	if (error == 0 && rawvol) {
 		zv->zv_flags |= ZVOL_RAW;
+		/*
+		 * Since raw zvols issue i/o directly to the underlying disks,
+		 * we cannot accept i/o's smaller than the underlying disks can.
+		 */
+		zv->zv_min_bs = dmu_objset_spa(os)->spa_max_ashift;
+
 		error = zvol_prealloc(zv);
 		if (error) {
 			dmu_objset_disown(os, 1, zv);
