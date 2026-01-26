@@ -7863,12 +7863,6 @@ zfs_do_change_key(int argc, char **argv)
 		}
 	}
 
-	if (inheritkey && !nvlist_empty(props)) {
-		(void) fprintf(stderr,
-		    gettext("Properties not allowed for inheriting\n"));
-		usage(B_FALSE);
-	}
-
 	argc -= optind;
 	argv += optind;
 

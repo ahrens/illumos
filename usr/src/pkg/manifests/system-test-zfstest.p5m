@@ -621,6 +621,9 @@ file \
 file \
     path=opt/zfs-tests/tests/functional/cli_root/zfs_change-key/zfs_change-key_pbkdf2iters \
     mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zfs_change-key/zfs_change-key_userprop \
+    mode=0555
 dir  path=opt/zfs-tests/tests/functional/cli_root/zfs_clone
 file path=opt/zfs-tests/tests/functional/cli_root/zfs_clone/cleanup mode=0555
 file path=opt/zfs-tests/tests/functional/cli_root/zfs_clone/setup mode=0555
