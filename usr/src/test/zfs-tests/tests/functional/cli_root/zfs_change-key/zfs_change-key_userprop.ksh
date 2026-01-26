@@ -60,12 +60,12 @@ log_must eval "echo $PASSPHRASE2 | zfs change-key -o user:prop=parentvalue" \
 log_must eval "zfs get -H -o value user:prop $TESTPOOL/$TESTFS1 | \
 	grep -q parentvalue"
 
-log_must zfs change-key -i -o user:prop=childvalue -o user:prop2=childvalue2 \
+log_must zfs change-key -i -o user:prop=abcd -o user:prop2=efgh \
 	$TESTPOOL/$TESTFS1/child
 log_must verify_encryption_root $TESTPOOL/$TESTFS1/child "$TESTPOOL/$TESTFS1"
 log_must eval "zfs get -H -o value user:prop $TESTPOOL/$TESTFS1/child | \
-	grep -q childvalue"
+	grep -q abcd"
 log_must eval "zfs get -H -o value user:prop2 $TESTPOOL/$TESTFS1/child | \
-	grep -q childvalue2"
+	grep -q efgh"
 
 log_pass "'zfs change-key -o user:prop=value' sets a user property"

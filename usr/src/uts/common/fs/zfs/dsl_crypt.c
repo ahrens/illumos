@@ -16,6 +16,7 @@
 /*
  * Copyright (c) 2017, Datto, Inc. All rights reserved.
  * Copyright (c) 2018 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dsl_crypt.h>
@@ -1232,7 +1233,7 @@ spa_keystore_change_key_check(void *arg, dmu_tx_t *tx)
 	dsl_crypto_params_t *dcp = skcka->skcka_cp;
 	uint64_t rddobj;
 
-	/* we assume skcka_userprops has already been verified */ 
+	/* we assume skcka_userprops has already been verified */
 
 	/* check for the encryption feature */
 	if (!spa_feature_is_enabled(dp->dp_spa, SPA_FEATURE_ENCRYPTION)) {

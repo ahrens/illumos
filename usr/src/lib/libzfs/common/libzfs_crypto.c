@@ -16,6 +16,7 @@
 /*
  * Copyright (c) 2017, Datto, Inc. All rights reserved.
  * Copyright 2020 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <string.h>
@@ -1370,8 +1371,6 @@ zfs_crypto_verify_rewrap_nvlist(zfs_handle_t *zhp, nvlist_t *props,
 	int ret;
 	nvpair_t *elem = NULL;
 	nvlist_t *new_props = NULL;
-
-	new_props = fnvlist_alloc();
 
 	/*
 	 * loop through all provided properties, we should only have

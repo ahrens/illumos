@@ -31,6 +31,7 @@
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright (c) 2018 Datto Inc.
  * Copyright 2021 RackTop Systems, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <assert.h>
