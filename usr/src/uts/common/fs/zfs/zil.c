@@ -680,7 +680,7 @@ zil_create(zilog_t *zilog)
 	 */
 	if (BP_IS_HOLE(&blk) || BP_SHOULD_BYTESWAP(&blk)) {
 		tx = dmu_tx_create(zilog->zl_os);
-		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+		VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND));
 		dsl_dataset_dirty(dmu_objset_ds(zilog->zl_os), tx);
 		txg = dmu_tx_get_txg(tx);
 
@@ -746,7 +746,7 @@ zil_destroy(zilog_t *zilog, boolean_t keep_first)
 		return;
 
 	tx = dmu_tx_create(zilog->zl_os);
-	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND));
 	dsl_dataset_dirty(dmu_objset_ds(zilog->zl_os), tx);
 	txg = dmu_tx_get_txg(tx);
 
@@ -1512,7 +1512,8 @@ zil_lwb_write_issue(zilog_t *zilog, lwb_t *lwb)
 	 * should not be subject to the dirty data based delays. We
 	 * use DMU_TX_NOTHROTTLE to bypass the delay mechanism.
 	 */
-	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_NOTHROTTLE));
+	VERIFY0(dmu_tx_assign(tx,
+	    DMU_TX_WAIT | DMU_TX_NOTHROTTLE | DMU_TX_SUSPEND));
 
 	dsl_dataset_dirty(dmu_objset_ds(zilog->zl_os), tx);
 	txg = dmu_tx_get_txg(tx);
@@ -2761,7 +2762,7 @@ static void
 zil_commit_itx_assign(zilog_t *zilog, zil_commit_waiter_t *zcw)
 {
 	dmu_tx_t *tx = dmu_tx_create(zilog->zl_os);
-	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND));
 
 	itx_t *itx = zil_itx_create(TX_COMMIT, sizeof (lr_t));
 	itx->itx_sync = B_TRUE;
