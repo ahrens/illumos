@@ -22,6 +22,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Portions Copyright 2011 Martin Matuska
  * Copyright (c) 2012, 2019 by Delphix. All rights reserved.
+ * Copyright (c) 2025, Klara, Inc.
  */
 
 #include <sys/zfs_context.h>
@@ -639,7 +640,7 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 	int error = 0;
 	tx_state_t *tx = &dp->dp_tx;
 
-	ASSERT0(flags & ~TXG_WAIT_SIGNAL);
+	ASSERT0(flags & ~(TXG_WAIT_SIGNAL | TXG_WAIT_SUSPEND));
 	ASSERT(!dsl_pool_config_held(dp));
 
 	mutex_enter(&tx->tx_sync_lock);
@@ -656,6 +657,15 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 	 * else interesting happens, we'll set an error and break out.
 	 */
 	while (tx->tx_synced_txg < txg) {
+		if ((flags & TXG_WAIT_SUSPEND) && spa_suspended(dp->dp_spa)) {
+			/*
+			 * Pool suspended and the caller does not want to
+			 * block; inform them immediately.
+			 */
+			error = SET_ERROR(ESHUTDOWN);
+			break;
+		}
+
 		dprintf_zfs("broadcasting sync more "
 		    "tx_synced=%llu waiting=%llu dp=%p\n",
 		    tx->tx_synced_txg, tx->tx_sync_txg_waiting, dp);
@@ -686,6 +696,15 @@ void
 txg_wait_synced(dsl_pool_t *dp, uint64_t txg)
 {
 	VERIFY0(txg_wait_synced_flags(dp, txg, TXG_WAIT_NONE));
+}
+
+void
+txg_wait_kick(dsl_pool_t *dp)
+{
+	tx_state_t *tx = &dp->dp_tx;
+	mutex_enter(&tx->tx_sync_lock);
+	cv_broadcast(&tx->tx_sync_done_cv);
+	mutex_exit(&tx->tx_sync_lock);
 }
 
 /*
