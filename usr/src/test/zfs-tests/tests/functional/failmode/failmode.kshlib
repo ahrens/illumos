@@ -1,0 +1,106 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright (c) 2025, Klara, Inc.
+# Copyright 2026 Oxide Computer Company
+#
+
+#
+# Helpers for testing how the pool behaves when it suspends. The pool is
+# built on a single file vdev. To suspend it, we make all writes to the
+# vdev fail, and also make the probe that follows a write failure fail
+# (vdev_probe() does its I/O to the vl_be area of the labels, which is
+# what "zinject -L pad2" covers). The next txg sync then cannot write
+# anywhere, and the pool suspends. Clearing the injections and running
+# "zpool clear" resumes it.
+#
+
+FAILMODE_VDEV=$TEST_BASE_DIR/failmode_vdev
+
+function failmode_create_pool # failmode
+{
+	log_must mkfile $MINVDEVSIZE $FAILMODE_VDEV
+	log_must zpool create -f -o failmode=$1 $TESTPOOL $FAILMODE_VDEV
+	log_must zfs create -o recordsize=128k $TESTPOOL/$TESTFS
+}
+
+function pool_is_suspended # pool
+{
+	zpool status $1 | grep -q -E "ZFS-8000-(HC|JQ)"
+}
+
+function failmode_suspend_pool
+{
+	log_must zinject -d $FAILMODE_VDEV -e io -T write $TESTPOOL
+	log_must zinject -d $FAILMODE_VDEV -L pad2 $TESTPOOL
+
+	# Dirty some data, so that the next txg sync has to write something.
+	log_must dd if=/dev/urandom of=/$TESTPOOL/$TESTFS/dirty bs=128k count=8
+
+	log_note "waiting for pool to suspend"
+	typeset -i tries=30
+	until pool_is_suspended $TESTPOOL; do
+		if ((tries-- == 0)); then
+			log_fail "pool didn't suspend"
+		fi
+		sleep 1
+	done
+}
+
+function failmode_resume_pool
+{
+	log_must zinject -c all
+	log_must zpool clear $TESTPOOL
+	if pool_is_suspended $TESTPOOL; then
+		log_fail "pool still suspended after zpool clear"
+	fi
+}
+
+function failmode_cleanup
+{
+	zinject -c all >/dev/null 2>&1
+	if poolexists $TESTPOOL; then
+		pool_is_suspended $TESTPOOL && zpool clear $TESTPOOL
+		destroy_pool $TESTPOOL
+	fi
+	rm -f $FAILMODE_VDEV
+}
+
+#
+# Percentage of a CPU that a (single-threaded) process used over the last
+# 5 seconds, from microstate accounting. We can't use the TIME column from
+# ps(1) here: a thread spinning in the kernel without ever leaving the CPU
+# doesn't have its accumulated time updated, so it looks idle.
+#
+function proc_cpu_pct # pid
+{
+	prstat -mLc -p $1 5 2 | nawk '
+	    $1 ~ /^[0-9]+$/ { pct = $3 + $4 }
+	    END { printf("%d\n", pct) }'
+}
+
+#
+# Check that a process is blocked (still running, but not using the CPU)
+# over a few seconds. Returns 0 if it is blocked, 1 if it has exited, and
+# 2 if it is still running and using the CPU (spinning).
+#
+function proc_is_blocked # pid
+{
+	typeset pid=$1
+
+	kill -0 $pid 2>/dev/null || return 1
+	typeset -i pct=$(proc_cpu_pct $pid)
+	kill -0 $pid 2>/dev/null || return 1
+	log_note "pid $pid used $pct% of a CPU over 5s"
+	((pct >= 50)) && return 2
+	return 0
+}
