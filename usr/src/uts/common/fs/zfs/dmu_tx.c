@@ -24,6 +24,7 @@
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright (c) 2024, 2025, Klara, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu.h>
@@ -1036,18 +1037,38 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 				 * suspend, so treat it as a normal retry.
 				 */
 				err = SET_ERROR(ERESTART);
-			else if ((flags & DMU_TX_WAIT) &&
-			    spa_get_failmode(tx->tx_pool->dp_spa) ==
+			else if (spa_get_failmode(tx->tx_pool->dp_spa) ==
 			    ZIO_FAILURE_MODE_CONTINUE)
 				/*
-				 * Caller wants to wait, but pool config is
-				 * overriding that, so return EIO to be
-				 * propagated back to userspace.
+				 * Pool config says not to block, so return
+				 * EIO to be propagated back to userspace.
+				 * This applies whether or not the caller
+				 * asked to wait; a DMU_TX_NOWAIT caller
+				 * that got ERESTART here would just call
+				 * dmu_tx_wait() and try again, which cannot
+				 * succeed until the pool resumes.
 				 */
 				err = SET_ERROR(EIO);
 			else
 				/* Anything else, we should just block. */
 				err = SET_ERROR(ERESTART);
+
+			/*
+			 * If we (or a DMU_TX_NOWAIT caller) are going to
+			 * wait, we unset tx_break_on_suspend to make sure
+			 * that if dmu_tx_wait() has to fall back to a
+			 * txg_wait_synced_flags(), it doesn't immediately
+			 * return because the pool is suspended. That would
+			 * then immediately return here (or to the caller,
+			 * who would call dmu_tx_assign() again), and we'd
+			 * end up in a busy loop until the pool resumes.
+			 *
+			 * On the other hand, if the pool hasn't suspended
+			 * yet, then it should be allowed to break a txg wait
+			 * if the pool does suspend, so we can loop and
+			 * reassess it in dmu_tx_try_assign().
+			 */
+			tx->tx_break_on_suspend = B_FALSE;
 		}
 
 		/*
@@ -1060,22 +1081,7 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 		/*
 		 * Wait until there's room in this txg, or until it's been
 		 * synced out and a new one is available.
-		 *
-		 * If we're here because the pool suspended above, then we
-		 * unset tx_break_on_suspend to make sure that if dmu_tx_wait()
-		 * has to fall back to a txg_wait_synced_flags(), it doesn't
-		 * immediately return because the pool is suspended. That would
-		 * then immediately return here, and we'd end up in a busy loop
-		 * until the pool resumes.
-		 *
-		 * On the other hand, if the pool hasn't suspended yet, then it
-		 * should be allowed to break a txg wait if the pool does
-		 * suspend, so we can loop and reassess it in
-		 * dmu_tx_try_assign().
 		 */
-		if (suspended)
-			tx->tx_break_on_suspend = B_FALSE;
-
 		dmu_tx_wait(tx);
 
 		/*
