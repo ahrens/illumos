@@ -744,7 +744,7 @@ top:
 
 		zp->z_size = end;
 		dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
-		error = dmu_tx_assign(tx, TXG_WAIT);
+		error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error) {
 			VN_RELE(ZTOV(zp));
 			if (error == ERESTART) {

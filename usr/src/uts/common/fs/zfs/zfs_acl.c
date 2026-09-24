@@ -2055,7 +2055,7 @@ top:
 	}
 
 	zfs_sa_upgrade_txholds(tx, zp);
-	error = dmu_tx_assign(tx, TXG_NOWAIT);
+	error = dmu_tx_assign(tx, DMU_TX_NOWAIT);
 	if (error) {
 		rw_exit(&zp->z_acl_lock);
 		mutex_exit(&zp->z_lock);

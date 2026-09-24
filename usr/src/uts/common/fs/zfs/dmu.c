@@ -900,7 +900,7 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 		 * reduction in space used.
 		 */
 		dmu_tx_mark_netfree(tx);
-		err = dmu_tx_assign(tx, TXG_WAIT);
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (err) {
 			dmu_tx_abort(tx);
 			return (err);
@@ -961,7 +961,7 @@ dmu_free_long_object(objset_t *os, uint64_t object)
 	dmu_tx_hold_bonus(tx, object);
 	dmu_tx_hold_free(tx, object, 0, DMU_OBJECT_END);
 	dmu_tx_mark_netfree(tx);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err == 0) {
 		if (err == 0)
 			err = dmu_object_free(os, object, tx);
@@ -1161,7 +1161,7 @@ dmu_object_remap_one_indirect(objset_t *os, dnode_t *dn,
 	    dbuf_can_remap(dbuf)) {
 		dmu_tx_t *tx = dmu_tx_create(os);
 		dmu_tx_hold_remap_l1indirect(tx, dn->dn_object);
-		err = dmu_tx_assign(tx, TXG_WAIT);
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (err == 0) {
 			(void) dbuf_dirty(dbuf, tx);
 			dmu_tx_commit(tx);
@@ -1214,7 +1214,7 @@ dmu_object_remap_indirects(objset_t *os, uint64_t object,
 		if (err == 0 && dnode_needs_remap(dn)) {
 			dmu_tx_t *tx = dmu_tx_create(os);
 			dmu_tx_hold_bonus(tx, dn->dn_object);
-			if ((err = dmu_tx_assign(tx, TXG_WAIT)) == 0) {
+			if ((err = dmu_tx_assign(tx, DMU_TX_WAIT)) == 0) {
 				dnode_setdirty(dn, tx);
 				dmu_tx_commit(tx);
 			} else {
@@ -1952,7 +1952,7 @@ dmu_sync_late_arrival(zio_t *pio, objset_t *os, dmu_sync_cb_t *done, zgd_t *zgd,
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_space(tx, zgd->zgd_db->db_size);
-	if (dmu_tx_assign(tx, TXG_WAIT) != 0) {
+	if (dmu_tx_assign(tx, DMU_TX_WAIT) != 0) {
 		dmu_tx_abort(tx);
 		/* Make zl_get_data do txg_waited_synced() */
 		return (SET_ERROR(EIO));

@@ -618,7 +618,7 @@ zfs_purgedir(znode_t *dzp)
 		/* Is this really needed ? */
 		zfs_sa_upgrade_txholds(tx, xzp);
 		dmu_tx_mark_netfree(tx);
-		error = dmu_tx_assign(tx, TXG_WAIT);
+		error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error) {
 			dmu_tx_abort(tx);
 			VN_RELE(ZTOV(xzp));
@@ -718,7 +718,7 @@ zfs_rmnode(znode_t *zp)
 
 	zfs_sa_upgrade_txholds(tx, zp);
 	dmu_tx_mark_netfree(tx);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		/*
 		 * Not enough space to delete the file.  Leave it in the
@@ -1040,7 +1040,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, vnode_t **xvpp, cred_t *cr)
 	fuid_dirtied = zfsvfs->z_fuid_dirty;
 	if (fuid_dirtied)
 		zfs_fuid_txhold(zfsvfs, tx);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		zfs_acl_ids_free(&acl_ids);
 		dmu_tx_abort(tx);

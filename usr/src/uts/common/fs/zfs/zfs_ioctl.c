@@ -6046,7 +6046,7 @@ zfs_ioc_smb_acl(zfs_cmd_t *zc)
 		dmu_tx_hold_zap(tx, MASTER_NODE_OBJ, TRUE,
 		    ZFS_SHARES_DIR);
 		dmu_tx_hold_zap(tx, DMU_NEW_OBJECT, FALSE, NULL);
-		error = dmu_tx_assign(tx, TXG_WAIT);
+		error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error != 0) {
 			dmu_tx_abort(tx);
 		} else {
