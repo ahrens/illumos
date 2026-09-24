@@ -539,7 +539,7 @@ zvol_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_write(tx, ZVOL_OBJ, offset, length);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
 	} else {
@@ -934,7 +934,7 @@ zvol_zero(zvol_state_t *zv)
 		tx = dmu_tx_create(os);
 		dmu_tx_hold_write(tx, ZVOL_OBJ, zv->zv_zero_off, bytes);
 		dmu_tx_hold_bonus(tx, ZVOL_OBJ);
-		error = dmu_tx_assign(tx, TXG_WAIT);
+		error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error) {
 			dmu_tx_abort(tx);
 			mutex_enter(&zv->zv_state_lock);
@@ -1089,7 +1089,7 @@ zvol_prealloc(zvol_state_t *zv)
 	    &zv->zv_min_volblocksize) != 0) {
 		dmu_tx_t *tx = dmu_tx_create(os);
 		dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
-		int error = dmu_tx_assign(tx, TXG_WAIT);
+		int error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error != 0) {
 			dmu_tx_abort(tx);
 			return (error);
@@ -1147,7 +1147,7 @@ zvol_update_volsize(objset_t *os, uint64_t volsize)
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
 	dmu_tx_mark_netfree(tx);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
 		return (error);
@@ -1850,7 +1850,7 @@ zvol_strategy(buf_t *bp)
 		} else {
 			dmu_tx_t *tx = dmu_tx_create(os);
 			dmu_tx_hold_write(tx, ZVOL_OBJ, off, size);
-			error = dmu_tx_assign(tx, TXG_WAIT);
+			error = dmu_tx_assign(tx, DMU_TX_WAIT);
 			if (error) {
 				dmu_tx_abort(tx);
 			} else {
@@ -2082,7 +2082,7 @@ zvol_write(dev_t dev, uio_t *uio, cred_t *cr)
 			bytes = volsize - off;
 
 		dmu_tx_hold_write_by_dnode(tx, zv->zv_dn, off, bytes);
-		error = dmu_tx_assign(tx, TXG_WAIT);
+		error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error) {
 			dmu_tx_abort(tx);
 			break;
@@ -2562,7 +2562,7 @@ out:
 			lr = rangelock_enter(&zv->zv_rangelock, start, length,
 			    RL_WRITER);
 			tx = dmu_tx_create(zv->zv_objset);
-			error = dmu_tx_assign(tx, TXG_WAIT);
+			error = dmu_tx_assign(tx, DMU_TX_WAIT);
 			if (error != 0) {
 				dmu_tx_abort(tx);
 			} else {
@@ -2769,7 +2769,7 @@ zvol_dump_init(zvol_state_t *zv, boolean_t resize)
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
 	dmu_tx_hold_bonus(tx, ZVOL_OBJ);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error != 0) {
 		dmu_tx_abort(tx);
 		return (error);
@@ -2871,7 +2871,7 @@ zvol_dumpify(zvol_state_t *zv)
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
 		(void) zvol_dump_fini(zv);
@@ -2910,7 +2910,7 @@ zvol_dump_fini(zvol_state_t *zv)
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
 		return (error);
@@ -2955,7 +2955,7 @@ zvol_dump_fini(zvol_state_t *zv)
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_bonus(tx, ZVOL_OBJ);
-	error = dmu_tx_assign(tx, TXG_WAIT);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
 		return (error);
