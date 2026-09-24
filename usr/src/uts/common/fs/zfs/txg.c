@@ -633,11 +633,13 @@ txg_delay(dsl_pool_t *dp, uint64_t txg, hrtime_t delay, hrtime_t resolution)
 	mutex_exit(&tx->tx_sync_lock);
 }
 
-static boolean_t
-txg_wait_synced_impl(dsl_pool_t *dp, uint64_t txg, boolean_t wait_sig)
+int
+txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 {
+	int error = 0;
 	tx_state_t *tx = &dp->dp_tx;
 
+	ASSERT0(flags & ~TXG_WAIT_SIGNAL);
 	ASSERT(!dsl_pool_config_held(dp));
 
 	mutex_enter(&tx->tx_sync_lock);
@@ -648,12 +650,18 @@ txg_wait_synced_impl(dsl_pool_t *dp, uint64_t txg, boolean_t wait_sig)
 		tx->tx_sync_txg_waiting = txg;
 	dprintf_zfs("txg=%llu quiesce_txg=%llu sync_txg=%llu\n",
 	    txg, tx->tx_quiesce_txg_waiting, tx->tx_sync_txg_waiting);
+
+	/*
+	 * Keep pushing util the pool gets to the wanted txg. If something
+	 * else interesting happens, we'll set an error and break out.
+	 */
 	while (tx->tx_synced_txg < txg) {
 		dprintf_zfs("broadcasting sync more "
 		    "tx_synced=%llu waiting=%llu dp=%p\n",
 		    tx->tx_synced_txg, tx->tx_sync_txg_waiting, dp);
 		cv_broadcast(&tx->tx_sync_more_cv);
-		if (wait_sig) {
+
+		if (flags & TXG_WAIT_SIGNAL) {
 			/*
 			 * Condition wait here but stop if the thread receives a
 			 * signal. The caller may call txg_wait_synced*() again
@@ -661,31 +669,23 @@ txg_wait_synced_impl(dsl_pool_t *dp, uint64_t txg, boolean_t wait_sig)
 			 */
 			if (cv_wait_sig(&tx->tx_sync_done_cv,
 			    &tx->tx_sync_lock) == 0) {
-				mutex_exit(&tx->tx_sync_lock);
-				return (B_TRUE);
+				error = SET_ERROR(EINTR);
+				break;
 			}
 		} else {
+			/* Uninterruptable wait, until the condvar fires */
 			cv_wait(&tx->tx_sync_done_cv, &tx->tx_sync_lock);
 		}
 	}
+
 	mutex_exit(&tx->tx_sync_lock);
-	return (B_FALSE);
+	return (error);
 }
 
 void
 txg_wait_synced(dsl_pool_t *dp, uint64_t txg)
 {
-	VERIFY0(txg_wait_synced_impl(dp, txg, B_FALSE));
-}
-
-/*
- * Similar to a txg_wait_synced but it can be interrupted from a signal.
- * Returns B_TRUE if the thread was signaled while waiting.
- */
-boolean_t
-txg_wait_synced_sig(dsl_pool_t *dp, uint64_t txg)
-{
-	return (txg_wait_synced_impl(dp, txg, B_TRUE));
+	VERIFY0(txg_wait_synced_flags(dp, txg, TXG_WAIT_NONE));
 }
 
 /*
