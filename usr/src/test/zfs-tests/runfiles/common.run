@@ -561,6 +561,11 @@ tags = ['functional', 'exec']
 tests = ['async_destroy_001_pos']
 tags = ['functional', 'async_destroy']
 
+[tests/functional/failmode]
+tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
+    'failmode_nowait_wait', 'failmode_nowait_continue']
+tags = ['functional', 'failmode']
+
 [tests/functional/fault]
 tests = ['zpool_status_-s', 'auto_spare_sorted_001_pos']
 tags = ['functional', 'fault']

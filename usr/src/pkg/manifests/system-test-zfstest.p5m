@@ -2428,6 +2428,16 @@ file path=opt/zfs-tests/tests/functional/exec/exec_001_pos mode=0555
 file path=opt/zfs-tests/tests/functional/exec/exec_002_neg mode=0555
 file path=opt/zfs-tests/tests/functional/exec/mmap_exec mode=0555
 file path=opt/zfs-tests/tests/functional/exec/setup mode=0555
+dir  path=opt/zfs-tests/tests/functional/failmode
+file path=opt/zfs-tests/tests/functional/failmode/cleanup mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode.kshlib mode=0444
+file path=opt/zfs-tests/tests/functional/failmode/failmode_dmu_tx_continue \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_dmu_tx_wait mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_nowait_continue \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_nowait_wait mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/setup mode=0555
 dir  path=opt/zfs-tests/tests/functional/fault
 file path=opt/zfs-tests/tests/functional/fault/auto_spare_sorted_001_pos \
     mode=0555
