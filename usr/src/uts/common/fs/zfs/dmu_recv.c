@@ -1329,7 +1329,7 @@ receive_object(struct receive_writer_arg *rwa, struct drr_object *drro,
 	tx = dmu_tx_create(rwa->os);
 	dmu_tx_hold_bonus(tx, object);
 	dmu_tx_hold_write(tx, object, 0, 0);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_tx_abort(tx);
 		return (err);
@@ -1532,7 +1532,7 @@ receive_write(struct receive_writer_arg *rwa, struct drr_write *drrw,
 	tx = dmu_tx_create(rwa->os);
 	dmu_tx_hold_write(tx, drrw->drr_object,
 	    drrw->drr_offset, drrw->drr_logical_size);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_tx_abort(tx);
 		return (err);
@@ -1622,7 +1622,7 @@ receive_write_byref(struct receive_writer_arg *rwa,
 
 	dmu_tx_hold_write(tx, drrwbr->drr_object,
 	    drrwbr->drr_offset, drrwbr->drr_length);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_tx_abort(tx);
 		return (err);
@@ -1670,7 +1670,7 @@ receive_write_embedded(struct receive_writer_arg *rwa,
 
 	dmu_tx_hold_write(tx, drrwe->drr_object,
 	    drrwe->drr_offset, drrwe->drr_length);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_tx_abort(tx);
 		return (err);
@@ -1737,7 +1737,7 @@ receive_spill(struct receive_writer_arg *rwa, struct drr_spill *drrs,
 
 	dmu_tx_hold_spill(tx, db->db_object);
 
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_buf_rele(db, FTAG);
 		dmu_buf_rele(db_spill, FTAG);
@@ -2337,7 +2337,7 @@ receive_reset_accounting(objset_t *os)
 	 * than the one a new tx is assigned to.
 	 */
 	tx = dmu_tx_create(os);
-	err = dmu_tx_assign(tx, TXG_WAIT | TXG_NOTHROTTLE);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_NOTHROTTLE);
 	if (err != 0) {
 		dmu_tx_abort(tx);
 		return (err);
@@ -2377,7 +2377,7 @@ receive_reset_accounting(objset_t *os)
 
 			tx = dmu_tx_create(os);
 			dmu_tx_hold_bonus(tx, obj);
-			err = dmu_tx_assign(tx, TXG_WAIT);
+			err = dmu_tx_assign(tx, DMU_TX_WAIT);
 			if (err != 0) {
 				dmu_tx_abort(tx);
 				tx = NULL;
@@ -2416,7 +2416,7 @@ receive_reset_accounting(objset_t *os)
 		}
 	}
 	dmu_tx_mark_netfree(tx);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_tx_abort(tx);
 		return (err);
