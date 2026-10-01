@@ -36,6 +36,7 @@
  */
 
 #include <assert.h>
+#include <atomic.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -51,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <thread_pool.h>
 #include <time.h>
 #include <unistd.h>
 #include <priv.h>
@@ -2642,6 +2644,8 @@ zfs_force_import_required(nvlist_t *config)
  * lifting off to zpool_import_props(), and then mounts the datasets contained
  * within the pool.
  */
+static pthread_mutex_t import_mount_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int
 do_import(nvlist_t *config, const char *newname, const char *mntopts,
     nvlist_t *props, int flags)
@@ -2738,14 +2742,42 @@ do_import(nvlist_t *config, const char *newname, const char *mntopts,
 	}
 
 	if (zpool_get_state(zhp) != POOL_STATE_UNAVAIL &&
-	    !(flags & ZFS_IMPORT_ONLY) &&
-	    zpool_enable_datasets(zhp, mntopts, 0) != 0) {
-		zpool_close(zhp);
-		return (1);
+	    !(flags & ZFS_IMPORT_ONLY)) {
+		/*
+		 * 'zpool import -a' imports pools in parallel, but mounts
+		 * one pool at a time: zpool_enable_datasets() shares through
+		 * libshare, which is not thread-safe, and starts its own
+		 * mount threads.
+		 */
+		(void) pthread_mutex_lock(&import_mount_lock);
+		int error = zpool_enable_datasets(zhp, mntopts, 0);
+		(void) pthread_mutex_unlock(&import_mount_lock);
+		if (error != 0) {
+			zpool_close(zhp);
+			return (1);
+		}
 	}
 
 	zpool_close(zhp);
 	return (ret);
+}
+
+typedef struct import_parameters {
+	nvlist_t *ip_config;
+	const char *ip_mntopts;
+	nvlist_t *ip_props;
+	int ip_flags;
+	uint_t *ip_err;
+} import_parameters_t;
+
+static void
+do_import_task(void *arg)
+{
+	import_parameters_t *ip = arg;
+
+	atomic_or_uint(ip->ip_err, do_import(ip->ip_config, NULL,
+	    ip->ip_mntopts, ip->ip_props, ip->ip_flags));
+	free(ip);
 }
 
 typedef struct target_exists_args {
@@ -2954,6 +2986,8 @@ zpool_do_import(int argc, char **argv)
 	char *cachefile = NULL;
 	importargs_t idata = { 0 };
 	char *endptr;
+	tpool_t *tp = NULL;
+	uint_t all_err = 0;
 
 
 	struct option long_options[] = {
@@ -3210,6 +3244,16 @@ zpool_do_import(int argc, char **argv)
 	err = 0;
 	elem = NULL;
 	first = B_TRUE;
+	if (do_all) {
+		tp = tpool_create(1, 5 * sysconf(_SC_NPROCESSORS_ONLN),
+		    0, NULL);
+		if (tp == NULL) {
+			(void) fprintf(stderr, gettext("cannot create "
+			    "thread pool: %s\n"), strerror(errno));
+			err = 1;
+			goto error;
+		}
+	}
 	while ((elem = nvlist_next_nvpair(pools, elem)) != NULL) {
 
 		verify(nvpair_value_nvlist(elem, &config) == 0);
@@ -3231,8 +3275,20 @@ zpool_do_import(int argc, char **argv)
 				(void) printf("\n");
 
 			if (do_all) {
-				err |= do_import(config, NULL, mntopts,
-				    props, flags);
+				import_parameters_t *ip = safe_malloc(
+				    sizeof (import_parameters_t));
+
+				ip->ip_config = config;
+				ip->ip_mntopts = mntopts;
+				ip->ip_props = props;
+				ip->ip_flags = flags;
+				ip->ip_err = &all_err;
+
+				if (tpool_dispatch(tp, do_import_task,
+				    ip) != 0) {
+					free(ip);
+					err = 1;
+				}
 			} else {
 				show_import(config);
 			}
@@ -3268,6 +3324,12 @@ zpool_do_import(int argc, char **argv)
 			if (guid == searchguid)
 				found_config = config;
 		}
+	}
+
+	if (do_all) {
+		tpool_wait(tp);
+		tpool_destroy(tp);
+		err |= all_err;
 	}
 
 	/*
