@@ -278,6 +278,8 @@ libzfs_error_description(libzfs_handle_t *hdl)
 	case EZFS_NO_RESILVER_DEFER:
 		return (dgettext(TEXT_DOMAIN, "this action requires the "
 		    "resilver_defer feature"));
+	case EZFS_EXPORT_IN_PROGRESS:
+		return (dgettext(TEXT_DOMAIN, "pool export in progress"));
 	case EZFS_UNKNOWN:
 		return (dgettext(TEXT_DOMAIN, "unknown error"));
 	default:
@@ -551,6 +553,9 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 		break;
 	case ZFS_ERR_CHECKPOINT_EXISTS:
 		zfs_verror(hdl, EZFS_CHECKPOINT_EXISTS, fmt, ap);
+		break;
+	case ZFS_ERR_EXPORT_IN_PROGRESS:
+		zfs_verror(hdl, EZFS_EXPORT_IN_PROGRESS, fmt, ap);
 		break;
 	case ZFS_ERR_DISCARDING_CHECKPOINT:
 		zfs_verror(hdl, EZFS_DISCARDING_CHECKPOINT, fmt, ap);
