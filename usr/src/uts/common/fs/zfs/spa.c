@@ -32,7 +32,7 @@
  * Copyright (c) 2017, Intel Corporation.
  * Copyright 2020 Joshua M. Clulow <josh@sysmgr.org>
  * Copyright 2021 OmniOS Community Edition (OmniOSce) Association.
- * Copyright 2022 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  * Copyright 2026 Edgecast Cloud LLC.
  */
 
@@ -5976,8 +5976,16 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		/*
 		 * Objsets may be open only because they're dirty, so we
 		 * have to force it to sync before checking spa_refcnt.
+		 * If the pool is or becomes suspended, give up rather than
+		 * wait forever while holding spa_namespace_lock, which
+		 * would block administration of every other pool.
 		 */
-		txg_wait_synced(spa->spa_dsl_pool, 0);
+		if (txg_wait_synced_flags(spa->spa_dsl_pool, 0,
+		    TXG_WAIT_SUSPEND) != 0) {
+			spa_async_resume(spa);
+			mutex_exit(&spa_namespace_lock);
+			return (SET_ERROR(EAGAIN));
+		}
 		spa_evicting_os_wait(spa);
 
 		/*
