@@ -35,6 +35,7 @@
  */
 
 #include <assert.h>
+#include <atomic.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -50,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <thread_pool.h>
 #include <time.h>
 #include <unistd.h>
 #include <priv.h>
@@ -2737,6 +2739,24 @@ do_import(nvlist_t *config, const char *newname, const char *mntopts,
 	return (ret);
 }
 
+typedef struct import_parameters {
+	nvlist_t *ip_config;
+	const char *ip_mntopts;
+	nvlist_t *ip_props;
+	int ip_flags;
+	uint_t *ip_err;
+} import_parameters_t;
+
+static void
+do_import_task(void *arg)
+{
+	import_parameters_t *ip = arg;
+
+	atomic_or_uint(ip->ip_err, do_import(ip->ip_config, NULL,
+	    ip->ip_mntopts, ip->ip_props, ip->ip_flags));
+	free(ip);
+}
+
 typedef struct target_exists_args {
 	const char	*poolname;
 	uint64_t	poolguid;
@@ -2943,6 +2963,8 @@ zpool_do_import(int argc, char **argv)
 	char *cachefile = NULL;
 	importargs_t idata = { 0 };
 	char *endptr;
+	tpool_t *tp = NULL;
+	uint_t all_err = 0;
 
 
 	struct option long_options[] = {
@@ -3199,6 +3221,16 @@ zpool_do_import(int argc, char **argv)
 	err = 0;
 	elem = NULL;
 	first = B_TRUE;
+	if (do_all) {
+		tp = tpool_create(1, 5 * sysconf(_SC_NPROCESSORS_ONLN),
+		    0, NULL);
+		if (tp == NULL) {
+			(void) fprintf(stderr, gettext("cannot create "
+			    "thread pool: %s\n"), strerror(errno));
+			err = 1;
+			goto error;
+		}
+	}
 	while ((elem = nvlist_next_nvpair(pools, elem)) != NULL) {
 
 		verify(nvpair_value_nvlist(elem, &config) == 0);
@@ -3220,8 +3252,20 @@ zpool_do_import(int argc, char **argv)
 				(void) printf("\n");
 
 			if (do_all) {
-				err |= do_import(config, NULL, mntopts,
-				    props, flags);
+				import_parameters_t *ip = safe_malloc(
+				    sizeof (import_parameters_t));
+
+				ip->ip_config = config;
+				ip->ip_mntopts = mntopts;
+				ip->ip_props = props;
+				ip->ip_flags = flags;
+				ip->ip_err = &all_err;
+
+				if (tpool_dispatch(tp, do_import_task,
+				    ip) != 0) {
+					free(ip);
+					err = 1;
+				}
 			} else {
 				show_import(config);
 			}
@@ -3257,6 +3301,12 @@ zpool_do_import(int argc, char **argv)
 			if (guid == searchguid)
 				found_config = config;
 		}
+	}
+
+	if (do_all) {
+		tpool_wait(tp);
+		tpool_destroy(tp);
+		err |= all_err;
 	}
 
 	/*

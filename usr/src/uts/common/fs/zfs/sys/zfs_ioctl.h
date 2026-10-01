@@ -403,6 +403,8 @@ typedef enum zinject_type {
 	ZINJECT_PANIC,
 	ZINJECT_DELAY_IO,
 	ZINJECT_DECRYPT_FAULT,
+	ZINJECT_DELAY_IMPORT,
+	ZINJECT_DELAY_EXPORT,
 } zinject_type_t;
 
 typedef struct zfs_share {

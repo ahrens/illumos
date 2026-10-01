@@ -808,6 +808,8 @@ extern void spa_sync_allpools(void);
 
 /* spa namespace global mutex */
 extern kmutex_t spa_namespace_lock;
+extern avl_tree_t spa_namespace_avl;
+extern kcondvar_t spa_namespace_cv;
 
 /*
  * SPA configuration functions in spa_config.c
