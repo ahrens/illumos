@@ -1731,6 +1731,15 @@ file \
     path=opt/zfs-tests/tests/functional/cli_root/zpool_import/zpool_import_missing_003_pos \
     mode=0555
 file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_import/zpool_import_parallel_admin \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_import/zpool_import_parallel_neg \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_import/zpool_import_parallel_pos \
+    mode=0555
+file \
     path=opt/zfs-tests/tests/functional/cli_root/zpool_import/zpool_import_rename_001_pos \
     mode=0555
 dir  path=opt/zfs-tests/tests/functional/cli_root/zpool_initialize

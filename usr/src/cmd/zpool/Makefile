@@ -43,6 +43,7 @@ LDLIBS += -lzfs -lnvpair -ldevid -lefi -ldiskmgt -luutil -lumem -lzutil \
 
 INCS += -I../../common/zfs -I../../uts/common/fs/zfs
 INCS += -I../../lib/libzutil/common
+INCS += -I../../lib/libc/inc
 
 CSTD=	$(CSTD_GNU99)
 
