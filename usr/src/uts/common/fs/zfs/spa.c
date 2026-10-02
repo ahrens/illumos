@@ -1431,7 +1431,8 @@ spa_unload_log_sm_metadata(spa_t *spa)
 static void
 spa_unload(spa_t *spa)
 {
-	ASSERT(MUTEX_HELD(&spa_namespace_lock));
+	ASSERT(MUTEX_HELD(&spa_namespace_lock) ||
+	    spa->spa_export_thread == curthread);
 	ASSERT(spa_state(spa) != POOL_STATE_UNINITIALIZED);
 
 	spa_import_progress_remove(spa);
@@ -5964,6 +5965,7 @@ static int
 spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
     boolean_t force, boolean_t hardforce)
 {
+	int error = 0;
 	spa_t *spa;
 	hrtime_t export_start = gethrtime();
 
@@ -5987,13 +5989,14 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	spa->spa_is_exporting = B_TRUE;
 
 	/*
-	 * Put a hold on the pool, drop the namespace lock, stop async tasks,
-	 * reacquire the namespace lock, and see if we can export.
+	 * Put a hold on the pool, drop the namespace lock, stop async tasks
+	 * and see if we can export.
 	 */
 	spa_open_ref(spa, FTAG);
 	mutex_exit(&spa_namespace_lock);
 	spa_async_suspend(spa);
 	mutex_enter(&spa_namespace_lock);
+	spa->spa_export_thread = curthread;
 	spa_close(spa, FTAG);
 
 	/*
@@ -6001,7 +6004,6 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	 * in which case we can modify its state.
 	 */
 	if (spa->spa_state != POOL_STATE_UNINITIALIZED && spa->spa_sync_on) {
-
 		/*
 		 * Objsets may be open only because they're dirty, so we
 		 * have to force it to sync before checking spa_refcnt.
@@ -6011,10 +6013,8 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 */
 		if (txg_wait_synced_flags(spa->spa_dsl_pool, 0,
 		    TXG_WAIT_SUSPEND) != 0) {
-			spa_async_resume(spa);
-			spa->spa_is_exporting = B_FALSE;
-			mutex_exit(&spa_namespace_lock);
-			return (SET_ERROR(EAGAIN));
+			error = SET_ERROR(EAGAIN);
+			goto fail;
 		}
 		spa_evicting_os_wait(spa);
 
@@ -6026,12 +6026,20 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		if (!spa_refcount_zero(spa) ||
 		    (spa->spa_inject_ref != 0 &&
 		    new_state != POOL_STATE_UNINITIALIZED)) {
-			spa_async_resume(spa);
-			spa->spa_is_exporting = B_FALSE;
-			mutex_exit(&spa_namespace_lock);
-			return (SET_ERROR(EBUSY));
+			error = SET_ERROR(EBUSY);
+			goto fail;
 		}
+	}
 
+	mutex_exit(&spa_namespace_lock);
+	/*
+	 * At this point we no longer hold the spa_namespace_lock and
+	 * there were no references on the spa. Future spa_lookups will
+	 * notice the spa->spa_export_thread and wait until we signal
+	 * that we are finished.
+	 */
+
+	if (spa->spa_state != POOL_STATE_UNINITIALIZED && spa->spa_sync_on) {
 		/*
 		 * A pool cannot be exported if it has an active shared spare.
 		 * This is to prevent other pools stealing the active spare
@@ -6040,10 +6048,9 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 */
 		if (!force && new_state == POOL_STATE_EXPORTED &&
 		    spa_has_active_shared_spare(spa)) {
-			spa_async_resume(spa);
-			spa->spa_is_exporting = B_FALSE;
-			mutex_exit(&spa_namespace_lock);
-			return (SET_ERROR(EXDEV));
+			error = SET_ERROR(EXDEV);
+			mutex_enter(&spa_namespace_lock);
+			goto fail;
 		}
 
 		/*
@@ -6088,6 +6095,10 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	if (new_state == POOL_STATE_EXPORTED)
 		zio_handle_export_delay(spa, gethrtime() - export_start);
 
+	/*
+	 * Take the namespace lock for the actual spa_t removal
+	 */
+	mutex_enter(&spa_namespace_lock);
 	if (new_state != POOL_STATE_UNINITIALIZED) {
 		if (!hardforce)
 			spa_write_cachefile(spa, B_TRUE, B_TRUE);
@@ -6099,11 +6110,27 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 * we make sure to reset the exporting flag.
 		 */
 		spa->spa_is_exporting = B_FALSE;
+		spa->spa_export_thread = NULL;
 	}
 
+	/*
+	 * Wake up any waiters in spa_lookup()
+	 */
+	cv_broadcast(&spa_namespace_cv);
 	mutex_exit(&spa_namespace_lock);
-
 	return (0);
+
+fail:
+	spa->spa_is_exporting = B_FALSE;
+	spa->spa_export_thread = NULL;
+
+	spa_async_resume(spa);
+	/*
+	 * Wake up any waiters in spa_lookup()
+	 */
+	cv_broadcast(&spa_namespace_cv);
+	mutex_exit(&spa_namespace_lock);
+	return (error);
 }
 
 /*
