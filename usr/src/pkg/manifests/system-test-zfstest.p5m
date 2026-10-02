@@ -1584,6 +1584,12 @@ file \
 file \
     path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_004_pos \
     mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_parallel_admin \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_parallel_pos \
+    mode=0555
 dir  path=opt/zfs-tests/tests/functional/cli_root/zpool_get
 file path=opt/zfs-tests/tests/functional/cli_root/zpool_get/cleanup mode=0555
 file path=opt/zfs-tests/tests/functional/cli_root/zpool_get/setup mode=0555
