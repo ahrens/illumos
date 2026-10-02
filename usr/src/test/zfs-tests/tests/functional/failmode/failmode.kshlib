@@ -69,7 +69,8 @@ function failmode_cleanup
 {
 	zinject -c all >/dev/null 2>&1
 	if poolexists $TESTPOOL; then
-		pool_is_suspended $TESTPOOL && zpool clear $TESTPOOL
+		# zpool status can miss a suspension; clearing is harmless.
+		zpool clear $TESTPOOL >/dev/null 2>&1
 		destroy_pool $TESTPOOL
 	fi
 	rm -f $FAILMODE_VDEV
