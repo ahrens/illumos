@@ -6100,10 +6100,19 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		if (spa_should_flush_logs_on_unload(spa))
 			spa_unload_log_sm_flush_all(spa);
 
+		/*
+		 * spa_unload() -> txg_sync_stop() syncs through the open txg
+		 * plus TXG_DEFER_SIZE, so base the final txg on the open txg.
+		 * spa_last_synced_txg() + 1 is the same when the sync pipeline
+		 * is idle, but a txg may still be syncing: SCL_ALL as writer
+		 * waits behind its spa_sync(), and the open txg is then one
+		 * further along, which would sync a txg past spa_final_txg.
+		 */
 		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce) {
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
-			spa->spa_final_txg = spa_last_synced_txg(spa) +
-			    TXG_DEFER_SIZE + 1;
+			spa->spa_final_txg = MAX(spa_last_synced_txg(spa) + 1,
+			    spa->spa_dsl_pool->dp_tx.tx_open_txg) +
+			    TXG_DEFER_SIZE;
 			spa_config_exit(spa, SCL_ALL, FTAG);
 		}
 	}
