@@ -1391,6 +1391,24 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 		mutex_exit(&zfsdev_state_lock);
 		return (SET_ERROR(ENXIO));
 	}
+
+	/*
+	 * The last close waits for the volume's dirty data to be synced (in
+	 * zil_close() and zvol_last_close()), which can take a long time, and
+	 * every zvol open, close and ioctl needs zfsdev_state_lock.  If this
+	 * looks like the last close, wait for the data first without holding
+	 * zfsdev_state_lock, so that zvol_last_close() has nothing to wait
+	 * for.  Our open keeps the volume from being closed or removed in the
+	 * meantime (see zvol_remove_zv()).  If another open comes in, the wait
+	 * was merely unnecessary.
+	 */
+	if (zv->zv_total_opens == 1 && !(zv->zv_flags & ZVOL_RDONLY) &&
+	    dsl_dataset_is_dirty(dmu_objset_ds(zv->zv_objset))) {
+		mutex_exit(&zfsdev_state_lock);
+		txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
+		mutex_enter(&zfsdev_state_lock);
+	}
+
 	zvol_close_impl(zv, otyp);
 	mutex_exit(&zfsdev_state_lock);
 	return (error);
