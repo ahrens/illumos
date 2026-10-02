@@ -566,7 +566,7 @@ tags = ['functional', 'async_destroy']
 [tests/functional/failmode]
 tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'failmode_nowait_wait', 'failmode_nowait_continue',
-    'failmode_admin_isolation']
+    'failmode_admin_isolation', 'failmode_status_resilver']
 tags = ['functional', 'failmode']
 
 [tests/functional/fault]
