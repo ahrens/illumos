@@ -23,6 +23,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012 by Delphix. All rights reserved.
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*
@@ -223,6 +224,24 @@ check_status(nvlist_t *config, boolean_t isimport, zpool_errata_t *erratap)
 	    &stateval) == 0);
 
 	/*
+	 * Check whether the pool has suspended.  This comes before the
+	 * resilver check: a pool can suspend in the middle of a resilver,
+	 * and a suspended pool needs the administrator's attention.
+	 */
+	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_SUSPENDED,
+	    &suspended) == 0) {
+		uint64_t reason;
+
+		if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_SUSPENDED_REASON,
+		    &reason) == 0 && reason == ZIO_SUSPEND_MMP)
+			return (ZPOOL_STATUS_IO_FAILURE_MMP);
+
+		if (suspended == ZIO_FAILURE_MODE_CONTINUE)
+			return (ZPOOL_STATUS_IO_FAILURE_CONTINUE);
+		return (ZPOOL_STATUS_IO_FAILURE_WAIT);
+	}
+
+	/*
 	 * Currently resilvering a vdev
 	 */
 	(void) nvlist_lookup_uint64_array(nvroot, ZPOOL_CONFIG_SCAN_STATS,
@@ -286,22 +305,6 @@ check_status(nvlist_t *config, boolean_t isimport, zpool_errata_t *erratap)
 	if (vs->vs_state == VDEV_STATE_CANT_OPEN &&
 	    vs->vs_aux == VDEV_AUX_BAD_GUID_SUM)
 		return (ZPOOL_STATUS_BAD_GUID_SUM);
-
-	/*
-	 * Check whether the pool has suspended.
-	 */
-	if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_SUSPENDED,
-	    &suspended) == 0) {
-		uint64_t reason;
-
-		if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_SUSPENDED_REASON,
-		    &reason) == 0 && reason == ZIO_SUSPEND_MMP)
-			return (ZPOOL_STATUS_IO_FAILURE_MMP);
-
-		if (suspended == ZIO_FAILURE_MODE_CONTINUE)
-			return (ZPOOL_STATUS_IO_FAILURE_CONTINUE);
-		return (ZPOOL_STATUS_IO_FAILURE_WAIT);
-	}
 
 	/*
 	 * Could not read a log.
