@@ -29,7 +29,7 @@
 .\" Copyright 2024 OmniOS Community Edition (OmniOSce) Association.
 .\" Copyright 2025 Hans Rosenfeld
 .\"
-.Dd September 6, 2025
+.Dd October 2, 2026
 .Dt ZPOOL 8
 .Os
 .Sh NAME
@@ -77,7 +77,7 @@
 .Nm
 .Cm export
 .Op Fl f
-.Ar pool Ns ...
+.Fl a Ns | Ns Ar pool Ns ...
 .Nm
 .Cm get
 .Op Fl Hp
@@ -1259,7 +1259,7 @@ The operation is refused if there are no other valid replicas of the data.
 .Nm
 .Cm export
 .Op Fl f
-.Ar pool Ns ...
+.Fl a Ns | Ns Ar pool Ns ...
 .Xc
 Exports the given pools from the system.
 All devices are marked as exported, but are still considered in use by other
@@ -1279,6 +1279,9 @@ portable EFI labels.
 Otherwise, disk drivers on platforms of different endianness will not recognize
 the disks.
 .Bl -tag -width Ds
+.It Fl a
+Exports all pools imported on the system, except the pool holding the root
+file system.
 .It Fl f
 Forcefully unmount all datasets, using the
 .Nm unmount Fl f
