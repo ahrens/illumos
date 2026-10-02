@@ -28,6 +28,7 @@
 # Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 # Copyright 2020 Joyent, Inc.
 # Copyright 2024 MNX Cloud, Inc.
+# Copyright 2026 Oxide Computer Company
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -134,4 +135,47 @@ function is_swap_inuse
 	swap -l | awk 'NR > 1 { print $1 }' | \
 	    grep "^$device\$" > /dev/null 2>&1
 	return $?
+}
+
+#
+# Log the raw zvol zero thread's recent zfs_dbgmsg entries: the block size
+# it is using and whether it found gang blocks and started over.  Each
+# restart rewrites the whole volume at half the block size, so a low
+# metaslab_force_ganging makes initialization many times slower.
+#
+function log_raw_zvol_dbgmsg
+{
+	typeset line
+
+	log_note "metaslab_force_ganging is" \
+	    "$(get_tunable metaslab_force_ganging)"
+	mdb -k -e ::zfs_dbgmsg | grep -E "^zv |zvol_zero|gang blocks" | \
+	    tail -20 | while read -r line; do
+		log_note "$line"
+	done
+}
+
+#
+# Destroy a raw zvol.  Its zero thread keeps it open until initialization
+# stops, so "zfs destroy" fails with EBUSY until then.  Clear any injected
+# delays first so that the rest of the initialization goes quickly.
+#
+# $1 raw zvol
+# $2 seconds to wait for it to become destroyable (default 300)
+#
+function destroy_raw_zvol # dataset [timeout]
+{
+	typeset vol=$1
+	typeset -i timeout=${2:-300}
+	typeset -i start=$SECONDS
+
+	zinject -c all >/dev/null
+	while datasetexists $vol && ! zfs destroy $vol 2>/dev/null; do
+		if (( SECONDS - start >= timeout )); then
+			log_raw_zvol_dbgmsg
+			log_must zfs destroy $vol
+		fi
+		sleep 1
+	done
+	return 0
 }
