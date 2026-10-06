@@ -3228,6 +3228,29 @@ ztest_split_pool(ztest_ds_t *zd, uint64_t id)
 }
 
 /*
+ * Returns B_TRUE if ztest_fault_inject() has made a leaf under vd
+ * unreadable (vdev_cant_read, or its fd closed behind its back).  Such a
+ * fault persists until the vdev is reopened.
+ */
+static boolean_t
+ztest_vdev_has_injected_fault(vdev_t *vd)
+{
+	if (vd->vdev_ops->vdev_op_leaf) {
+		vdev_file_t *vf = vd->vdev_tsd;
+
+		return (vd->vdev_cant_read ||
+		    (vd->vdev_ops == &vdev_file_ops && vf != NULL &&
+		    vf->vf_vnode != NULL && vf->vf_vnode->v_fd == -1));
+	}
+
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		if (ztest_vdev_has_injected_fault(vd->vdev_child[c]))
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
  * Verify that we can attach and detach devices.
  */
 /* ARGSUSED */
@@ -3342,6 +3365,21 @@ ztest_vdev_attach_detach(ztest_ds_t *zd, uint64_t id)
 		    error != ENOTSUP && error != ZFS_ERR_CHECKPOINT_EXISTS &&
 		    error != ZFS_ERR_DISCARDING_CHECKPOINT)
 			fatal(0, "detach (%s) returned %d", oldpath, error);
+		mutex_exit(&ztest_vdev_lock);
+		return;
+	}
+
+	/*
+	 * A resilver that can't read its source still completes and
+	 * excises the new device's DTL (vdev_dtl_reassess()), after which
+	 * the old device, possibly the only good copy, can be detached or
+	 * replaced away.  That's by design: otherwise a permanent read
+	 * error would make the resilver run forever, and the errors are
+	 * reported.  So don't attach to or replace in a top-level vdev
+	 * with a leaf that ztest_fault_inject() has made unreadable.
+	 */
+	if (ztest_vdev_has_injected_fault(oldvd->vdev_top)) {
+		spa_config_exit(spa, SCL_ALL, FTAG);
 		mutex_exit(&ztest_vdev_lock);
 		return;
 	}
@@ -5704,7 +5742,6 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	maxfaults = MAXFAULTS();
 	leaves = MAX(zs->zs_mirrors, 1) * ztest_opts.zo_raidz;
 	mirror_save = zs->zs_mirrors;
-	mutex_exit(&ztest_vdev_lock);
 
 	ASSERT(leaves >= 1);
 
@@ -5718,8 +5755,17 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 	 * as the pool has been scrubbed prior to using the new mapping.
 	 * Failure to do can result in non-repairable damage being injected.
 	 */
-	if (ztest_pool_scrubbed == B_FALSE)
+	if (ztest_pool_scrubbed == B_FALSE) {
+		mutex_exit(&ztest_vdev_lock);
 		return;
+	}
+
+	/*
+	 * Keep holding the ztest_vdev_lock while we pick a device and
+	 * inject a fault into it, so that ztest_vdev_attach_detach() can
+	 * tell whether a resilver source has an injected fault (see
+	 * ztest_vdev_has_injected_fault()).
+	 */
 
 	/*
 	 * Grab the name lock as reader. There are some operations
@@ -5806,6 +5852,7 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 		if (sav->sav_count == 0) {
 			spa_config_exit(spa, SCL_STATE, FTAG);
 			rw_exit(&ztest_name_lock);
+			mutex_exit(&ztest_vdev_lock);
 			return;
 		}
 		vd0 = sav->sav_vdevs[ztest_random(sav->sav_count)];
@@ -5820,6 +5867,7 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 
 	spa_config_exit(spa, SCL_STATE, FTAG);
 	rw_exit(&ztest_name_lock);
+	mutex_exit(&ztest_vdev_lock);
 
 	/*
 	 * If we can tolerate two or more faults, or we're dealing
