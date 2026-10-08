@@ -1426,8 +1426,19 @@ spa_vdev_remove_thread(void *arg)
 		 * appropriate action (see free_from_removing_vdev()).
 		 */
 		if (msp->ms_sm != NULL) {
-			VERIFY0(space_map_load(msp->ms_sm,
-			    svr->svr_allocd_segs, SM_ALLOC));
+			int error = space_map_load(msp->ms_sm,
+			    svr->svr_allocd_segs, SM_ALLOC);
+			if (error != 0) {
+				/*
+				 * A failed pool can't be read; stop as if
+				 * we'd been asked to (see below).
+				 */
+				VERIFY(spa_failed(spa));
+				mutex_exit(&msp->ms_lock);
+				mutex_exit(&msp->ms_sync_lock);
+				svr->svr_thread_exit = B_TRUE;
+				break;
+			}
 
 			range_tree_walk(msp->ms_unflushed_allocs,
 			    range_tree_add, svr->svr_allocd_segs);
@@ -1490,8 +1501,18 @@ spa_vdev_remove_thread(void *arg)
 			dmu_tx_t *tx =
 			    dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 
-			VERIFY0(dmu_tx_assign(tx,
-			    DMU_TX_WAIT | DMU_TX_SUSPEND));
+			int error = dmu_tx_assign(tx,
+			    DMU_TX_WAIT | DMU_TX_SUSPEND);
+			if (error != 0) {
+				/* The pool has failed: stop. */
+				VERIFY(spa_failed(spa));
+				dmu_tx_abort(tx);
+				spa_config_enter(spa, SCL_CONFIG, FTAG,
+				    RW_READER);
+				mutex_enter(&svr->svr_lock);
+				svr->svr_thread_exit = B_TRUE;
+				continue;
+			}
 			uint64_t txg = dmu_tx_get_txg(tx);
 
 			/*
@@ -1831,6 +1852,13 @@ spa_vdev_remove_log(vdev_t *vd, uint64_t *txg)
 		error = spa_reset_logs(spa);
 
 	*txg = spa_vdev_config_enter(spa);
+
+	/*
+	 * If the pool failed in the meantime, its frees are no-ops and its
+	 * txgs aren't committed, so the device keeps its allocations.
+	 */
+	if (error == 0 && spa_failed(spa))
+		error = SET_ERROR(EIO);
 
 	if (error != 0) {
 		metaslab_group_activate(mg);

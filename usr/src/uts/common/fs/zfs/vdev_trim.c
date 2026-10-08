@@ -24,6 +24,7 @@
  * Copyright (c) 2019 by Lawrence Livermore National Security, LLC.
  * Copyright 2019 Joyent, Inc.
  * Copyright 2023 RackTop Systems, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/spa.h>
@@ -644,9 +645,14 @@ vdev_trim_calculate_progress(vdev_t *vd)
 		/*
 		 * If we get here, we're in the middle of trimming this
 		 * metaslab.  Load it and walk the free tree for more
-		 * accurate progress estimation.
+		 * accurate progress estimation.  A pool that has failed can't
+		 * load it, and the estimate doesn't matter then.
 		 */
-		VERIFY0(metaslab_load(msp));
+		if (metaslab_load(msp) != 0) {
+			VERIFY(spa_failed(vd->vdev_spa));
+			mutex_exit(&msp->ms_lock);
+			continue;
+		}
 
 		range_tree_t *rt = msp->ms_allocatable;
 		zfs_btree_t *bt = &rt->rt_root;
@@ -757,9 +763,13 @@ vdev_trim_range_add(void *arg, uint64_t start, uint64_t size)
 	 */
 	if (zfs_flags & ZFS_DEBUG_TRIM) {
 		metaslab_t *msp = ta->trim_msp;
-		VERIFY0(metaslab_load(msp));
-		VERIFY3B(msp->ms_loaded, ==, B_TRUE);
-		VERIFY(range_tree_contains(msp->ms_allocatable, start, size));
+		if (metaslab_load(msp) == 0) {
+			VERIFY3B(msp->ms_loaded, ==, B_TRUE);
+			VERIFY(range_tree_contains(msp->ms_allocatable,
+			    start, size));
+		} else {
+			VERIFY(spa_failed(vd->vdev_spa));
+		}
 	}
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
@@ -838,8 +848,11 @@ vdev_trim_thread(void *arg)
 	 * has no parent, which loading its progress needs, and the loop below
 	 * doesn't run.
 	 */
-	if (!vd->vdev_detached)
-		VERIFY0(vdev_trim_load(vd));
+	if (!vd->vdev_detached) {
+		error = vdev_trim_load(vd);
+		/* The pool has failed, and can't read the leaf ZAP. */
+		VERIFY(error == 0 || spa_failed(spa));
+	}
 
 	ta.trim_vdev = vd;
 	ta.trim_extent_bytes_max = zfs_trim_extent_bytes_max;
@@ -859,7 +872,7 @@ vdev_trim_thread(void *arg)
 	}
 
 	uint64_t ms_count = 0;
-	for (uint64_t i = 0; !vd->vdev_detached &&
+	for (uint64_t i = 0; error == 0 && !vd->vdev_detached &&
 	    i < vd->vdev_top->vdev_ms_count; i++) {
 		metaslab_t *msp = vd->vdev_top->vdev_ms[i];
 
@@ -875,7 +888,15 @@ vdev_trim_thread(void *arg)
 		spa_config_exit(spa, SCL_CONFIG, FTAG);
 		metaslab_disable(msp);
 		mutex_enter(&msp->ms_lock);
-		VERIFY0(metaslab_load(msp));
+		error = metaslab_load(msp);
+		if (error != 0) {
+			/* The pool has failed, and can't read the metaslab. */
+			VERIFY(spa_failed(spa));
+			mutex_exit(&msp->ms_lock);
+			metaslab_enable(msp, B_FALSE, B_FALSE);
+			spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+			break;
+		}
 
 		/*
 		 * If a partial TRIM was requested skip metaslabs which have
@@ -1325,10 +1346,13 @@ vdev_autotrim_thread(void *arg)
 			 */
 			if (zfs_flags & ZFS_DEBUG_TRIM) {
 				mutex_enter(&msp->ms_lock);
-				VERIFY0(metaslab_load(msp));
-				VERIFY3P(tap[0].trim_msp, ==, msp);
-				range_tree_walk(trim_tree,
-				    vdev_trim_range_verify, &tap[0]);
+				if (metaslab_load(msp) == 0) {
+					VERIFY3P(tap[0].trim_msp, ==, msp);
+					range_tree_walk(trim_tree,
+					    vdev_trim_range_verify, &tap[0]);
+				} else {
+					VERIFY(spa_failed(spa));
+				}
 				mutex_exit(&msp->ms_lock);
 			}
 

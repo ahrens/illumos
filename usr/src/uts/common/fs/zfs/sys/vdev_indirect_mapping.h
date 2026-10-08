@@ -15,6 +15,7 @@
 
 /*
  * Copyright (c) 2015 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_VDEV_INDIRECT_MAPPING_H
@@ -125,7 +126,7 @@ extern vdev_indirect_mapping_entry_phys_t *
 
 extern uint32_t *vdev_indirect_mapping_load_obsolete_counts(
     vdev_indirect_mapping_t *vim);
-extern void vdev_indirect_mapping_load_obsolete_spacemap(
+extern int vdev_indirect_mapping_load_obsolete_spacemap(
     vdev_indirect_mapping_t *vim,
     uint32_t *counts, space_map_t *obsolete_space_sm);
 extern void vdev_indirect_mapping_increment_obsolete_count(

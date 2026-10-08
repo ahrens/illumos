@@ -389,6 +389,10 @@ spa_checkpoint_discard_thread_check(void *arg, zthr_t *zthr)
 	if (spa_has_checkpoint(spa))
 		return (B_FALSE);
 
+	/* A failed pool can't change. */
+	if (spa_failed(spa))
+		return (B_FALSE);
+
 	return (B_TRUE);
 }
 
@@ -424,6 +428,8 @@ spa_checkpoint_discard_thread(void *arg, zthr_t *zthr)
 			int error = dmu_buf_hold_array_by_bonus(
 			    checkpoint_sm->sm_dbuf, offset, size,
 			    B_TRUE, FTAG, &numbufs, &dbp);
+			if (error != 0 && spa_failed(spa))
+				return;
 			if (error != 0) {
 				zfs_panic_recover("zfs: error %d was returned "
 				    "while prefetching checkpoint space map "
@@ -431,19 +437,24 @@ spa_checkpoint_discard_thread(void *arg, zthr_t *zthr)
 				    error, vd->vdev_id);
 			}
 
-			VERIFY0(dsl_sync_task(spa->spa_name, NULL,
+			/* A failed pool runs no sync tasks. */
+			error = dsl_sync_task(spa->spa_name, NULL,
 			    spa_checkpoint_discard_thread_sync, vd,
-			    0, ZFS_SPACE_CHECK_NONE));
-
+			    0, ZFS_SPACE_CHECK_NONE);
 			dmu_buf_rele_array(dbp, numbufs, FTAG);
+			if (error != 0) {
+				VERIFY(spa_failed(spa));
+				return;
+			}
 		}
 	}
 
 	VERIFY(spa_checkpoint_discard_is_done(spa));
 	VERIFY0(spa->spa_checkpoint_info.sci_dspace);
-	VERIFY0(dsl_sync_task(spa->spa_name, NULL,
+	int error = dsl_sync_task(spa->spa_name, NULL,
 	    spa_checkpoint_discard_complete_sync, spa,
-	    0, ZFS_SPACE_CHECK_NONE));
+	    0, ZFS_SPACE_CHECK_NONE);
+	VERIFY(error == 0 || spa_failed(spa));
 }
 
 
