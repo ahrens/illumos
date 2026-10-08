@@ -39,6 +39,7 @@
 #include <sys/dsl_dir.h>
 #include <sys/dmu_tx.h>
 #include <sys/spa.h>
+#include <sys/dsl_pool.h>
 #include <sys/zio.h>
 #include <sys/dmu_zfetch.h>
 #include <sys/sa.h>
@@ -54,6 +55,7 @@
 
 static boolean_t dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx);
 static void dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx);
+static void dbuf_poison(dmu_buf_impl_t *db);
 
 #ifndef __lint
 extern inline void dmu_buf_init_user(dmu_buf_user_t *dbu,
@@ -872,6 +874,7 @@ dbuf_clear_data(dmu_buf_impl_t *db)
 	dbuf_evict_user(db);
 	ASSERT3P(db->db_buf, ==, NULL);
 	db->db.db_data = NULL;
+	db->db_poisoned = FALSE;
 	if (db->db_state != DB_ZEROFILL && db->db_state != DB_NOFILL)
 		db->db_state = DB_UNCACHED;
 }
@@ -1007,7 +1010,10 @@ dbuf_read_done(zio_t *zio, const zbookmark_phys_t *zb, const blkptr_t *bp,
 		ASSERT(zio == NULL || zio->io_error != 0);
 		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 		ASSERT3P(db->db_buf, ==, NULL);
-		db->db_state = DB_UNCACHED;
+		if (spa_failed(db->db_objset->os_spa))
+			dbuf_poison(db);
+		else
+			db->db_state = DB_UNCACHED;
 	} else if (db->db_level == 0 && db->db_freed_in_flight) {
 		/* we were freed in flight; disregard any error */
 		ASSERT(zio == NULL || zio->io_error == 0);
@@ -1089,6 +1095,42 @@ dbuf_read_verify_dnode_crypt(dmu_buf_impl_t *db, uint32_t flags)
 }
 
 /*
+ * A failed pool can't read anything (see zio_vdev_io_fence()), but its
+ * syncing context still has to get through the dirty data that is left, and
+ * it reads blocks along the way: the indirect blocks that dnode_sync() frees
+ * from, and the bpobjs and ZAPs that dsl_pool_sync() updates.  Much of that
+ * code can't handle an error (it VERIFYs), so syncing context gets zeros
+ * for every block it can't read, whatever the caller's flags: its reads
+ * fail in the fence, and dbuf_read_done() poisons the block.  In syncing
+ * context zeros look like holes, so there is nothing to free under them, and
+ * anything written over them goes nowhere (a ZAP opens a zeroed block as an
+ * empty one; see mzap_open()).  Open context, which could otherwise mistake
+ * them for real data or holes, gets EIO for them (see dbuf_read()).
+ */
+static void
+dbuf_poison(dmu_buf_impl_t *db)
+{
+	spa_t *spa = db->db_objset->os_spa;
+	zbookmark_phys_t zb;
+
+	ASSERT(MUTEX_HELD(&db->db_mtx));
+	ASSERT(db->db_state == DB_UNCACHED || db->db_state == DB_READ);
+	ASSERT3P(db->db_buf, ==, NULL);
+	ASSERT(spa_failed(spa));
+
+	dbuf_set_data(db, arc_alloc_buf(spa, db, DBUF_GET_BUFC_TYPE(db),
+	    db->db.db_size));
+	bzero(db->db.db_data, db->db.db_size);
+	db->db_poisoned = TRUE;
+	db->db_state = DB_CACHED;
+	cv_broadcast(&db->db_changed);
+
+	SET_BOOKMARK(&zb, dmu_objset_id(db->db_objset),
+	    db->db.db_object, db->db_level, db->db_blkid);
+	spa_exit_poisoned_read(spa, &zb);
+}
+
+/*
  * Drops db_mtx and the parent lock specified by dblt and tag before
  * returning.
  */
@@ -1145,9 +1187,34 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	 * processes the delete record and clears the bp while we are waiting
 	 * for the dn_mtx (resulting in a "no" from block_freed).
 	 */
-	if (db->db_blkptr == NULL || BP_IS_HOLE(db->db_blkptr) ||
+	boolean_t hole = (db->db_blkptr == NULL || BP_IS_HOLE(db->db_blkptr) ||
 	    (db->db_level == 0 && (dnode_block_freed(dn, db->db_blkid) ||
-	    BP_IS_HOLE(db->db_blkptr)))) {
+	    BP_IS_HOLE(db->db_blkptr))));
+
+	/*
+	 * Open context can't read a block from a failed pool.  It can have a
+	 * hole, such as the first block of an object created in a tx that
+	 * was assigned before the pool failed, unless the hole's block
+	 * pointer is in a parent that was poisoned (see dbuf_poison()): then
+	 * it is a hole only because the parent was zeroed.  A caller that
+	 * must have the block anyway, such as dmu_buf_will_dirty(), gets
+	 * zeros as well as the error.
+	 */
+	spa_t *spa = db->db_objset->os_spa;
+	boolean_t failed = spa_failed(spa);
+	boolean_t tainted = failed && db->db_parent != NULL &&
+	    db->db_parent->db_poisoned;
+	if (failed && !dsl_pool_sync_context(spa_get_dsl(spa)) &&
+	    (!hole || tainted)) {
+		if (flags & DB_RF_MUST_SUCCEED)
+			dbuf_poison(db);
+		DB_DNODE_EXIT(db);
+		mutex_exit(&db->db_mtx);
+		dmu_buf_unlock_parent(db, dblt, tag);
+		return (SET_ERROR(EIO));
+	}
+
+	if (hole) {
 		arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
 
 		dbuf_set_data(db, arc_alloc_buf(db->db_objset->os_spa, db, type,
@@ -1175,6 +1242,8 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 			}
 		}
 		DB_DNODE_EXIT(db);
+		/* A hole under a poisoned parent is no more real than it. */
+		db->db_poisoned = tainted;
 		db->db_state = DB_CACHED;
 		mutex_exit(&db->db_mtx);
 		dmu_buf_unlock_parent(db, dblt, tag);
@@ -1222,6 +1291,15 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	if ((flags & DB_RF_NO_DECRYPT) && BP_IS_PROTECTED(db->db_blkptr))
 		zio_flags |= ZIO_FLAG_RAW;
 	/*
+	 * Syncing context on a failed pool (open context returned above) reads
+	 * a block that isn't cached into the fence, and dbuf_read_done()
+	 * poisons it.  Keep the error from the caller's zio, which may be
+	 * waiting for several blocks: by the time it completes, this one is
+	 * cached.
+	 */
+	if (failed)
+		zio_flags |= ZIO_FLAG_DONT_PROPAGATE;
+	/*
 	 * The zio layer will copy the provided blkptr later, but we need to
 	 * do this now so that we can release the parent's rwlock. We have to
 	 * do that now so that if dbuf_read_done is called synchronously (on
@@ -1230,7 +1308,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	 */
 	blkptr_t bp = *db->db_blkptr;
 	dmu_buf_unlock_parent(db, dblt, tag);
-	(void) arc_read(zio, db->db_objset->os_spa, &bp,
+	(void) arc_read(zio, spa, &bp,
 	    dbuf_read_done, db, ZIO_PRIORITY_SYNC_READ, zio_flags,
 	    &aflags, &zb);
 	return (err);
@@ -1311,6 +1389,32 @@ dbuf_fix_old_data(dmu_buf_impl_t *db, uint64_t txg)
 		db->db_buf = NULL;
 		dbuf_clear_data(db);
 	}
+}
+
+/*
+ * Finish a read from a failed pool (see dbuf_poison()).  Only syncing context
+ * can use a poisoned block; open context gets EIO for it.  A read that failed
+ * just before the pool did left the block uncached, and syncing context, or
+ * a caller that must have the block, poisons it now.
+ */
+static int
+dbuf_read_poison(dmu_buf_impl_t *db, uint32_t flags, int err)
+{
+	spa_t *spa = db->db_objset->os_spa;
+
+	if (!spa_failed(spa))
+		return (err);
+
+	boolean_t syncing = dsl_pool_sync_context(spa_get_dsl(spa));
+	mutex_enter(&db->db_mtx);
+	if (err != 0 && (syncing || (flags & DB_RF_MUST_SUCCEED)) &&
+	    db->db_state == DB_UNCACHED && db->db_blkid != DMU_BONUS_BLKID)
+		dbuf_poison(db);
+	if (db->db_poisoned)
+		err = syncing ? 0 : SET_ERROR(EIO);
+	mutex_exit(&db->db_mtx);
+
+	return (err);
 }
 
 int
@@ -1438,6 +1542,9 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		}
 		mutex_exit(&db->db_mtx);
 	}
+
+	if (err != 0 || db->db_poisoned)
+		err = dbuf_read_poison(db, flags, err);
 
 	return (err);
 }
@@ -2561,6 +2668,7 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 	db->db_user = NULL;
 	db->db_user_immediate_evict = FALSE;
 	db->db_freed_in_flight = FALSE;
+	db->db_poisoned = FALSE;
 	db->db_pending_evict = FALSE;
 
 	if (blkid == DMU_BONUS_BLKID) {
@@ -3339,6 +3447,18 @@ void *
 dmu_buf_remove_user(dmu_buf_t *db_fake, dmu_buf_user_t *user)
 {
 	return (dmu_buf_replace_user(db_fake, user, NULL));
+}
+
+/*
+ * Whether syncing context got zeros for this block because the pool failed
+ * (see dbuf_poison()).
+ */
+boolean_t
+dmu_buf_is_poisoned(dmu_buf_t *db_fake)
+{
+	dmu_buf_impl_t *db = (dmu_buf_impl_t *)db_fake;
+
+	return (db->db_poisoned);
 }
 
 void *

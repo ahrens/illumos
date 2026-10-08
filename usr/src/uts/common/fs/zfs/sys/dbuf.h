@@ -294,6 +294,13 @@ typedef struct dmu_buf_impl {
 	uint8_t db_freed_in_flight;
 
 	/*
+	 * The pool has failed, and this block was zero-filled instead of
+	 * read, because syncing context had to have it (see
+	 * dbuf_read_impl()).  Reads of it from open context fail.
+	 */
+	uint8_t db_poisoned;
+
+	/*
 	 * dnode_evict_dbufs() or dnode_evict_bonus() tried to
 	 * evict this dbuf, but couldn't due to outstanding
 	 * references.  Evict once the refcount drops to 0.

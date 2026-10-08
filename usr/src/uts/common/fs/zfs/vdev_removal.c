@@ -214,6 +214,8 @@ spa_vdev_removal_destroy(spa_vdev_removal_t *svr)
 		list_destroy(&svr->svr_new_segments[i]);
 	}
 
+	if (svr->svr_zaplist != NULL)
+		fnvlist_free(svr->svr_zaplist);
 	range_tree_destroy(svr->svr_allocd_segs);
 	mutex_destroy(&svr->svr_lock);
 	cv_destroy(&svr->svr_cv);
@@ -741,6 +743,27 @@ vdev_mapping_sync(void *arg, dmu_tx_t *tx)
 	spa_sync_removing_state(spa, tx);
 }
 
+/*
+ * Discard what vdev_mapping_sync() would have consumed, if it didn't run.
+ */
+static void
+vdev_mapping_free(void *arg, dmu_tx_t *tx)
+{
+	spa_vdev_removal_t *svr = arg;
+	int txgoff = dmu_tx_get_txg(tx) & TXG_MASK;
+	vdev_indirect_mapping_entry_t *entry;
+
+	while ((entry = list_remove_head(&svr->svr_new_segments[txgoff])) !=
+	    NULL) {
+		kmem_free(entry, sizeof (*entry));
+	}
+
+	mutex_enter(&svr->svr_lock);
+	range_tree_vacate(svr->svr_frees[txgoff], NULL, NULL);
+	svr->svr_max_offset_to_sync[txgoff] = 0;
+	mutex_exit(&svr->svr_lock);
+}
+
 typedef struct vdev_copy_segment_arg {
 	spa_t *vcsa_spa;
 	dva_t *vcsa_dest_dva;
@@ -1037,19 +1060,6 @@ spa_vdev_copy_segment(vdev_t *vd, range_tree_t *segs,
  * synctask in the same txg that we will sync out the new config (to the
  * MOS object) which indicates that this vdev is indirect.
  */
-/*
- * Free what vdev_remove_complete_sync() would have, if it didn't run.  The
- * spa_vdev_removal_t itself is freed when the pool is unloaded.
- */
-static void
-vdev_remove_complete_free(void *arg)
-{
-	spa_vdev_removal_t *svr = arg;
-
-	fnvlist_free(svr->svr_zaplist);
-	svr->svr_zaplist = NULL;
-}
-
 static void
 vdev_remove_complete_sync(void *arg, dmu_tx_t *tx)
 {
@@ -1075,7 +1085,6 @@ vdev_remove_complete_sync(void *arg, dmu_tx_t *tx)
 	    pair = nvlist_next_nvpair(svr->svr_zaplist, pair)) {
 		vdev_destroy_unlink_zap(vd, fnvpair_value_uint64(pair), tx);
 	}
-	fnvlist_free(svr->svr_zaplist);
 
 	spa_finish_removal(dmu_tx_pool(tx)->dp_spa, DSS_FINISHED, tx);
 	/* vd->vdev_path is not available here */
@@ -1127,9 +1136,10 @@ vdev_remove_replace_with_indirect(vdev_t *vd, uint64_t txg)
 
 	ASSERT(!list_link_active(&vd->vdev_state_dirty_node));
 
+	/* svr is freed with its zaplist by spa_vdev_removal_destroy(). */
 	tx = dmu_tx_create_assigned(spa->spa_dsl_pool, txg);
-	dsl_sync_task_nowait_free(spa->spa_dsl_pool, vdev_remove_complete_sync,
-	    vdev_remove_complete_free, svr, 0, ZFS_SPACE_CHECK_NONE, tx);
+	dsl_sync_task_nowait(spa->spa_dsl_pool, vdev_remove_complete_sync,
+	    NULL, svr, 0, ZFS_SPACE_CHECK_NONE, tx);
 	dmu_tx_commit(tx);
 
 	/*
@@ -1286,7 +1296,7 @@ spa_vdev_copy_impl(vdev_t *vd, spa_vdev_removal_t *svr, vdev_copy_arg_t *vca,
 
 	if (svr->svr_max_offset_to_sync[txg & TXG_MASK] == 0) {
 		dsl_sync_task_nowait(dmu_tx_pool(tx), vdev_mapping_sync,
-		    svr, 0, ZFS_SPACE_CHECK_NONE, tx);
+		    vdev_mapping_free, svr, 0, ZFS_SPACE_CHECK_NONE, tx);
 	}
 
 	svr->svr_max_offset_to_sync[txg & TXG_MASK] = range_tree_max(segs);
@@ -1741,6 +1751,20 @@ svr_sync(spa_t *spa, dmu_tx_t *tx)
 	spa_sync_removing_state(spa, tx);
 }
 
+/*
+ * A failed pool doesn't sync the progress of a removal (see
+ * spa_sync_discard()), so discard it.
+ */
+void
+svr_sync_discard(spa_t *spa, dmu_tx_t *tx)
+{
+	spa_vdev_removal_t *svr = spa->spa_vdev_removal;
+
+	ASSERT(spa_failed(spa));
+	if (svr != NULL)
+		svr->svr_bytes_done[dmu_tx_get_txg(tx) & TXG_MASK] = 0;
+}
+
 static void
 vdev_remove_make_hole_and_free(vdev_t *vd)
 {
@@ -2061,8 +2085,9 @@ spa_vdev_remove_top(vdev_t *vd, uint64_t *txg)
 	vdev_dirty_leaves(vd, VDD_DTL, *txg);
 	vdev_config_dirty(vd);
 	dmu_tx_t *tx = dmu_tx_create_assigned(spa->spa_dsl_pool, *txg);
+	/* The argument is just the vdev id, and nothing needs freeing. */
 	dsl_sync_task_nowait(spa->spa_dsl_pool,
-	    vdev_remove_initiate_sync,
+	    vdev_remove_initiate_sync, NULL,
 	    (void *)(uintptr_t)vd->vdev_id, 0, ZFS_SPACE_CHECK_NONE, tx);
 	dmu_tx_commit(tx);
 

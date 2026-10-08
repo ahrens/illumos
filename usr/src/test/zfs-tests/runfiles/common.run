@@ -569,7 +569,8 @@ tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'failmode_admin_isolation', 'failmode_status_resilver',
     'failmode_zil_flush_error', 'failmode_death_fails_alone',
     'failmode_death_enospc', 'forced_export_fence', 'forced_export_armed',
-    'forced_export_healthy', 'failmode_write_errors_probe_ok',
+    'forced_export_healthy', 'forced_export_cold_cache',
+    'failmode_write_errors_probe_ok',
     'failmode_transient_no_errlog']
 tags = ['functional', 'failmode']
 

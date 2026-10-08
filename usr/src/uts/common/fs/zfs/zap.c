@@ -22,6 +22,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*
@@ -309,6 +310,11 @@ zap_table_load(zap_t *zap, zap_table_phys_t *tbl, uint64_t idx, uint64_t *valp)
 	dmu_buf_dnode_exit(zap->zap_dbuf);
 	if (err != 0)
 		return (err);
+	/* A pointer table block that a failed pool couldn't read */
+	if (dmu_buf_is_poisoned(db)) {
+		dmu_buf_rele(db, FTAG);
+		return (SET_ERROR(EIO));
+	}
 	*valp = ((uint64_t *)db->db_data)[off];
 	dmu_buf_rele(db, FTAG);
 
@@ -483,6 +489,15 @@ zap_open_leaf(uint64_t blkid, dmu_buf_t *db)
 
 	dmu_buf_init_user(&l->l_dbu, zap_leaf_evict_sync, NULL, &l->l_dbuf);
 	zap_leaf_t *winner = dmu_buf_set_user(db, &l->l_dbu);
+
+	/*
+	 * Syncing context on a failed pool gets zeros for a leaf that it
+	 * can't read (see dbuf_poison()).  Make it an empty leaf: nothing
+	 * written to it reaches the disks.
+	 */
+	if (winner == NULL && dmu_buf_is_poisoned(db) &&
+	    zap_leaf_phys(l)->l_hdr.lh_block_type == 0)
+		zap_leaf_init(l, B_FALSE);
 
 	rw_exit(&l->l_rwlock);
 	if (winner != NULL) {

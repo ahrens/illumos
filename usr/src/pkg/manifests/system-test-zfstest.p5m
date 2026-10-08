@@ -2468,6 +2468,8 @@ file \
 file path=opt/zfs-tests/tests/functional/failmode/failmode_zil_flush_error \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_armed mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_cold_cache \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_fence mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_healthy \
     mode=0555

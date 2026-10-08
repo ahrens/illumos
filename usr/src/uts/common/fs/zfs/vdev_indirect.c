@@ -554,6 +554,22 @@ spa_condense_indirect_commit_sync(void *arg, dmu_tx_t *tx)
 }
 
 /*
+ * Discard the entries that spa_condense_indirect_commit_sync() would have
+ * written, if it didn't run.
+ */
+static void
+spa_condense_indirect_commit_free(void *arg, dmu_tx_t *tx)
+{
+	spa_condensing_indirect_t *sci = arg;
+	list_t *list = &sci->sci_new_mapping_entries[dmu_tx_get_txg(tx) &
+	    TXG_MASK];
+	vdev_indirect_mapping_entry_t *vime;
+
+	while ((vime = list_remove_head(list)) != NULL)
+		kmem_free(vime, sizeof (*vime));
+}
+
+/*
  * Open-context function to add one entry to the new mapping.  The new
  * entry will be remembered and written from syncing context.
  */
@@ -576,7 +592,8 @@ spa_condense_indirect_commit_entry(spa_t *spa,
 	 */
 	if (list_is_empty(&sci->sci_new_mapping_entries[txgoff])) {
 		dsl_sync_task_nowait(dmu_tx_pool(tx),
-		    spa_condense_indirect_commit_sync, sci,
+		    spa_condense_indirect_commit_sync,
+		    spa_condense_indirect_commit_free, sci,
 		    0, ZFS_SPACE_CHECK_NONE, tx);
 	}
 

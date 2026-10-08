@@ -4297,6 +4297,20 @@ metaslab_sync_done(metaslab_t *msp, uint64_t txg)
 		VERIFY0(range_tree_space(msp->ms_freed));
 	}
 
+	/*
+	 * If the pool failed after this metaslab synced, but in the same txg,
+	 * allocations and frees that came after that were never synced (see
+	 * vdev_sync_discard()).  Drop them, as metaslab_fini() would.
+	 */
+	if (spa_failed(spa)) {
+		range_tree_t *alloctree = msp->ms_allocating[txg & TXG_MASK];
+
+		msp->ms_allocating_total -= range_tree_space(alloctree);
+		range_tree_vacate(alloctree, NULL, NULL);
+		range_tree_vacate(msp->ms_freeing, NULL, NULL);
+		range_tree_vacate(msp->ms_checkpointing, NULL, NULL);
+	}
+
 	ASSERT0(range_tree_space(msp->ms_freeing));
 	ASSERT0(range_tree_space(msp->ms_checkpointing));
 

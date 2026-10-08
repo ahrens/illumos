@@ -755,6 +755,12 @@ void *dmu_buf_remove_user(dmu_buf_t *db, dmu_buf_user_t *user);
  */
 void *dmu_buf_get_user(dmu_buf_t *db);
 
+/*
+ * Whether syncing context got zeros for this buffer instead of its contents,
+ * because the pool failed.
+ */
+boolean_t dmu_buf_is_poisoned(dmu_buf_t *db);
+
 objset_t *dmu_buf_get_objset(dmu_buf_t *db);
 dnode_t *dmu_buf_dnode_enter(dmu_buf_t *db);
 void dmu_buf_dnode_exit(dmu_buf_t *db);

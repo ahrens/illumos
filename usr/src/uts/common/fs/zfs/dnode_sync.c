@@ -23,7 +23,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
- * Copyright 2020 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -562,9 +562,12 @@ dnode_sync_free(dnode_t *dn, dmu_tx_t *tx)
 
 	/*
 	 * Our contents should have been freed in dnode_sync() by the
-	 * free range record inserted by the caller of dnode_free().
+	 * free range record inserted by the caller of dnode_free().  On a
+	 * failed pool, some of them may have been under an indirect block
+	 * that was poisoned (see dbuf_poison()), and so were never found.
 	 */
-	ASSERT0(DN_USED_BYTES(dn->dn_phys));
+	ASSERT(DN_USED_BYTES(dn->dn_phys) == 0 ||
+	    spa_failed(dn->dn_objset->os_spa));
 	ASSERT(BP_IS_HOLE(dn->dn_phys->dn_blkptr));
 
 	dnode_undirty_dbufs(&dn->dn_dirty_records[txgoff]);

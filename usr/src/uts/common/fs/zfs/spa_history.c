@@ -258,16 +258,16 @@ spa_history_log_notify(spa_t *spa, nvlist_t *nvl)
 	nvlist_free(hist_nvl);
 }
 
-/*
- * Write out a history event.
- */
-/* Free the argument of a spa_history_log_sync() that didn't run. */
+/* ARGSUSED */
 static void
-spa_history_log_free(void *arg)
+spa_history_log_free(void *arg, dmu_tx_t *tx)
 {
 	fnvlist_free(arg);
 }
 
+/*
+ * Write out a history event.  Doesn't free the nvlist.
+ */
 /*ARGSUSED*/
 static void
 spa_history_log_sync(void *arg, dmu_tx_t *tx)
@@ -369,7 +369,6 @@ spa_history_log_sync(void *arg, dmu_tx_t *tx)
 	mutex_exit(&spa->spa_history_lock);
 	fnvlist_pack_free(record_packed, reclen);
 	dmu_buf_rele(dbp, FTAG);
-	fnvlist_free(nvl);
 }
 
 /*
@@ -433,11 +432,11 @@ top:
 	fnvlist_add_uint64(nvarg, ZPOOL_HIST_WHO, crgetruid(CRED()));
 
 	/* Kick this off asynchronously; errors are ignored. */
-	dsl_sync_task_nowait_free(spa_get_dsl(spa), spa_history_log_sync,
+	dsl_sync_task_nowait(spa_get_dsl(spa), spa_history_log_sync,
 	    spa_history_log_free, nvarg, 0, ZFS_SPACE_CHECK_NONE, tx);
 	dmu_tx_commit(tx);
 
-	/* spa_history_log_sync will free nvl */
+	/* spa_history_log_free will free nvarg */
 	return (err);
 
 }
@@ -568,12 +567,13 @@ log_internal(nvlist_t *nvl, const char *operation, spa_t *spa,
 
 	if (dmu_tx_is_syncing(tx)) {
 		spa_history_log_sync(nvl, tx);
+		fnvlist_free(nvl);
 	} else {
-		dsl_sync_task_nowait_free(spa_get_dsl(spa),
+		dsl_sync_task_nowait(spa_get_dsl(spa),
 		    spa_history_log_sync, spa_history_log_free, nvl, 0,
 		    ZFS_SPACE_CHECK_NONE, tx);
+		/* spa_history_log_free() will free nvl */
 	}
-	/* spa_history_log_sync() will free nvl */
 }
 
 void

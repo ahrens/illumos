@@ -391,6 +391,74 @@ spa_prop_get_config(spa_t *spa, nvlist_t **nvp)
 }
 
 /*
+ * Get the properties of a failed pool that are kept in the MOS pool property
+ * object.  The pool can't read that object unless it happens to be cached
+ * (see dbuf_poison()), so we don't try: reporting some of the properties
+ * some of the time, and the default for the rest, would look like a right
+ * answer when it isn't.  The properties that spa_sync_props() also keeps in
+ * the spa_t are reported from there, since those values are the ones in
+ * effect.  Every other property in the object is reported as unknown: its
+ * entry has a source of ZPROP_SRC_NONE and no value.  That includes
+ * autoreplace and bootsize, whose spa_t copies are only set when the pool is
+ * opened, and bootfs, whose name we'd have to read.
+ */
+static void
+spa_prop_get_failed(spa_t *spa, nvlist_t *nvl)
+{
+	ASSERT(MUTEX_HELD(&spa->spa_props_lock));
+
+	for (zpool_prop_t prop = 0; prop < ZPOOL_NUM_PROPS; prop++) {
+		uint64_t intval;
+		nvlist_t *propval;
+
+		switch (prop) {
+		case ZPOOL_PROP_DELEGATION:
+			intval = spa->spa_delegation;
+			break;
+		case ZPOOL_PROP_FAILUREMODE:
+			intval = spa->spa_failmode;
+			break;
+		case ZPOOL_PROP_AUTOTRIM:
+			intval = spa->spa_autotrim;
+			break;
+		case ZPOOL_PROP_AUTOEXPAND:
+			intval = spa->spa_autoexpand;
+			break;
+		case ZPOOL_PROP_MULTIHOST:
+			intval = spa->spa_multihost;
+			break;
+		case ZPOOL_PROP_DEDUPDITTO:
+			intval = spa->spa_dedup_ditto;
+			break;
+
+		/* These aren't kept in the pool property object. */
+		case ZPOOL_PROP_VERSION:
+		case ZPOOL_PROP_ALTROOT:
+		case ZPOOL_PROP_READONLY:
+		case ZPOOL_PROP_CACHEFILE:
+		case ZPOOL_PROP_COMMENT:
+		case ZPOOL_PROP_TNAME:
+			continue;
+
+		default:
+			if (zpool_prop_readonly(prop))
+				continue;
+			propval = fnvlist_alloc();
+			fnvlist_add_uint64(propval, ZPROP_SOURCE,
+			    ZPROP_SRC_NONE);
+			fnvlist_add_nvlist(nvl, zpool_prop_to_name(prop),
+			    propval);
+			fnvlist_free(propval);
+			continue;
+		}
+
+		spa_prop_add_list(nvl, prop, NULL, intval,
+		    intval == zpool_prop_default_numeric(prop) ?
+		    ZPROP_SRC_DEFAULT : ZPROP_SRC_LOCAL);
+	}
+}
+
+/*
  * Get zpool property values.
  */
 int
@@ -409,6 +477,12 @@ spa_prop_get(spa_t *spa, nvlist_t **nvp)
 	 * Get properties from the spa config.
 	 */
 	spa_prop_get_config(spa, nvp);
+
+	if (spa_failed(spa)) {
+		spa_prop_get_failed(spa, *nvp);
+		mutex_exit(&spa->spa_props_lock);
+		return (0);
+	}
 
 	/* If no pool property object, no more prop to get. */
 	if (mos == NULL || spa->spa_pool_props_object == 0) {
@@ -486,6 +560,7 @@ spa_prop_get(spa_t *spa, nvlist_t **nvp)
 	}
 	zap_cursor_fini(&zc);
 	mutex_exit(&spa->spa_props_lock);
+
 	if (err && err != ENOENT) {
 		nvlist_free(*nvp);
 		*nvp = NULL;
@@ -4837,6 +4912,29 @@ spa_add_feature_stats(spa_t *spa, nvlist_t *config)
 	ASSERT(spa_config_held(spa, SCL_CONFIG, RW_READER));
 	VERIFY(nvlist_alloc(&features, NV_UNIQUE_NAME, KM_SLEEP) == 0);
 
+	/*
+	 * A failed pool can read the feature objects only if they happen to
+	 * be cached (see spa_prop_get_failed()), and a cursor that can't read
+	 * would just end the list early, making features look disabled.  The
+	 * spa_t keeps the refcounts of the features this software supports,
+	 * so report those.  The ones it doesn't support, which only a pool
+	 * imported read-only can have, are left out.
+	 */
+	if (spa_failed(spa)) {
+		for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
+			uint64_t refcount = spa->spa_feat_refcount_cache[f];
+
+			if (refcount != SPA_FEATURE_DISABLED) {
+				fnvlist_add_uint64(features,
+				    spa_feature_table[f].fi_guid, refcount);
+			}
+		}
+		fnvlist_add_nvlist(config, ZPOOL_CONFIG_FEATURE_STATS,
+		    features);
+		fnvlist_free(features);
+		return;
+	}
+
 	if (spa->spa_feat_for_read_obj != 0) {
 		for (zap_cursor_init(&zc, spa->spa_meta_objset,
 		    spa->spa_feat_for_read_obj);
@@ -8693,6 +8791,30 @@ spa_free_discard_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 	return (0);
 }
 
+/*
+ * A failed pool only drains its dirty datasets, which releases the holds that
+ * dirty data has on dbufs, dnodes and datasets.  Nothing it writes reaches the
+ * disks (see zio_vdev_io_fence()), so the phases that only update on-disk
+ * metadata, or that would have to read it, are skipped.  This discards what
+ * they would have consumed; the rest of their in-core state is discarded when
+ * the pool is exported.  The pool can fail at any point in a pass, so each
+ * phase checks for it.
+ */
+static void
+spa_sync_discard(spa_t *spa, dmu_tx_t *tx)
+{
+	uint64_t txg = tx->tx_txg;
+	bplist_t *free_bpl = &spa->spa_free_bplist[txg & TXG_MASK];
+	vdev_t *vd;
+
+	ASSERT(spa_failed(spa));
+
+	bplist_iterate(free_bpl, spa_free_discard_cb, NULL, tx);
+	while ((vd = txg_list_remove(&spa->spa_vdev_txg_list, txg)) != NULL)
+		vdev_sync_discard(vd, txg);
+	svr_sync_discard(spa, tx);
+}
+
 static void
 spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 {
@@ -8704,22 +8826,9 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 	do {
 		int pass = ++spa->spa_sync_pass;
 
-		/*
-		 * A failed pool only drains its dirty datasets, which releases
-		 * the holds that dirty data has on dbufs, dnodes and datasets.
-		 * Nothing it writes reaches the disks (see
-		 * zio_vdev_io_fence()), so the phases that only update on-disk
-		 * metadata, or that would have to read it, are skipped.  Their
-		 * in-core state is discarded when the pool is exported.
-		 */
 		if (spa_failed(spa)) {
 			dsl_pool_sync(dp, txg);
-			bplist_iterate(free_bpl, spa_free_discard_cb, NULL, tx);
-			vdev_t *vd;
-			while ((vd = txg_list_remove(&spa->spa_vdev_txg_list,
-			    txg)) != NULL)
-				vdev_sync_discard(vd, txg);
-			continue;
+			goto discard;
 		}
 
 		spa_sync_config_object(spa, tx);
@@ -8729,6 +8838,8 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 		    ZPOOL_CONFIG_L2CACHE, DMU_POOL_L2CACHE);
 		spa_errlog_sync(spa, txg);
 		dsl_pool_sync(dp, txg);
+		if (spa_failed(spa))
+			goto discard;
 
 		if (pass < zfs_sync_pass_deferred_free ||
 		    spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP)) {
@@ -8748,18 +8859,28 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 			bplist_iterate(free_bpl, bpobj_enqueue_cb,
 			    &spa->spa_deferred_bpobj, tx);
 		}
+		if (spa_failed(spa))
+			goto discard;
 
 		ddt_sync(spa, txg);
 		dsl_scan_sync(dp, tx);
 		svr_sync(spa, tx);
 		spa_sync_upgrades(spa, tx);
+		if (spa_failed(spa))
+			goto discard;
 
 		spa_flush_metaslabs(spa, tx);
+		if (spa_failed(spa))
+			goto discard;
 
 		vdev_t *vd = NULL;
 		while ((vd = txg_list_remove(&spa->spa_vdev_txg_list, txg))
-		    != NULL)
-			vdev_sync(vd, txg);
+		    != NULL) {
+			if (spa_failed(spa))
+				vdev_sync_discard(vd, txg);
+			else
+				vdev_sync(vd, txg);
+		}
 
 		/*
 		 * Note: We need to check if the MOS is dirty because we could
@@ -8785,7 +8906,14 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 			break;
 		}
 
+		if (spa_failed(spa))
+			goto discard;
 		spa_sync_deferred_frees(spa, tx);
+		continue;
+
+discard:
+		/* The pool has failed: drop the rest of the pass. */
+		spa_sync_discard(spa, tx);
 	} while (dmu_objset_is_dirty(mos, txg));
 }
 

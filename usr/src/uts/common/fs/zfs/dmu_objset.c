@@ -2538,6 +2538,7 @@ dmu_snapshot_list_next(objset_t *os, int namelen, char *name,
 	dsl_dataset_t *ds = os->os_dsl_dataset;
 	zap_cursor_t cursor;
 	zap_attribute_t attr;
+	int error;
 
 	ASSERT(dsl_pool_config_held(dmu_objset_pool(os)));
 
@@ -2548,9 +2549,14 @@ dmu_snapshot_list_next(objset_t *os, int namelen, char *name,
 	    ds->ds_dir->dd_pool->dp_meta_objset,
 	    dsl_dataset_phys(ds)->ds_snapnames_zapobj, *offp);
 
-	if (zap_cursor_retrieve(&cursor, &attr) != 0) {
+	/*
+	 * ENOENT means there are no more.  Any other error must reach the
+	 * caller: on a failed pool, the ZAP can't be read unless it happens to
+	 * be cached (see dbuf_poison()), and the list isn't over.
+	 */
+	if ((error = zap_cursor_retrieve(&cursor, &attr)) != 0) {
 		zap_cursor_fini(&cursor);
-		return (SET_ERROR(ENOENT));
+		return (error);
 	}
 
 	if (strlen(attr.za_name) + 1 > namelen) {
@@ -2577,6 +2583,7 @@ dmu_dir_list_next(objset_t *os, int namelen, char *name,
 	dsl_dir_t *dd = os->os_dsl_dataset->ds_dir;
 	zap_cursor_t cursor;
 	zap_attribute_t attr;
+	int error;
 
 	/* there is no next dir on a snapshot! */
 	if (os->os_dsl_dataset->ds_object !=
@@ -2587,9 +2594,10 @@ dmu_dir_list_next(objset_t *os, int namelen, char *name,
 	    dd->dd_pool->dp_meta_objset,
 	    dsl_dir_phys(dd)->dd_child_dir_zapobj, *offp);
 
-	if (zap_cursor_retrieve(&cursor, &attr) != 0) {
+	/* See dmu_snapshot_list_next(). */
+	if ((error = zap_cursor_retrieve(&cursor, &attr)) != 0) {
 		zap_cursor_fini(&cursor);
-		return (SET_ERROR(ENOENT));
+		return (error);
 	}
 
 	if (strlen(attr.za_name) + 1 > namelen) {
