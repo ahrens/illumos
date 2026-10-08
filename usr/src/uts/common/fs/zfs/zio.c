@@ -3601,28 +3601,56 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
  * error and never report the data as stable.  Other writes, flushes and TRIMs
  * succeed without doing anything, so syncing context drains through its
  * normal success paths.
+ *
+ * An I/O that the vdev queue issues (ZIO_FLAG_DONT_QUEUE), including an
+ * aggregate, is in the queue's active tree, so it still has to go through
+ * zio_vdev_io_done() for the queue to let go of it; it gets there from the
+ * interrupt taskq, rather than recursing through vdev_queue_io_done().  The
+ * I/Os that make up an aggregate write already wait for it, and only the ones
+ * that may fail get an error.
  */
-static void
+static int
 zio_vdev_io_fence(zio_t *zio)
 {
 	zio_t *lio = (zio->io_logical != NULL) ? zio->io_logical : zio;
+	boolean_t queued = (zio->io_flags & ZIO_FLAG_DONT_QUEUE) != 0;
 
 	ASSERT(spa_failed(zio->io_spa));
 	ASSERT(zio->io_vd->vdev_ops->vdev_op_leaf);
 
-	zio_vdev_io_bypass(zio);
+	if (queued)
+		zio->io_flags |= ZIO_FLAG_IO_BYPASS;
+	else
+		zio_vdev_io_bypass(zio);
 
 	switch (zio->io_type) {
 	case ZIO_TYPE_READ:
 		zio->io_error = SET_ERROR(EIO);
 		break;
 	case ZIO_TYPE_WRITE:
-		if (lio->io_flags & ZIO_FLAG_CANFAIL)
+		if (vdev_queue_io_is_aggregate(zio)) {
+			zio_link_t *zl = NULL;
+			zio_t *dio;
+
+			while ((dio = zio_walk_parents(zio, &zl)) != NULL) {
+				lio = (dio->io_logical != NULL) ?
+				    dio->io_logical : dio;
+				if (lio->io_flags & ZIO_FLAG_CANFAIL)
+					dio->io_error = SET_ERROR(EIO);
+			}
+		} else if (lio->io_flags & ZIO_FLAG_CANFAIL) {
 			zio->io_error = SET_ERROR(EIO);
+		}
 		break;
 	default:
 		break;
 	}
+
+	if (queued) {
+		zio_interrupt(zio);
+		return (ZIO_PIPELINE_STOP);
+	}
+	return (ZIO_PIPELINE_CONTINUE);
 }
 
 /*
@@ -3658,10 +3686,8 @@ zio_vdev_io_start(zio_t *zio)
 		return (ZIO_PIPELINE_STOP);
 	}
 
-	if (vd->vdev_ops->vdev_op_leaf && spa_failed(spa)) {
-		zio_vdev_io_fence(zio);
-		return (ZIO_PIPELINE_CONTINUE);
-	}
+	if (vd->vdev_ops->vdev_op_leaf && spa_failed(spa))
+		return (zio_vdev_io_fence(zio));
 
 	ASSERT3P(zio->io_logical, !=, zio);
 	if (zio->io_type == ZIO_TYPE_WRITE) {
@@ -3796,6 +3822,12 @@ zio_vdev_io_done(zio_t *zio)
 
 		if (zio->io_type != ZIO_TYPE_IOCTL)
 			vdev_queue_io_done(zio);
+
+		/* Fenced on its way out of the queue: zio_vdev_io_fence(). */
+		if (zio->io_flags & ZIO_FLAG_IO_BYPASS) {
+			ASSERT(spa_failed(zio->io_spa));
+			return (ZIO_PIPELINE_CONTINUE);
+		}
 
 		if (zio->io_type == ZIO_TYPE_WRITE)
 			vdev_cache_write(zio);
