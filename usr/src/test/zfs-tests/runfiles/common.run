@@ -568,8 +568,24 @@ tags = ['functional', 'async_destroy']
 tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'failmode_nowait_wait', 'failmode_nowait_continue',
     'failmode_admin_isolation', 'failmode_status_resilver',
-    'failmode_zil_flush_error', 'failmode_write_errors_probe_ok',
-    'failmode_transient_no_errlog']
+    'failmode_zil_flush_error', 'failmode_death_fails_alone',
+    'failmode_death_enospc', 'failmode_death_props',
+    'failmode_death_cold_metadata', 'forced_export_fence',
+    'forced_export_slow',
+    'forced_export_healthy', 'forced_export_cold_cache',
+    'forced_export_busy_fs', 'forced_export_zvol',
+    'forced_export_namespace_sleeper', 'forced_export_retry',
+    'forced_export_idle', 'forced_export_read_errors_only',
+    'export_suspended_eagain', 'forced_export_ereports',
+    'failmode_death_export_f', 'forced_export_other_pools',
+    'forced_export_busy_fs_continue', 'forced_export_busy_fs_death',
+    'forced_export_zvol_continue', 'forced_export_zvol_death',
+    'forced_export_idle_lofi', 'failmode_write_errors_probe_ok',
+    'failmode_transient_no_errlog', 'forced_export_pinned_sync',
+    'forced_export_pinned_zil', 'forced_export_send', 'forced_export_recv',
+    'forced_export_detach', 'forced_export_mount_races',
+    'forced_export_removal', 'forced_export_blocked_streams',
+    'failmode_failed_fma']
 tags = ['functional', 'failmode']
 
 [tests/functional/fault]

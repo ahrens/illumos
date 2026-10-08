@@ -33,9 +33,17 @@ function failmode_create_pool # failmode
 	log_must zfs create -o recordsize=128k $TESTPOOL/$TESTFS
 }
 
+#
+# Is the pool suspended?  This asks the kernel rather than "zpool status",
+# which needs spa_namespace_lock, and a command sleeping on the suspended pool
+# may hold that.
+#
 function pool_is_suspended # pool
 {
-	zpool status $1 | grep -q -E "ZFS-8000-(HC|JQ)"
+	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_suspended'
+	typeset susp=$(print -r -- "::walk spa | $fmt" | mdb -k |
+	    nawk -v pool=$1 '$1 == pool { print $2 }')
+	[[ -n $susp && $susp != 0 ]]
 }
 
 function failmode_suspend_pool
@@ -56,6 +64,118 @@ function failmode_suspend_pool
 	done
 }
 
+#
+# Has the pool failed (see spa_fail() in the kernel)?  A failed pool is not
+# suspended, so zpool status can't tell yet; ask the kernel.
+#
+function pool_has_failed # pool
+{
+	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_exit'
+	typeset state=$(print -r -- "::walk spa | $fmt" | mdb -k |
+	    nawk -v pool=$1 '$1 == pool { print $2 }')
+	[[ $state == 2 ]]
+}
+
+#
+# Make every write to the vdev fail, so that the next txg sync that has
+# something to write fails the pool (failmode=death) or suspends it.
+#
+function failmode_break_vdev
+{
+	log_must zinject -d $FAILMODE_VDEV -e io -T write $TESTPOOL
+	log_must zinject -d $FAILMODE_VDEV -L pad2 $TESTPOOL
+}
+
+function failmode_wait_failed # pool
+{
+	log_note "waiting for $1 to fail"
+	typeset -i tries=30
+	until pool_has_failed $1; do
+		if ((tries-- == 0)); then
+			log_fail "$1 didn't fail"
+		fi
+		sleep 1
+	done
+}
+
+#
+# Wait for a pool whose writes now fail to stop: a death pool fails, any
+# other suspends.
+#
+function failmode_wait_stopped # pool failmode
+{
+	if [[ $2 == death ]]; then
+		failmode_wait_failed $1
+		return
+	fi
+	log_note "waiting for $1 to suspend"
+	typeset -i tries=30
+	until pool_is_suspended $1; do
+		if ((tries-- == 0)); then
+			log_fail "$1 didn't suspend"
+		fi
+		sleep 1
+	done
+}
+
+#
+# Checksum of a vdev file, to tell whether anything was written to it.
+#
+function vdev_digest # file
+{
+	digest -a sha256 $1
+}
+
+#
+# Run a command in the background and fail the test if it hasn't finished
+# within the given number of seconds.  Sets "within_rc" to its exit status.
+#
+function run_within # seconds description command...
+{
+	typeset -i tries=$1
+	typeset desc=$2
+	shift 2
+
+	"$@" >/dev/null 2>&1 &
+	typeset -i pid=$!
+	while kill -0 $pid 2>/dev/null; do
+		if ((tries-- == 0)); then
+			log_fail "$desc did not finish in time"
+		fi
+		sleep 1
+	done
+	wait $pid
+	within_rc=$?
+	log_note "$desc returned $within_rc"
+}
+
+#
+# For cleanup: wait up to 60 seconds for the given processes, which have been
+# killed, to exit.  A process stuck in the kernel can't be killed, and
+# mustn't hang the test run; it is left behind, and logged.
+#
+function failmode_reap # pid...
+{
+	typeset -i tries=60
+	typeset pid alive
+
+	while :; do
+		alive=""
+		for pid in "$@"; do
+			kill -0 $pid 2>/dev/null && alive="$alive $pid"
+		done
+		[[ -z $alive ]] && break
+		if ((tries-- == 0)); then
+			log_note "processes still running:$alive"
+			return
+		fi
+		sleep 1
+	done
+	for pid in "$@"; do
+		wait $pid 2>/dev/null
+	done
+}
+
 function failmode_resume_pool
 {
 	log_must zinject -c all
@@ -68,7 +188,10 @@ function failmode_resume_pool
 function failmode_cleanup
 {
 	zinject -c all >/dev/null 2>&1
-	if poolexists $TESTPOOL; then
+	if poolexists $TESTPOOL && pool_has_failed $TESTPOOL; then
+		# A failed pool can't be destroyed; exporting removes it.
+		log_must zpool export -f $TESTPOOL
+	elif poolexists $TESTPOOL; then
 		# zpool status can miss a suspension; clearing is harmless.
 		zpool clear $TESTPOOL >/dev/null 2>&1
 		destroy_pool $TESTPOOL

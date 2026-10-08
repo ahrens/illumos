@@ -23,7 +23,9 @@
 #	aren't permanent errors: "zpool status -v" doesn't list them (before
 #	any scrub), and the data reads back intact (failmode=wait or
 #	continue).  zio_done() used to log a write's error before deciding to
-#	reexecute it.
+#	reexecute it.  A failmode=death pool fails instead of suspending, and
+#	its retried writes aren't logged either: it loses the data, but
+#	nothing on its disk is damaged.
 #
 # STRATEGY:
 #	For failmode=wait and continue:
@@ -38,11 +40,27 @@
 #	   the failed writes is held until then: a finished scan drops the
 #	   error log)
 #	6. After an export and import, the file reads back intact
+#	For failmode=death, the pool fails at step 3.  A failed pool never
+#	writes its error log, so check the log in core: it must be empty.
+#	After an export and import, the pool is at its last committed txg,
+#	without the file.
 #
 
 verify_runnable "global"
 
 typeset src=$TEST_BASE_DIR/transient_src
+
+#
+# The number of entries in the pool's error log in core, which a failed pool
+# can't write out (or read back).
+#
+function incore_errors # pool
+{
+	typeset fmt='::printf "%s %d %d\n" spa_t spa_name '
+	fmt+='spa_errlist_last.avl_numnodes spa_errlist_scrub.avl_numnodes'
+	print -r -- "::walk spa | $fmt" | mdb -k |
+	    nawk -v pool=$1 '$1 == pool { print $2 + $3 }'
+}
 
 function cleanup
 {
@@ -57,7 +75,7 @@ log_onexit cleanup
 log_must dd if=/dev/urandom of=$src bs=128k count=8
 typeset cksum=$(sha256digest $src)
 
-for mode in wait continue; do
+for mode in wait continue death; do
 	log_note "failmode=$mode"
 	failmode_create_pool $mode
 	typeset fs=$(get_prop mountpoint $TESTPOOL/$TESTFS)
@@ -66,6 +84,25 @@ for mode in wait continue; do
 	log_must zinject -d $FAILMODE_VDEV -e io -T write $TESTPOOL
 	# A write blocks once the pool suspends, so it must finish first.
 	log_must dd if=$src of=$fs/data bs=128k
+	if [[ $mode == death ]]; then
+		failmode_wait_failed $TESTPOOL
+		log_must zpool status -v $TESTPOOL
+		typeset errs=$(incore_errors $TESTPOOL)
+		log_note "$errs errors in core"
+		log_must test "$errs" -eq 0
+		# A failed pool can't read its error log; check after import.
+		log_must check_pool_status $TESTPOOL "errors" \
+		    "Unknown, the pool has failed"
+		log_must zinject -c all
+		log_must zpool export $TESTPOOL
+		log_must zpool import -d $TEST_BASE_DIR $TESTPOOL
+		log_mustnot test -e $fs/data
+		log_must check_pool_status $TESTPOOL "errors" \
+		    "No known data errors"
+		failmode_cleanup
+		continue
+	fi
+
 	log_note "waiting for $TESTPOOL to suspend"
 	typeset -i tries=30
 	until pool_is_suspended $TESTPOOL; do

@@ -17,6 +17,7 @@
 #
 # Copyright (c) 2017 by Lawrence Livermore National Security, LLC.
 # Copyright 2019 Joyent, Inc.
+# Copyright 2026 Oxide Computer Company
 #
 
 # DESCRIPTION:
@@ -103,15 +104,15 @@ for x in $(seq 10); do
 			log_must zpool import $TESTPOOL
 		fi
 	elif [ $action -eq 1 ]; then
-		log_must zpool export -F $TESTPOOL
+		log_must export_pool_skip_update $TESTPOOL
 		log_must zpool import $TESTPOOL
 	elif [ $action -eq 2 ]; then
-		log_must zpool export -F $TESTPOOL
+		log_must export_pool_skip_update $TESTPOOL
 		log_must mmp_clear_hostid
 		log_must mmp_set_hostid $HOSTID2
 		log_must zpool import -f $TESTPOOL
 	elif [ $action -eq 3 ]; then
-		log_must zpool export -F $TESTPOOL
+		log_must export_pool_skip_update $TESTPOOL
 		log_must set_tunable64 zfs_multihost_interval $MMP_INTERVAL_MIN
 		log_must zpool import $TESTPOOL
 	elif [ $action -eq 4 ]; then
