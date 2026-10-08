@@ -56,6 +56,72 @@ function failmode_suspend_pool
 	done
 }
 
+#
+# Has the pool failed (see spa_fail() in the kernel)?  A failed pool is not
+# suspended, so zpool status can't tell yet; ask the kernel.
+#
+function pool_has_failed # pool
+{
+	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_exit'
+	typeset state=$(print -r -- "::walk spa | $fmt" | mdb -k |
+	    nawk -v pool=$1 '$1 == pool { print $2 }')
+	[[ $state == 2 ]]
+}
+
+#
+# Make every write to the vdev fail, so that the next txg sync that has
+# something to write fails the pool (failmode=death, or a pool armed by
+# "zpool export -F") or suspends it.
+#
+function failmode_break_vdev
+{
+	log_must zinject -d $FAILMODE_VDEV -e io -T write $TESTPOOL
+	log_must zinject -d $FAILMODE_VDEV -L pad2 $TESTPOOL
+}
+
+function failmode_wait_failed # pool
+{
+	log_note "waiting for $1 to fail"
+	typeset -i tries=30
+	until pool_has_failed $1; do
+		if ((tries-- == 0)); then
+			log_fail "$1 didn't fail"
+		fi
+		sleep 1
+	done
+}
+
+#
+# Checksum of a vdev file, to tell whether anything was written to it.
+#
+function vdev_digest # file
+{
+	digest -a sha256 $1
+}
+
+#
+# Run a command in the background and fail the test if it hasn't finished
+# within the given number of seconds.  Sets "within_rc" to its exit status.
+#
+function run_within # seconds description command...
+{
+	typeset -i tries=$1
+	typeset desc=$2
+	shift 2
+
+	"$@" >/dev/null 2>&1 &
+	typeset -i pid=$!
+	while kill -0 $pid 2>/dev/null; do
+		if ((tries-- == 0)); then
+			log_fail "$desc did not finish in time"
+		fi
+		sleep 1
+	done
+	wait $pid
+	within_rc=$?
+	log_note "$desc returned $within_rc"
+}
+
 function failmode_resume_pool
 {
 	log_must zinject -c all
