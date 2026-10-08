@@ -25,6 +25,7 @@
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright (c) 2017, Intel Corporation.
  * Copyright 2020 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/sysmacros.h>
@@ -1345,12 +1346,31 @@ zio_vdev_delegated_io(vdev_t *vd, uint64_t offset, abd_t *data, uint64_t size,
 	return (zio);
 }
 
+/*
+ * Flush the write caches of vd's leaves.  If propagate is set, a flush error
+ * is passed up to pio.  A leaf that can't be written to is skipped then, as
+ * long as its top-level vdev still can be: the data is then also on its
+ * writeable siblings, and a degraded mirror or raidz would otherwise fail
+ * every flush.
+ */
 void
-zio_flush(zio_t *zio, vdev_t *vd)
+zio_flush(zio_t *pio, vdev_t *vd, boolean_t propagate)
 {
-	zio_nowait(zio_ioctl(zio, zio->io_spa, vd, DKIOCFLUSHWRITECACHE,
-	    NULL, NULL,
-	    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_PROPAGATE | ZIO_FLAG_DONT_RETRY));
+	enum zio_flag flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY;
+
+	if (!propagate)
+		flags |= ZIO_FLAG_DONT_PROPAGATE;
+
+	if (vd->vdev_children == 0) {
+		if (propagate && !vdev_writeable(vd) && vd->vdev_top != vd &&
+		    vdev_writeable(vd->vdev_top))
+			return;
+		zio_nowait(zio_ioctl(pio, pio->io_spa, vd,
+		    DKIOCFLUSHWRITECACHE, NULL, NULL, flags));
+	} else {
+		for (uint64_t c = 0; c < vd->vdev_children; c++)
+			zio_flush(pio, vd->vdev_child[c], propagate);
+	}
 }
 
 void
@@ -3735,12 +3755,15 @@ zio_vdev_io_assess(zio_t *zio)
 	/*
 	 * If a cache flush returns ENOTSUP or ENOTTY, we know that no future
 	 * attempts will ever succeed. In this case we set a persistent
-	 * boolean flag so that we don't bother with it in the future.
+	 * boolean flag so that we don't bother with it in the future, and
+	 * then we act like the flush succeeded.
 	 */
 	if ((zio->io_error == ENOTSUP || zio->io_error == ENOTTY) &&
 	    zio->io_type == ZIO_TYPE_IOCTL &&
-	    zio->io_cmd == DKIOCFLUSHWRITECACHE && vd != NULL)
+	    zio->io_cmd == DKIOCFLUSHWRITECACHE && vd != NULL) {
 		vd->vdev_nowritecache = B_TRUE;
+		zio->io_error = 0;
+	}
 
 	if (zio->io_error)
 		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
