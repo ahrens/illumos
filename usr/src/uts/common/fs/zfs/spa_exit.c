@@ -68,14 +68,15 @@
  * uberblock is written, so spa_last_synced_txg() stops at the last txg that
  * was committed.
  *
- * Syncing context must never need to read anything, since every read fails.
- * A block it needs that isn't cached is "poisoned" instead (dbuf_poison()):
- * it gets zeros and db_poisoned is set.  Nothing that is written reaches the
+ * Every read fails, but syncing context can't cope with errors.  A block it
+ * needs that isn't cached is "poisoned" instead (dbuf_poison()): its read
+ * fails in the fence, and dbuf_read_done() gives it zeros and sets
+ * db_poisoned.  The read doesn't fail the caller's zio, so callers that read
+ * several blocks at once get them all.  Nothing that is written reaches the
  * disks, and only syncing context sees poisoned blocks: in open context, a
  * read of a poisoned block, or of any block that isn't cached, fails with
- * EIO.  The zfs:0:forced_exit kstat counts the reads that syncing context
- * issued anyway (sync_reads, which should stay at zero) and the blocks it
- * poisoned.
+ * EIO.  The zfs:0:forced_exit:poisoned_reads kstat counts the poisoned
+ * blocks.
  *
  * Waiting
  *
@@ -284,14 +285,70 @@ spa_exit_check(spa_t *spa)
 		spa_fail(spa);
 }
 
+/*
+ * Syncing context on a failed pool drains the dirty data that is left (see
+ * spa_sync_iterate_to_convergence()).  Every read it issues fails (see
+ * zio_vdev_io_fence()), and "poisoned_reads" counts the blocks that got
+ * zero-filled instead (see dbuf_poison()), each of which is also logged with
+ * zfs_dbgmsg.
+ */
+typedef struct spa_exit_stats {
+	kstat_named_t	ses_poisoned_reads;
+} spa_exit_stats_t;
+
+static spa_exit_stats_t spa_exit_stats = {
+	{ "poisoned_reads",	KSTAT_DATA_UINT64 },
+};
+
+static kstat_t *spa_exit_ksp;
+
+static void
+spa_exit_stat_init(void)
+{
+	spa_exit_ksp = kstat_create("zfs", 0, "forced_exit", "misc",
+	    KSTAT_TYPE_NAMED,
+	    sizeof (spa_exit_stats) / sizeof (kstat_named_t),
+	    KSTAT_FLAG_VIRTUAL);
+	if (spa_exit_ksp != NULL) {
+		spa_exit_ksp->ks_data = &spa_exit_stats;
+		kstat_install(spa_exit_ksp);
+	}
+}
+
+static void
+spa_exit_stat_fini(void)
+{
+	if (spa_exit_ksp != NULL) {
+		kstat_delete(spa_exit_ksp);
+		spa_exit_ksp = NULL;
+	}
+}
+
+/*
+ * Called for every block of a failed pool that got zero-filled instead of
+ * read.
+ */
+void
+spa_exit_poisoned_read(spa_t *spa, const struct zbookmark_phys *zb)
+{
+	atomic_inc_64(&spa_exit_stats.ses_poisoned_reads.value.ui64);
+	zfs_dbgmsg("pool '%s' has failed: poisoned read "
+	    "<%llu, %llu, %lld, %llu>",
+	    spa_name(spa), (u_longlong_t)zb->zb_objset,
+	    (u_longlong_t)zb->zb_object, (longlong_t)zb->zb_level,
+	    (u_longlong_t)zb->zb_blkid);
+}
+
 void
 spa_exit_init(void)
 {
 	cv_init(&spa_exit_hold_cv, NULL, CV_DEFAULT, NULL);
+	spa_exit_stat_init();
 }
 
 void
 spa_exit_fini(void)
 {
+	spa_exit_stat_fini();
 	cv_destroy(&spa_exit_hold_cv);
 }

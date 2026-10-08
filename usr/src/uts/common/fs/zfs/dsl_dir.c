@@ -182,6 +182,12 @@ dsl_dir_hold_obj(dsl_pool_t *dp, uint64_t ddobj,
 	if (dd == NULL) {
 		dsl_dir_t *winner;
 
+		/* See dsl_dataset_hold_obj(). */
+		if (spa_failed(dp->dp_spa) && !dsl_pool_sync_context(dp)) {
+			dmu_buf_rele(dbuf, tag);
+			return (SET_ERROR(EIO));
+		}
+
 		dd = kmem_zalloc(sizeof (dsl_dir_t), KM_SLEEP);
 		dd->dd_object = ddobj;
 		dd->dd_dbuf = dbuf;

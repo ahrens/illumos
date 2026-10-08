@@ -15,6 +15,7 @@
 
 /*
  * Copyright (c) 2014, 2017 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef _SYS_VDEV_REMOVAL_H
@@ -82,6 +83,7 @@ extern int spa_vdev_remove(spa_t *, uint64_t, boolean_t);
 extern void free_from_removing_vdev(vdev_t *, uint64_t, uint64_t);
 extern int spa_removal_get_stats(spa_t *, pool_removal_stat_t *);
 extern void svr_sync(spa_t *spa, dmu_tx_t *tx);
+extern void svr_sync_discard(spa_t *spa, dmu_tx_t *tx);
 extern void spa_vdev_remove_suspend(spa_t *);
 extern int spa_vdev_remove_cancel(spa_t *);
 extern void spa_vdev_removal_destroy(spa_vdev_removal_t *svr);

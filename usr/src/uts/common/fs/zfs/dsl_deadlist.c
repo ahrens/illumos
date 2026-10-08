@@ -247,6 +247,17 @@ dsl_deadlist_insert(dsl_deadlist_t *dl, const blkptr_t *bp, dmu_tx_t *tx)
 	dsl_deadlist_entry_t *dle;
 	avl_index_t where;
 
+	/*
+	 * A failed pool doesn't add to its deadlists: nothing writes them, and
+	 * on a failed pool, a deadlist whose ZAP or bpobjs have to be read
+	 * would load as empty (see dbuf_poison()), which we can't handle.  Its
+	 * datasets still account for the block (see dsl_dataset_block_kill()),
+	 * so the space computed from both is no longer right (see
+	 * dsl_dataset_space_written()).
+	 */
+	if (spa_failed(dmu_objset_spa(dl->dl_os)))
+		return;
+
 	if (dl->dl_oldfmt) {
 		bpobj_enqueue(&dl->dl_bpobj, bp, tx);
 		return;
