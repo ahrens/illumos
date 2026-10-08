@@ -112,6 +112,8 @@
 #include <sys/callb.h>
 #endif
 
+static kcondvar_t spa_exit_hold_cv;
+
 /*
  * Has the pool failed?  Once this returns B_TRUE it always will, until the
  * pool is exported.
@@ -182,6 +184,93 @@ spa_exit_arm(spa_t *spa)
 	spa_exit_check(spa);
 }
 
+/*
+ * Hold a pool found in spa_namespace_avl without spa_namespace_lock, so that
+ * it can be armed (see spa_exit_arm()) once spa_namespace_avl_lock is
+ * dropped: arming a suspended pool fails it, which posts an ereport and
+ * dispatches I/O, too much to do under a leaf lock.  The hold keeps the pool
+ * from being unloaded (see spa_exit_unload_wait()), and so from being removed
+ * and freed.  Returns B_FALSE if there is nothing to arm: the pool isn't
+ * loaded, is being unloaded, or is read-only, and can't suspend.
+ */
+static boolean_t
+spa_exit_hold(spa_t *spa)
+{
+	ASSERT(MUTEX_HELD(&spa_namespace_avl_lock));
+
+	if (spa->spa_dsl_pool == NULL || spa->spa_exit_unloading ||
+	    !spa_writeable(spa))
+		return (B_FALSE);
+	spa->spa_exit_holds++;
+	return (B_TRUE);
+}
+
+static void
+spa_exit_rele(spa_t *spa)
+{
+	ASSERT(MUTEX_HELD(&spa_namespace_avl_lock));
+	ASSERT3U(spa->spa_exit_holds, >, 0);
+
+	if (--spa->spa_exit_holds == 0)
+		cv_broadcast(&spa_exit_hold_cv);
+}
+
+/*
+ * Called by spa_unload() before it closes the DSL pool: wait for the threads
+ * arming the pool to let go of it, and keep new ones away until the pool is
+ * activated again.
+ */
+void
+spa_exit_unload_wait(spa_t *spa)
+{
+	mutex_enter(&spa_namespace_avl_lock);
+	spa->spa_exit_unloading = B_TRUE;
+	while (spa->spa_exit_holds != 0)
+		cv_wait(&spa_exit_hold_cv, &spa_namespace_avl_lock);
+	mutex_exit(&spa_namespace_avl_lock);
+}
+
+/*
+ * Arm the named pool for forced exit (see spa_exit_arm()) without taking
+ * spa_namespace_lock, which may be held indefinitely by a thread sleeping on
+ * that very pool.  spa_namespace_avl_lock keeps the tree intact while we look,
+ * and spa_exit_hold() keeps the pool while we arm it.  Unlike spa_lookup(),
+ * this does not wait for an import or export in progress.  A pool that has
+ * nothing to arm (see spa_exit_hold()) is exported as usual, so that isn't an
+ * error.
+ */
+int
+spa_exit_arm_by_name(const char *name)
+{
+	size_t len = strcspn(name, "/@#");
+	int error = SET_ERROR(ENOENT);
+	spa_t *spa;
+
+	/* A spa_t is too big for the stack, so walk the tree. */
+	mutex_enter(&spa_namespace_avl_lock);
+	for (spa = avl_first(&spa_namespace_avl); spa != NULL;
+	    spa = AVL_NEXT(&spa_namespace_avl, spa)) {
+		if (strncmp(spa->spa_name, name, len) == 0 &&
+		    spa->spa_name[len] == '\0')
+			break;
+	}
+	if (spa != NULL) {
+		error = 0;
+		if (!spa_exit_hold(spa))
+			spa = NULL;
+	}
+	mutex_exit(&spa_namespace_avl_lock);
+
+	if (spa != NULL) {
+		spa_exit_arm(spa);
+		mutex_enter(&spa_namespace_avl_lock);
+		spa_exit_rele(spa);
+		mutex_exit(&spa_namespace_avl_lock);
+	}
+
+	return (error);
+}
+
 void
 spa_exit_check(spa_t *spa)
 {
@@ -193,4 +282,16 @@ spa_exit_check(spa_t *spa)
 
 	if (fail)
 		spa_fail(spa);
+}
+
+void
+spa_exit_init(void)
+{
+	cv_init(&spa_exit_hold_cv, NULL, CV_DEFAULT, NULL);
+}
+
+void
+spa_exit_fini(void)
+{
+	cv_destroy(&spa_exit_hold_cv);
 }
