@@ -5472,6 +5472,15 @@ zfs_ioc_clear(zfs_cmd_t *zc)
 		return (error);
 
 	/*
+	 * A failed pool can't be resumed (see zio_resume()); don't clear its
+	 * errors or reopen its devices first.
+	 */
+	if (spa_failed(spa)) {
+		spa_close(spa, FTAG);
+		return (SET_ERROR(EIO));
+	}
+
+	/*
 	 * If multihost is enabled, resuming I/O is unsafe as another
 	 * host may have imported the pool.
 	 */
@@ -6584,6 +6593,8 @@ zfs_ioc_pool_sync(const char *pool, nvlist_t *innvl, nvlist_t *onvl)
 		spa_config_exit(spa, SCL_CONFIG, FTAG);
 	}
 	txg_wait_synced(spa_get_dsl(spa), 0);
+	if (spa_failed(spa))
+		err = SET_ERROR(EIO);
 
 	spa_close(spa, FTAG);
 

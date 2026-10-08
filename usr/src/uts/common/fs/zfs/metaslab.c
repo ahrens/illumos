@@ -2785,6 +2785,25 @@ metaslab_fini(metaslab_t *msp)
 	VERIFY(msp->ms_group == NULL);
 
 	/*
+	 * A failed pool stopped syncing its metaslabs, so the space they were
+	 * tracking for unsynced txgs, and the frees they were deferring, are
+	 * dropped rather than written out.  Allocations and frees that never
+	 * synced aren't in the space accounting yet, but deferred frees are.
+	 */
+	if (spa_failed(spa)) {
+		metaslab_space_update(vd, mg->mg_class, -msp->ms_deferspace,
+		    -msp->ms_deferspace, 0);
+		msp->ms_deferspace = 0;
+		for (int t = 0; t < TXG_DEFER_SIZE; t++)
+			range_tree_vacate(msp->ms_defer[t], NULL, NULL);
+		for (int t = 0; t < TXG_SIZE; t++)
+			range_tree_vacate(msp->ms_allocating[t], NULL, NULL);
+		range_tree_vacate(msp->ms_freeing, NULL, NULL);
+		range_tree_vacate(msp->ms_freed, NULL, NULL);
+		range_tree_vacate(msp->ms_checkpointing, NULL, NULL);
+	}
+
+	/*
 	 * If this metaslab hasn't been through metaslab_sync_done() yet its
 	 * space hasn't been accounted for in its vdev and doesn't need to be
 	 * subtracted.
@@ -5836,6 +5855,14 @@ metaslab_free(spa_t *spa, const blkptr_t *bp, uint64_t txg, boolean_t now)
 	ASSERT(!now || bp->blk_birth >= spa_syncing_txg(spa));
 
 	/*
+	 * A failed pool never writes its space maps again, and blocks
+	 * allocated after it failed have fake DVAs.  What is left in the
+	 * metaslabs is discarded when it is exported.
+	 */
+	if (spa_failed(spa))
+		return;
+
+	/*
 	 * If we have a checkpoint for the pool we need to make sure that
 	 * the blocks that we free that are part of the checkpoint won't be
 	 * reused until the checkpoint is discarded or we revert to it.
@@ -5884,6 +5911,9 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 	int error = 0;
 
 	ASSERT(!BP_IS_HOLE(bp));
+
+	if (spa_failed(spa))
+		return (0);
 
 	if (txg != 0) {
 		/*

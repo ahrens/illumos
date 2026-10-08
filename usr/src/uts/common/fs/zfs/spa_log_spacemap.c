@@ -21,6 +21,7 @@
 
 /*
  * Copyright (c) 2018, 2019 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu_objset.h>
@@ -860,12 +861,16 @@ spa_sync_close_syncing_log_sm(spa_t *spa)
 	 * Note that we can't assert that sls_mscount is not 0,
 	 * because there is the case where the first metaslab
 	 * in spa_metaslabs_by_flushed is loading and we were
-	 * not able to flush any metaslabs the current TXG.
+	 * not able to flush any metaslabs the current TXG.  A pool
+	 * that failed while it was syncing may have stopped syncing
+	 * its metaslabs (see spa_sync_iterate_to_convergence()) right
+	 * after it created the log, which is then empty.
 	 */
-	ASSERT(sls->sls_nblocks != 0);
+	ASSERT(sls->sls_nblocks != 0 || spa_failed(spa));
 
 	spa_log_summary_add_incoming_blocks(spa, sls->sls_nblocks);
-	spa_log_summary_verify_counts(spa);
+	if (!spa_failed(spa))
+		spa_log_summary_verify_counts(spa);
 
 	space_map_close(spa->spa_syncing_log_sm);
 	spa->spa_syncing_log_sm = NULL;

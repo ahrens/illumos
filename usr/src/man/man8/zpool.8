@@ -28,8 +28,9 @@
 .\" Copyright (c) 2012 Cyril Plisko. All Rights Reserved.
 .\" Copyright 2024 OmniOS Community Edition (OmniOSce) Association.
 .\" Copyright 2025 Hans Rosenfeld
+.\" Copyright 2026 Oxide Computer Company
 .\"
-.Dd October 2, 2026
+.Dd October 8, 2026
 .Dt ZPOOL 8
 .Os
 .Sh NAME
@@ -795,7 +796,7 @@ permissions defined on the dataset.
 See
 .Xr zfs 8
 for more information on ZFS delegated administration.
-.It Sy failmode Ns = Ns Sy wait Ns | Ns Sy continue Ns | Ns Sy panic
+.It Sy failmode Ns = Ns Sy wait Ns | Ns Sy continue Ns | Ns Sy panic Ns | Ns Sy death
 Controls the system behavior in the event of catastrophic pool failure.
 This condition is typically a result of a loss of connectivity to the underlying
 storage device(s) or a failure of all devices within the pool.
@@ -813,6 +814,20 @@ devices.
 Any write requests that have yet to be committed to disk would be blocked.
 .It Sy panic
 Prints out a message to the console and generates a system crash dump.
+.It Sy death
+The pool fails instead of being suspended, and
+.Nm zpool Cm clear
+cannot resume it.
+Operations that are waiting for the pool return
+.Er EIO ,
+as do later attempts to change it.
+Changes that were not yet written are discarded, and nothing more is written
+to the devices, so they remain at the last committed transaction group.
+The pool can then only be exported; it can be imported again once its devices
+are back.
+A pool with
+.Sy multihost
+enabled also fails when its multihost writes stop succeeding.
 .El
 .It Sy autotrim Ns = Ns Sy on Ns | Ns Sy off
 When set to

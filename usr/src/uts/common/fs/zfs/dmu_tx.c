@@ -872,7 +872,7 @@ dmu_tx_delay(dmu_tx_t *tx, uint64_t dirty)
  * decreasing performance.
  */
 static int
-dmu_tx_try_assign(dmu_tx_t *tx)
+dmu_tx_try_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 {
 	spa_t *spa = tx->tx_pool->dp_spa;
 
@@ -880,6 +880,15 @@ dmu_tx_try_assign(dmu_tx_t *tx)
 
 	if (tx->tx_err)
 		return (tx->tx_err);
+
+	/*
+	 * A failed pool accepts no new changes, whatever its failmode.  The
+	 * exception is callers that can't handle failure (DMU_TX_SUSPEND):
+	 * they get a txg, and what they change is drained without being
+	 * written, like everything else that was dirty when the pool failed.
+	 */
+	if (spa_failed(spa) && !(flags & DMU_TX_SUSPEND))
+		return (SET_ERROR(EIO));
 
 	if (spa_suspended(spa)) {
 		/*
@@ -1026,7 +1035,7 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 	if (!(flags & DMU_TX_SUSPEND))
 		tx->tx_break_on_suspend = B_TRUE;
 
-	while ((err = dmu_tx_try_assign(tx)) != 0) {
+	while ((err = dmu_tx_try_assign(tx, flags)) != 0) {
 		dmu_tx_unassign(tx);
 
 		boolean_t suspended = (err == ESHUTDOWN);
@@ -1085,9 +1094,13 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 
 		/*
 		 * Wait until there's room in this txg, or until it's been
-		 * synced out and a new one is available.
+		 * synced out and a new one is available.  On a failed pool,
+		 * which only DMU_TX_SUSPEND callers get here on, the waits
+		 * return at once (see spa_fail()): don't spin while it drains.
 		 */
 		dmu_tx_wait(tx);
+		if (spa_failed(tx->tx_pool->dp_spa))
+			delay(1);
 
 		/*
 		 * Reset tx_break_on_suspend for DMU_TX_SUSPEND. We do this
@@ -1129,12 +1142,19 @@ dmu_tx_wait(dmu_tx_t *tx)
 		 * space.
 		 */
 		mutex_enter(&dp->dp_lock);
-		while (dp->dp_dirty_total >= zfs_dirty_data_max)
+		while (dp->dp_dirty_total >= zfs_dirty_data_max &&
+		    !spa_failed(spa) &&
+		    !(tx->tx_break_on_suspend && spa_suspended(spa)))
 			cv_wait(&dp->dp_spaceavail_cv, &dp->dp_lock);
 		uint64_t dirty = dp->dp_dirty_total;
 		mutex_exit(&dp->dp_lock);
 
-		dmu_tx_delay(tx, dirty);
+		/*
+		 * A pool that fails, or suspends when we break on suspend,
+		 * stops the wait while it is still over.
+		 */
+		if (dirty < zfs_dirty_data_max)
+			dmu_tx_delay(tx, dirty);
 
 		tx->tx_wait_dirty = B_FALSE;
 

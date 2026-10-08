@@ -22,6 +22,7 @@
 /*
  * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -878,11 +879,34 @@ ddt_load(spa_t *spa)
 	return (0);
 }
 
+/*
+ * A failed pool stops syncing its DDTs (see spa_sync_iterate_to_convergence()),
+ * so the entries that were changed since are dropped rather than written.
+ */
+static void
+ddt_discard(ddt_t *ddt)
+{
+	ddt_entry_t *dde;
+	void *cookie;
+
+	ddt_enter(ddt);
+	cookie = NULL;
+	while ((dde = avl_destroy_nodes(&ddt->ddt_tree, &cookie)) != NULL)
+		ddt_free(dde);
+	cookie = NULL;
+	while ((dde = avl_destroy_nodes(&ddt->ddt_repair_tree, &cookie)) !=
+	    NULL)
+		ddt_free(dde);
+	ddt_exit(ddt);
+}
+
 void
 ddt_unload(spa_t *spa)
 {
 	for (enum zio_checksum c = 0; c < ZIO_CHECKSUM_FUNCTIONS; c++) {
 		if (spa->spa_ddt[c]) {
+			if (spa_failed(spa))
+				ddt_discard(spa->spa_ddt[c]);
 			ddt_table_free(spa->spa_ddt[c]);
 			spa->spa_ddt[c] = NULL;
 		}

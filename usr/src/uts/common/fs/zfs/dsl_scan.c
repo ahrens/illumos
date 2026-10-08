@@ -3140,6 +3140,10 @@ dsl_scan_free_block_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 {
 	dsl_scan_t *scn = arg;
 
+	/* A failed pool's bpobj blocks can be zeros: see dbuf_poison(). */
+	if (spa_failed(scn->scn_dp->dp_spa))
+		return (SET_ERROR(EIO));
+
 	if (!scn->scn_is_bptree ||
 	    (BP_GET_LEVEL(bp) == 0 && BP_GET_TYPE(bp) != DMU_OT_OBJSET)) {
 		if (dsl_scan_async_block_should_pause(scn))
@@ -3196,6 +3200,8 @@ dsl_scan_obsolete_block_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 	dsl_scan_t *scn = arg;
 	const dva_t *dva = &bp->blk_dva[0];
 
+	if (spa_failed(scn->scn_dp->dp_spa))
+		return (SET_ERROR(EIO));
 	if (dsl_scan_async_block_should_pause(scn))
 		return (SET_ERROR(ERESTART));
 
@@ -3215,6 +3221,9 @@ dsl_scan_active(dsl_scan_t *scn)
 	if (spa->spa_load_state != SPA_LOAD_NONE)
 		return (B_FALSE);
 	if (spa_shutting_down(spa))
+		return (B_FALSE);
+	/* A failed pool doesn't scan; see spa_sync_iterate_to_convergence(). */
+	if (spa_failed(spa))
 		return (B_FALSE);
 	if ((dsl_scan_is_running(scn) && !dsl_scan_is_paused_scrub(scn)) ||
 	    (scn->scn_async_destroying && !scn->scn_async_stalled))
@@ -3304,6 +3313,23 @@ dsl_scan_need_resilver(spa_t *spa, const dva_t *dva, size_t psize,
 	return (B_TRUE);
 }
 
+/*
+ * An iteration over the blocks to free returned err.  If the pool failed while
+ * it ran, the error means nothing (see dsl_process_async_destroys()).
+ * Otherwise a block couldn't be read: a failmode=death pool fails, as in
+ * dsl_deadlist_insert_failed(), and any other pool panics, as it always has.
+ */
+static void
+dsl_scan_iterate_failed(spa_t *spa, int err, const char *func)
+{
+	if (err == 0 || err == ERESTART || spa_failed(spa))
+		return;
+	if (spa_get_failmode(spa) == ZIO_FAILURE_MODE_DEATH)
+		spa_fail(spa);
+	else
+		zfs_panic_recover("error %u from %s()", err, func);
+}
+
 static int
 dsl_process_async_destroys(dsl_pool_t *dp, dmu_tx_t *tx)
 {
@@ -3313,6 +3339,15 @@ dsl_process_async_destroys(dsl_pool_t *dp, dmu_tx_t *tx)
 
 	if (spa_suspend_async_destroy(spa))
 		return (0);
+
+	/*
+	 * The pool can fail while it syncs.  Its txg is discarded then (see
+	 * spa_sync_iterate_to_convergence()), and the blocks it reads are
+	 * zeros or errors, so stop here, in the callbacks, and after each
+	 * iteration.
+	 */
+	if (spa_failed(spa))
+		return (SET_ERROR(EIO));
 
 	if (zfs_free_bpobj_enabled &&
 	    spa_version(spa) >= SPA_VERSION_DEADLISTS) {
@@ -3325,8 +3360,9 @@ dsl_process_async_destroys(dsl_pool_t *dp, dmu_tx_t *tx)
 		VERIFY0(zio_wait(scn->scn_zio_root));
 		scn->scn_zio_root = NULL;
 
-		if (err != 0 && err != ERESTART)
-			zfs_panic_recover("error %u from bpobj_iterate()", err);
+		dsl_scan_iterate_failed(spa, err, "bpobj_iterate");
+		if (spa_failed(spa))
+			return (SET_ERROR(EIO));
 	}
 
 	if (err == 0 && spa_feature_is_active(spa, SPA_FEATURE_ASYNC_DESTROY)) {
@@ -3339,12 +3375,11 @@ dsl_process_async_destroys(dsl_pool_t *dp, dmu_tx_t *tx)
 		VERIFY0(zio_wait(scn->scn_zio_root));
 		scn->scn_zio_root = NULL;
 
-		if (err == EIO || err == ECKSUM) {
+		if (err == EIO || err == ECKSUM)
 			err = 0;
-		} else if (err != 0 && err != ERESTART) {
-			zfs_panic_recover("error %u from "
-			    "traverse_dataset_destroyed()", err);
-		}
+		dsl_scan_iterate_failed(spa, err, "traverse_dataset_destroyed");
+		if (spa_failed(spa))
+			return (SET_ERROR(EIO));
 
 		if (bptree_is_empty(dp->dp_meta_objset, dp->dp_bptree_obj)) {
 			/* finished; deactivate async destroy feature */
@@ -3438,8 +3473,9 @@ dsl_process_async_destroys(dsl_pool_t *dp, dmu_tx_t *tx)
 		scn->scn_async_block_min_time_ms = zfs_obsolete_min_time_ms;
 		err = bpobj_iterate(&dp->dp_obsolete_bpobj,
 		    dsl_scan_obsolete_block_cb, scn, tx);
-		if (err != 0 && err != ERESTART)
-			zfs_panic_recover("error %u from bpobj_iterate()", err);
+		dsl_scan_iterate_failed(spa, err, "bpobj_iterate");
+		if (spa_failed(spa))
+			return (SET_ERROR(EIO));
 
 		if (bpobj_is_empty(&dp->dp_obsolete_bpobj))
 			dsl_pool_destroy_obsolete_bpobj(dp, tx);

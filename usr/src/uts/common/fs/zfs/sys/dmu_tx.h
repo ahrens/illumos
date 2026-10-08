@@ -25,6 +25,7 @@
 /*
  * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
  * Copyright (c) 2025, Klara, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_DMU_TX_H

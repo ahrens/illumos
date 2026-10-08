@@ -27,6 +27,7 @@
  * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -401,6 +402,15 @@ vdev_queue_agg_io_done(zio_t *aio)
 	}
 
 	abd_free(aio->io_abd);
+}
+
+/*
+ * Is this an I/O that the queue made by aggregating others (its parents)?
+ */
+boolean_t
+vdev_queue_io_is_aggregate(const zio_t *zio)
+{
+	return (zio->io_done == vdev_queue_agg_io_done);
 }
 
 static int

@@ -23,6 +23,7 @@
  * Portions Copyright 2011 Martin Matuska
  * Copyright (c) 2012, 2019 by Delphix. All rights reserved.
  * Copyright (c) 2025, Klara, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -401,6 +402,19 @@ txg_do_callbacks(list_t *cb_list)
 }
 
 /*
+ * The txg was drained by a failed pool, not committed.
+ */
+static void
+txg_do_callbacks_cancelled(list_t *cb_list)
+{
+	dmu_tx_do_callbacks(cb_list, ECANCELED);
+
+	list_destroy(cb_list);
+
+	kmem_free(cb_list, sizeof (list_t));
+}
+
+/*
  * Dispatch the commit callbacks registered on this txg to worker threads.
  *
  * If no callbacks are registered for a given TXG, nothing happens.
@@ -412,6 +426,11 @@ txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
 	int c;
 	tx_state_t *tx = &dp->dp_tx;
 	list_t *cb_list;
+	/*
+	 * A txg that a failed pool drained wasn't committed.  The pool can
+	 * fail after spa_sync() committed this one, so ask whether it did.
+	 */
+	boolean_t cancelled = (txg > spa_last_synced_txg(dp->dp_spa));
 
 	for (c = 0; c < max_ncpus; c++) {
 		tx_cpu_t *tc = &tx->tx_cpu[c];
@@ -441,7 +460,8 @@ txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
 		list_move_tail(cb_list, &tc->tc_callbacks[g]);
 
 		(void) taskq_dispatch(tx->tx_commit_cb_taskq, (task_func_t *)
-		    txg_do_callbacks, cb_list, TQ_SLEEP);
+		    (cancelled ? txg_do_callbacks_cancelled :
+		    txg_do_callbacks), cb_list, TQ_SLEEP);
 	}
 }
 
@@ -491,11 +511,13 @@ txg_sync_thread(void *arg)
 		/*
 		 * We sync when we're scanning, there's someone waiting
 		 * on us, or the quiesce thread has handed off a txg to
-		 * us, or we have reached our timeout.
+		 * us, or we have reached our timeout.  A failed pool
+		 * drains its dirty data without waiting.
 		 */
 		timer = (delta >= timeout ? 0 : timeout - delta);
 		while (!dsl_scan_active(dp->dp_scan) &&
 		    !tx->tx_exiting && timer > 0 &&
+		    !(spa_failed(spa) && dp->dp_dirty_total != 0) &&
 		    tx->tx_synced_txg >= tx->tx_sync_txg_waiting &&
 		    !txg_has_quiesced_to_sync(dp) &&
 		    dp->dp_dirty_total < dirty_min_bytes) {
@@ -657,6 +679,10 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 	 * else interesting happens, we'll set an error and break out.
 	 */
 	while (tx->tx_synced_txg < txg) {
+		if ((flags & TXG_WAIT_SUSPEND) && spa_failed(dp->dp_spa)) {
+			error = SET_ERROR(EIO);
+			break;
+		}
 		if ((flags & TXG_WAIT_SUSPEND) && spa_suspended(dp->dp_spa)) {
 			/*
 			 * Pool suspended and the caller does not want to
@@ -688,6 +714,14 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 		}
 	}
 
+	/*
+	 * On a failed pool, txgs after the last one synced before the failure
+	 * were drained without being written.
+	 */
+	if (error == 0 && spa_failed(dp->dp_spa) &&
+	    txg > spa_last_synced_txg(dp->dp_spa))
+		error = SET_ERROR(EIO);
+
 	mutex_exit(&tx->tx_sync_lock);
 	return (error);
 }
@@ -695,7 +729,9 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 void
 txg_wait_synced(dsl_pool_t *dp, uint64_t txg)
 {
-	VERIFY0(txg_wait_synced_flags(dp, txg, TXG_WAIT_NONE));
+	int error = txg_wait_synced_flags(dp, txg, TXG_WAIT_NONE);
+
+	VERIFY(error == 0 || spa_failed(dp->dp_spa));
 }
 
 void
@@ -704,6 +740,19 @@ txg_wait_kick(dsl_pool_t *dp)
 	tx_state_t *tx = &dp->dp_tx;
 	mutex_enter(&tx->tx_sync_lock);
 	cv_broadcast(&tx->tx_sync_done_cv);
+	mutex_exit(&tx->tx_sync_lock);
+}
+
+void
+txg_exit_wakeup(dsl_pool_t *dp)
+{
+	tx_state_t *tx = &dp->dp_tx;
+
+	mutex_enter(&tx->tx_sync_lock);
+	cv_broadcast(&tx->tx_sync_done_cv);
+	cv_broadcast(&tx->tx_sync_more_cv);
+	cv_broadcast(&tx->tx_quiesce_done_cv);
+	cv_broadcast(&tx->tx_quiesce_more_cv);
 	mutex_exit(&tx->tx_sync_lock);
 }
 
@@ -726,7 +775,7 @@ txg_wait_open(dsl_pool_t *dp, uint64_t txg, boolean_t should_quiesce)
 		tx->tx_quiesce_txg_waiting = txg;
 	dprintf_zfs("txg=%llu quiesce_txg=%llu sync_txg=%llu\n",
 	    txg, tx->tx_quiesce_txg_waiting, tx->tx_sync_txg_waiting);
-	while (tx->tx_open_txg < txg) {
+	while (tx->tx_open_txg < txg && !spa_failed(dp->dp_spa)) {
 		cv_broadcast(&tx->tx_quiesce_more_cv);
 		cv_wait(&tx->tx_quiesce_done_cv, &tx->tx_sync_lock);
 	}

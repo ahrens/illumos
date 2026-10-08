@@ -1592,6 +1592,8 @@ spa_keystore_change_key_sync(void *arg, dmu_tx_t *tx)
 	if (dcp->cp_cmd == DCP_CMD_NEW_KEY) {
 		(void) avl_find(&spa->spa_keystore.sk_wkeys, wkey, &where);
 		avl_insert(&spa->spa_keystore.sk_wkeys, wkey, where);
+		/* The keystore owns it now. */
+		dcp->cp_wkey = NULL;
 	} else if (wkey != NULL) {
 		dsl_wrapping_key_rele(wkey, FTAG);
 	}
@@ -1953,6 +1955,13 @@ dsl_dataset_create_crypt_sync(uint64_t dsobj, dsl_dir_t *dd,
 		dsl_wrapping_key_rele(wkey, FTAG);
 	} else {
 		VERIFY0(spa_keystore_load_wkey_impl(dp->dp_spa, wkey));
+		/*
+		 * The keystore owns the key now.  The caller frees dcp, and if
+		 * the pool failed before this txg was committed, the sync
+		 * task returns an error (see dsl_sync_task()), which would
+		 * otherwise free the key too.
+		 */
+		dcp->cp_wkey = NULL;
 	}
 }
 

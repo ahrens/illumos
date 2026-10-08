@@ -1037,6 +1037,19 @@ spa_vdev_copy_segment(vdev_t *vd, range_tree_t *segs,
  * synctask in the same txg that we will sync out the new config (to the
  * MOS object) which indicates that this vdev is indirect.
  */
+/*
+ * Free what vdev_remove_complete_sync() would have, if it didn't run.  The
+ * spa_vdev_removal_t itself is freed when the pool is unloaded.
+ */
+static void
+vdev_remove_complete_free(void *arg)
+{
+	spa_vdev_removal_t *svr = arg;
+
+	fnvlist_free(svr->svr_zaplist);
+	svr->svr_zaplist = NULL;
+}
+
 static void
 vdev_remove_complete_sync(void *arg, dmu_tx_t *tx)
 {
@@ -1115,8 +1128,8 @@ vdev_remove_replace_with_indirect(vdev_t *vd, uint64_t txg)
 	ASSERT(!list_link_active(&vd->vdev_state_dirty_node));
 
 	tx = dmu_tx_create_assigned(spa->spa_dsl_pool, txg);
-	dsl_sync_task_nowait(spa->spa_dsl_pool, vdev_remove_complete_sync, svr,
-	    0, ZFS_SPACE_CHECK_NONE, tx);
+	dsl_sync_task_nowait_free(spa->spa_dsl_pool, vdev_remove_complete_sync,
+	    vdev_remove_complete_free, svr, 0, ZFS_SPACE_CHECK_NONE, tx);
 	dmu_tx_commit(tx);
 
 	/*
@@ -2094,7 +2107,7 @@ spa_vdev_remove(spa_t *spa, uint64_t guid, boolean_t unspare)
 	 * that its spa_vdev_enter() returned.
 	 */
 	ASSERT(!locked || spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
-	txg = locked ? spa_last_synced_txg(spa) + 1 : spa_vdev_enter(spa);
+	txg = locked ? spa_config_change_txg(spa) : spa_vdev_enter(spa);
 
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
 	if (spa_feature_is_active(spa, SPA_FEATURE_POOL_CHECKPOINT)) {

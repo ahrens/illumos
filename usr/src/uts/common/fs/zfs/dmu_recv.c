@@ -63,6 +63,7 @@ static char *dmu_recv_tag = "dmu_recv_tag";
 const char *recv_clone_name = "%recv";
 
 static void byteswap_record(dmu_replay_record_t *drr);
+static void dmu_recv_cleanup_ds(dmu_recv_cookie_t *drc);
 
 typedef enum {
 	ORNS_NO,
@@ -730,6 +731,7 @@ dmu_recv_begin(char *tofs, char *tosnap, dmu_replay_record_t *drr_begin,
     nvlist_t *hidden_args, char *origin, dmu_recv_cookie_t *drc)
 {
 	dmu_recv_begin_arg_t drba = { 0 };
+	int err;
 
 	bzero(drc, sizeof (dmu_recv_cookie_t));
 	drc->drc_drr_begin = drr_begin;
@@ -762,12 +764,10 @@ dmu_recv_begin(char *tofs, char *tosnap, dmu_replay_record_t *drr_begin,
 
 	if (DMU_GET_FEATUREFLAGS(drc->drc_drrb->drr_versioninfo) &
 	    DMU_BACKUP_FEATURE_RESUMING) {
-		return (dsl_sync_task(tofs,
+		err = dsl_sync_task(tofs,
 		    dmu_recv_resume_begin_check, dmu_recv_resume_begin_sync,
-		    &drba, 5, ZFS_SPACE_CHECK_NORMAL));
+		    &drba, 5, ZFS_SPACE_CHECK_NORMAL);
 	} else  {
-		int err;
-
 		/*
 		 * For non-raw, non-incremental, non-resuming receives the
 		 * user can specify encryption parameters on the command line
@@ -791,9 +791,19 @@ dmu_recv_begin(char *tofs, char *tosnap, dmu_replay_record_t *drr_begin,
 		    dmu_recv_begin_check, dmu_recv_begin_sync,
 		    &drba, 5, ZFS_SPACE_CHECK_NORMAL);
 		dsl_crypto_params_free(drba.drba_dcp, !!err);
-
-		return (err);
 	}
+
+	/*
+	 * If the pool failed after the sync task ran, the sync task still
+	 * owns the dataset it set up, and the receive must let it go.  What
+	 * the task did is lost with its txg, as in dmu_recv_end().
+	 */
+	if (err != 0 && drc->drc_ds != NULL) {
+		dmu_recv_cleanup_ds(drc);
+		drc->drc_ds = NULL;
+	}
+
+	return (err);
 }
 
 struct receive_record_arg {
@@ -3086,7 +3096,14 @@ dmu_recv_end(dmu_recv_cookie_t *drc, void *owner)
 		error = dmu_recv_existing_end(drc);
 
 	if (error != 0) {
-		dmu_recv_cleanup_ds(drc);
+		/*
+		 * If the pool failed after dmu_recv_end_sync() ran, the
+		 * dataset has already been disowned.  What the sync task did
+		 * is lost with its txg, and the next import cleans up the
+		 * receive, or keeps it to resume.
+		 */
+		if (drc->drc_ds != NULL)
+			dmu_recv_cleanup_ds(drc);
 		nvlist_free(drc->drc_keynvl);
 	} else if (drc->drc_guid_to_ds_map != NULL) {
 		(void) add_ds_to_guidmap(drc->drc_tofs, drc->drc_guid_to_ds_map,
