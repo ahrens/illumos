@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu.h>
@@ -87,17 +88,28 @@ top:
 
 	if (sigfunc != NULL) {
 		err = txg_wait_synced_flags(dp, dst.dst_txg, TXG_WAIT_SIGNAL);
-		if (err != 0) {
-			VERIFY3U(err, ==, EINTR);
+		if (err == EINTR) {
 			/* current contract is to call func once */
 			sigfunc(arg, tx);
 			/* in case we're performing an EAGAIN retry */
 			sigfunc = NULL;
 
-			txg_wait_synced(dp, dst.dst_txg);
+			err = txg_wait_synced_flags(dp, dst.dst_txg,
+			    TXG_WAIT_NONE);
 		}
-	} else
-		txg_wait_synced(dp, dst.dst_txg);
+	} else {
+		err = txg_wait_synced_flags(dp, dst.dst_txg, TXG_WAIT_NONE);
+	}
+
+	/*
+	 * If the pool failed before the txg was committed, what the task did
+	 * is lost, even if it ran.
+	 */
+	if (err != 0) {
+		ASSERT(spa_failed(spa));
+		spa_close(spa, FTAG);
+		return (SET_ERROR(EIO));
+	}
 
 	if (dst.dst_error == EAGAIN) {
 		txg_wait_synced(dp, dst.dst_txg + TXG_DEFER_SIZE);
@@ -176,9 +188,9 @@ dsl_sync_task_sig(const char *pool, dsl_checkfunc_t *checkfunc,
 }
 
 static void
-dsl_sync_task_nowait_common(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc, void *arg,
-    int blocks_modified, zfs_space_check_t space_check, dmu_tx_t *tx,
-    boolean_t early)
+dsl_sync_task_nowait_common(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
+    dsl_freefunc_t *freefunc, void *arg, int blocks_modified,
+    zfs_space_check_t space_check, dmu_tx_t *tx, boolean_t early)
 {
 	dsl_sync_task_t *dst = kmem_zalloc(sizeof (*dst), KM_SLEEP);
 
@@ -191,6 +203,7 @@ dsl_sync_task_nowait_common(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc, void *arg,
 	dst->dst_arg = arg;
 	dst->dst_error = 0;
 	dst->dst_nowaiter = B_TRUE;
+	dst->dst_freefunc = freefunc;
 
 	txg_list_t *task_list = (early) ?
 	    &dp->dp_early_sync_tasks : &dp->dp_sync_tasks;
@@ -201,7 +214,21 @@ void
 dsl_sync_task_nowait(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc, void *arg,
     int blocks_modified, zfs_space_check_t space_check, dmu_tx_t *tx)
 {
-	dsl_sync_task_nowait_common(dp, syncfunc, arg,
+	dsl_sync_task_nowait_common(dp, syncfunc, NULL, arg,
+	    blocks_modified, space_check, tx, B_FALSE);
+}
+
+/*
+ * Like dsl_sync_task_nowait(), for a sync function that frees its argument.
+ * If the task doesn't run, because the pool has failed (see
+ * dsl_sync_task_sync()), freefunc frees the argument instead.
+ */
+void
+dsl_sync_task_nowait_free(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
+    dsl_freefunc_t *freefunc, void *arg, int blocks_modified,
+    zfs_space_check_t space_check, dmu_tx_t *tx)
+{
+	dsl_sync_task_nowait_common(dp, syncfunc, freefunc, arg,
 	    blocks_modified, space_check, tx, B_FALSE);
 }
 
@@ -209,7 +236,7 @@ void
 dsl_early_sync_task_nowait(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc, void *arg,
     int blocks_modified, zfs_space_check_t space_check, dmu_tx_t *tx)
 {
-	dsl_sync_task_nowait_common(dp, syncfunc, arg,
+	dsl_sync_task_nowait_common(dp, syncfunc, NULL, arg,
 	    blocks_modified, space_check, tx, B_TRUE);
 }
 
@@ -222,6 +249,20 @@ dsl_sync_task_sync(dsl_sync_task_t *dst, dmu_tx_t *tx)
 	dsl_pool_t *dp = dst->dst_pool;
 
 	ASSERT0(dst->dst_error);
+
+	/*
+	 * A failed pool runs no sync tasks: whatever they changed would be
+	 * dropped, and their check and sync functions may need to read.
+	 */
+	if (spa_failed(dp->dp_spa)) {
+		dst->dst_error = SET_ERROR(EIO);
+		if (dst->dst_nowaiter) {
+			if (dst->dst_freefunc != NULL)
+				dst->dst_freefunc(dst->dst_arg);
+			kmem_free(dst, sizeof (*dst));
+		}
+		return;
+	}
 
 	/*
 	 * Check for sufficient space.

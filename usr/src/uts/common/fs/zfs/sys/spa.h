@@ -29,6 +29,7 @@
  * Copyright (c) 2017, 2019, Datto Inc. All rights reserved.
  * Copyright (c) 2017, Intel Corporation.
  * Copyright 2020 Joshua M. Clulow <josh@sysmgr.org>
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef _SYS_SPA_H
@@ -198,6 +199,15 @@ typedef struct zio_cksum_salt {
  * log. birth	transaction group in which the block was logically born
  * fill count	number of non-zero blocks under this bp
  * checksum[4]	256-bit checksum of the data this bp describes
+ *
+ * The offset field is 63 bits, counted in 512-byte sectors, but
+ * DVA_GET_OFFSET() returns a 64-bit byte offset, so the top 8 bits of the
+ * field (bits 55-62) can't be used.  The next bit down (bit 54, byte offset
+ * 2^63, DVA_FAKE_OFFSET_BASE) marks a fake DVA: once a pool has failed, the
+ * blocks it pretends to write get fake DVAs instead of real allocations (see
+ * zio_dva_allocate_fake()).  Fake DVAs are never written to disk.  Real offsets
+ * must therefore be below 2^63 bytes (8 EiB), so bits 54-62 of the offset
+ * field are zero in every DVA on disk.
  */
 
 /*
@@ -415,6 +425,14 @@ typedef struct blkptr {
 	BF64_GET_SB((dva)->dva_word[1], 0, 63, SPA_MINBLOCKSHIFT, 0)
 #define	DVA_SET_OFFSET(dva, x)	\
 	BF64_SET_SB((dva)->dva_word[1], 0, 63, SPA_MINBLOCKSHIFT, 0, x)
+
+/*
+ * Offsets at or above DVA_FAKE_OFFSET_BASE belong to fake DVAs, which only a
+ * failed pool creates (see the blkptr layout above).
+ */
+#define	DVA_FAKE_OFFSET_BASE	(1ULL << 63)
+#define	DVA_IS_FAKE(dva)	\
+	(DVA_GET_OFFSET(dva) >= DVA_FAKE_OFFSET_BASE)
 
 #define	DVA_GET_GANG(dva)	BF64_GET((dva)->dva_word[1], 63, 1)
 #define	DVA_SET_GANG(dva, x)	BF64_SET((dva)->dva_word[1], 63, 1, x)
@@ -809,6 +827,7 @@ extern void spa_sync_allpools(void);
 /* spa namespace global mutex */
 extern kmutex_t spa_namespace_lock;
 extern avl_tree_t spa_namespace_avl;
+extern kmutex_t spa_namespace_avl_lock;
 extern kcondvar_t spa_namespace_cv;
 
 /*
@@ -921,6 +940,7 @@ extern char *spa_name(spa_t *spa);
 extern uint64_t spa_guid(spa_t *spa);
 extern uint64_t spa_load_guid(spa_t *spa);
 extern uint64_t spa_last_synced_txg(spa_t *spa);
+extern uint64_t spa_config_change_txg(spa_t *spa);
 extern uint64_t spa_first_txg(spa_t *spa);
 extern uint64_t spa_syncing_txg(spa_t *spa);
 extern uint64_t spa_final_dirty_txg(spa_t *spa);
@@ -950,6 +970,10 @@ extern int spa_prev_software_version(spa_t *spa);
 extern int spa_busy(void);
 extern uint8_t spa_get_failmode(spa_t *spa);
 extern boolean_t spa_suspended(spa_t *spa);
+extern boolean_t spa_failed(spa_t *spa);
+extern void spa_fail(spa_t *spa);
+extern void spa_exit_arm(spa_t *spa);
+extern void spa_exit_check(spa_t *spa);
 extern uint64_t spa_bootfs(spa_t *spa);
 extern uint64_t spa_delegation(spa_t *spa);
 extern objset_t *spa_meta_objset(spa_t *spa);

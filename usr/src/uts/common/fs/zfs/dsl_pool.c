@@ -25,6 +25,7 @@
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2016 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dsl_pool.h>
@@ -571,6 +572,17 @@ dsl_pool_dirty_delta(dsl_pool_t *dp, int64_t delta)
 	 */
 	if (dp->dp_dirty_total < zfs_dirty_data_max)
 		cv_signal(&dp->dp_spaceavail_cv);
+}
+
+/*
+ * The pool has failed: wake writers waiting for dirty space, so they see it.
+ */
+void
+dsl_pool_exit_wakeup(dsl_pool_t *dp)
+{
+	mutex_enter(&dp->dp_lock);
+	cv_broadcast(&dp->dp_spaceavail_cv);
+	mutex_exit(&dp->dp_lock);
 }
 
 static boolean_t

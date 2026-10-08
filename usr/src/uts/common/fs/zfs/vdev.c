@@ -28,6 +28,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright (c) 2017, Intel Corporation.
  * Copyright (c) 2019, Datto Inc. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -3189,6 +3190,30 @@ vdev_sync_done(vdev_t *vd, uint64_t txg)
 
 	if (reassess)
 		metaslab_sync_reassess(vd->vdev_mg);
+}
+
+/*
+ * A failed pool does not sync its vdevs (see
+ * spa_sync_iterate_to_convergence()).  Take the vdev's dirty metaslabs and
+ * DTLs off its txg lists, in place of vdev_sync(), so they can be torn down
+ * when the pool is exported; metaslab_fini() drops whatever space they were
+ * still tracking.  An indirect vdev's segments made obsolete in this txg
+ * are dropped as well: their space map is never written, and the next
+ * spa_sync() and vdev_free() expect none.
+ */
+void
+vdev_sync_discard(vdev_t *vd, uint64_t txg)
+{
+	ASSERT(spa_failed(vd->vdev_spa));
+
+	mutex_enter(&vd->vdev_obsolete_lock);
+	range_tree_vacate(vd->vdev_obsolete_segments, NULL, NULL);
+	mutex_exit(&vd->vdev_obsolete_lock);
+
+	while (txg_list_remove(&vd->vdev_ms_list, txg) != NULL)
+		continue;
+	while (txg_list_remove(&vd->vdev_dtl_list, txg) != NULL)
+		continue;
 }
 
 void

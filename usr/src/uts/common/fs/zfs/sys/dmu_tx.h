@@ -25,6 +25,7 @@
 /*
  * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
  * Copyright (c) 2025, Klara, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_DMU_TX_H
@@ -82,6 +83,9 @@ struct dmu_tx {
 
 	/* whether dmu_tx_wait() should return on suspend */
 	boolean_t tx_break_on_suspend;
+
+	/* has to be assigned even on a failed pool (DMU_TX_SUSPEND) */
+	boolean_t tx_must_assign;
 
 	int tx_err;
 };

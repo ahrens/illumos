@@ -854,8 +854,10 @@ zfs_blkptr_verify(spa_t *spa, const blkptr_t *bp)
 	/*
 	 * Do not verify individual DVAs if the config is not trusted. This
 	 * will be done once the zio is executed in vdev_mirror_map_alloc.
+	 * Blocks written after the pool failed have fake DVAs beyond the end
+	 * of the vdev (see zio_dva_allocate_fake()).
 	 */
-	if (!spa->spa_trust_config)
+	if (!spa->spa_trust_config || spa_failed(spa))
 		return;
 
 	/*
@@ -867,6 +869,13 @@ zfs_blkptr_verify(spa_t *spa, const blkptr_t *bp)
 	 * that are in the log) to be arbitrarily large.
 	 */
 	for (int i = 0; i < BP_GET_NDVAS(bp); i++) {
+		if (DVA_IS_FAKE(&bp->blk_dva[i])) {
+			zfs_panic_recover("blkptr at %p DVA %u has fake "
+			    "OFFSET %llu, but the pool has not failed",
+			    bp, i,
+			    (longlong_t)DVA_GET_OFFSET(&bp->blk_dva[i]));
+			continue;
+		}
 		uint64_t vdevid = DVA_GET_VDEV(&bp->blk_dva[i]);
 		if (vdevid >= spa->spa_root_vdev->vdev_children) {
 			zfs_panic_recover("blkptr at %p DVA %u has invalid "
@@ -1036,6 +1045,12 @@ zio_write_override(zio_t *zio, blkptr_t *bp, int copies, boolean_t nopwrite)
 void
 zio_free(spa_t *spa, uint64_t txg, const blkptr_t *bp)
 {
+	/*
+	 * A failed pool frees nothing: its space maps are never written
+	 * again, and the block may have a fake DVA.
+	 */
+	if (spa_failed(spa))
+		return;
 
 	zfs_blkptr_verify(spa, bp);
 
@@ -1079,7 +1094,7 @@ zio_free_sync(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	ASSERT(!BP_IS_HOLE(bp));
 	ASSERT(spa_syncing_txg(spa) == txg);
 
-	if (BP_IS_EMBEDDED(bp))
+	if (BP_IS_EMBEDDED(bp) || spa_failed(spa))
 		return (zio_null(pio, spa, NULL, NULL, NULL, 0));
 
 	metaslab_check_free(spa, bp);
@@ -2040,9 +2055,86 @@ zio_reexecute(zio_t *pio)
 	}
 }
 
+static void
+zio_exit_reexecute_task(void *arg)
+{
+	zio_t *pio = arg;
+
+	ASSERT(pio->io_flags & ZIO_FLAG_GODFATHER);
+
+	zio_reexecute(pio);
+	(void) zio_wait(pio);
+}
+
+/*
+ * The pool has failed: reexecute the tree of I/O that was parked while it was
+ * suspended.  It runs into the fence, so it completes without device I/O.
+ */
+void
+zio_exit_reexecute(zio_t *pio)
+{
+	ASSERT(spa_failed(pio->io_spa));
+	ASSERT(pio->io_tqent.tqent_next == NULL);
+
+	spa_taskq_dispatch_ent(pio->io_spa, ZIO_TYPE_CLAIM, ZIO_TASKQ_ISSUE,
+	    zio_exit_reexecute_task, pio, 0, &pio->io_tqent);
+}
+
+/*
+ * Reexecute a root zio (and its tree) that wanted to suspend, on a pool that
+ * has failed.  It runs into the fence.
+ */
+static void
+zio_exit_reexecute_root(zio_t *zio)
+{
+	ASSERT(spa_failed(zio->io_spa));
+	ASSERT(zio->io_tqent.tqent_next == NULL);
+
+	spa_taskq_dispatch_ent(zio->io_spa, ZIO_TYPE_CLAIM, ZIO_TASKQ_ISSUE,
+	    (task_func_t *)zio_reexecute, zio, 0, &zio->io_tqent);
+}
+
 void
 zio_suspend(spa_t *spa, zio_t *zio, zio_suspend_reason_t reason)
 {
+	boolean_t death = (spa_get_failmode(spa) == ZIO_FAILURE_MODE_DEATH);
+	boolean_t fail;
+
+	/*
+	 * A failmode=death pool, or one that is armed for forced exit or has
+	 * already failed, fails rather than suspends, whatever the reason, and
+	 * the zio is reexecuted, into the fence.  spa_exit_arm() takes
+	 * spa_suspend_lock too, so a pool that is armed as it suspends is
+	 * failed by one of us.
+	 */
+	mutex_enter(&spa->spa_suspend_lock);
+	fail = (death || spa->spa_exit != SPA_EXIT_NONE);
+	if (!fail) {
+		if (spa->spa_suspend_zio_root == NULL)
+			spa->spa_suspend_zio_root = zio_root(spa, NULL, NULL,
+			    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
+			    ZIO_FLAG_GODFATHER);
+
+		spa->spa_suspended = reason;
+
+		if (zio != NULL) {
+			ASSERT(!(zio->io_flags & ZIO_FLAG_GODFATHER));
+			ASSERT(zio != spa->spa_suspend_zio_root);
+			ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
+			ASSERT(zio_unique_parent(zio) == NULL);
+			ASSERT(zio->io_stage == ZIO_STAGE_DONE);
+			zio_add_child(spa->spa_suspend_zio_root, zio);
+		}
+	}
+	mutex_exit(&spa->spa_suspend_lock);
+
+	if (fail) {
+		spa_fail(spa);
+		if (zio != NULL)
+			zio_exit_reexecute_root(zio);
+		return;
+	}
+
 	if (spa_get_failmode(spa) == ZIO_FAILURE_MODE_PANIC)
 		fm_panic("Pool '%s' has encountered an uncorrectable I/O "
 		    "failure and the failure mode property for this pool "
@@ -2055,26 +2147,6 @@ zio_suspend(spa_t *spa, zio_t *zio, zio_suspend_reason_t reason)
 	(void) zfs_ereport_post(FM_EREPORT_ZFS_IO_FAILURE, spa, NULL,
 	    NULL, NULL, 0, 0);
 
-	mutex_enter(&spa->spa_suspend_lock);
-
-	if (spa->spa_suspend_zio_root == NULL)
-		spa->spa_suspend_zio_root = zio_root(spa, NULL, NULL,
-		    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
-		    ZIO_FLAG_GODFATHER);
-
-	spa->spa_suspended = reason;
-
-	if (zio != NULL) {
-		ASSERT(!(zio->io_flags & ZIO_FLAG_GODFATHER));
-		ASSERT(zio != spa->spa_suspend_zio_root);
-		ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
-		ASSERT(zio_unique_parent(zio) == NULL);
-		ASSERT(zio->io_stage == ZIO_STAGE_DONE);
-		zio_add_child(spa->spa_suspend_zio_root, zio);
-	}
-
-	mutex_exit(&spa->spa_suspend_lock);
-
 	txg_wait_kick(spa->spa_dsl_pool);
 }
 
@@ -2084,9 +2156,14 @@ zio_resume(spa_t *spa)
 	zio_t *pio;
 
 	/*
-	 * Reexecute all previously suspended i/o.
+	 * Reexecute all previously suspended i/o.  A failed pool can't be
+	 * resumed; only exporting it gets rid of it.
 	 */
 	mutex_enter(&spa->spa_suspend_lock);
+	if (spa->spa_exit == SPA_EXIT_FAILED) {
+		mutex_exit(&spa->spa_suspend_lock);
+		return (SET_ERROR(EBUSY));
+	}
 	if (spa->spa_suspended != ZIO_SUSPEND_NONE)
 		cmn_err(CE_WARN, "Pool '%s' was suspended and is being "
 		    "resumed. Failed I/O will be retried.",
@@ -3011,6 +3088,21 @@ zio_ddt_write(zio_t *zio)
 	ASSERT(BP_IS_HOLE(bp) || zio->io_bp_override);
 	ASSERT(!(zio->io_bp_override && (zio->io_flags & ZIO_FLAG_RAW)));
 
+	/*
+	 * Dedup would read the DDT.  A write that was set up for dedup before
+	 * the pool failed is written as a plain block instead, as it would
+	 * have been had the pool already failed (see zio_write_bp_init()).
+	 */
+	if (spa_failed(spa)) {
+		zp->zp_dedup = zp->zp_dedup_verify = B_FALSE;
+		BP_SET_DEDUP(bp, 0);
+		if (zio->io_bp_override != NULL)
+			zio->io_pipeline &= ~ZIO_STAGE_DDT_WRITE;
+		else
+			zio->io_pipeline = ZIO_WRITE_PIPELINE;
+		return (ZIO_PIPELINE_CONTINUE);
+	}
+
 	ddt_enter(ddt);
 	dde = ddt_lookup(ddt, bp, B_TRUE);
 	ddp = &dde->dde_phys[p];
@@ -3238,6 +3330,50 @@ zio_allocate_dispatch(spa_t *spa, int allocator)
 	zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE, B_TRUE);
 }
 
+/*
+ * Allocate a block on a failed pool.  Nothing will be written (see
+ * zio_vdev_io_fence()), so we don't touch the metaslabs: the block gets a fake
+ * DVA on a real top-level vdev, so that vdev lookups and space accounting
+ * still work, at an offset that is unique, because the ARC identifies blocks
+ * by DVA and birth txg.  Fake offsets start at DVA_FAKE_OFFSET_BASE, above
+ * any real block (see the blkptr layout in spa.h).  Fake DVAs never reach the
+ * metaslabs: frees and claims are no-ops on a failed pool.
+ */
+static void
+zio_dva_allocate_fake(zio_t *zio, metaslab_class_t *mc)
+{
+	spa_t *spa = zio->io_spa;
+	blkptr_t *bp = zio->io_bp;
+
+	/* Nothing is allocated, so give back the throttle's reservation. */
+	if (zio->io_flags & ZIO_FLAG_IO_ALLOCATING) {
+		metaslab_class_throttle_unreserve(mc, zio->io_prop.zp_copies,
+		    zio->io_allocator, zio);
+		zio->io_flags &= ~ZIO_FLAG_IO_ALLOCATING;
+		zio_allocate_dispatch(spa, zio->io_allocator);
+	}
+
+	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
+	if (mc->mc_rotor == NULL)
+		mc = spa_normal_class(spa);
+	vdev_t *vd = mc->mc_rotor->mg_vd;
+	uint64_t asize = vdev_psize_to_asize(vd, zio->io_size);
+	ASSERT3U(vd->vdev_asize, <=, DVA_FAKE_OFFSET_BASE);
+
+	for (int d = 0; d < zio->io_prop.zp_copies; d++) {
+		uint64_t offset = DVA_FAKE_OFFSET_BASE +
+		    atomic_add_64_nv(&spa->spa_exit_offset, asize) - asize;
+
+		DVA_SET_VDEV(&bp->blk_dva[d], vd->vdev_id);
+		DVA_SET_OFFSET(&bp->blk_dva[d], offset);
+		DVA_SET_ASIZE(&bp->blk_dva[d], asize);
+		DVA_SET_GANG(&bp->blk_dva[d], 0);
+	}
+	spa_config_exit(spa, SCL_ALLOC, FTAG);
+
+	BP_SET_BIRTH(bp, zio->io_txg, zio->io_txg);
+}
+
 static int
 zio_dva_allocate(zio_t *zio)
 {
@@ -3257,6 +3393,14 @@ zio_dva_allocate(zio_t *zio)
 	ASSERT3U(zio->io_prop.zp_copies, >, 0);
 	ASSERT3U(zio->io_prop.zp_copies, <=, spa_max_replication(spa));
 	ASSERT3U(zio->io_size, ==, BP_GET_PSIZE(bp));
+
+	if (spa_failed(spa)) {
+		mc = zio->io_metaslab_class;
+		if (mc == NULL)
+			mc = spa_normal_class(spa);
+		zio_dva_allocate_fake(zio, mc);
+		return (ZIO_PIPELINE_CONTINUE);
+	}
 
 	if (zio->io_flags & ZIO_FLAG_NODATA)
 		flags |= METASLAB_DONT_THROTTLE;
@@ -3450,6 +3594,38 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
  */
 
 /*
+ * The fence.  Once the pool has failed, no I/O reaches a device, so the disks
+ * stay exactly at the last synced txg (plus ZIL blocks), even if a device
+ * comes back.  Fenced I/O completes at once: reads fail, as do writes that may
+ * fail (ZIL blocks, labels, uberblocks, dmu_sync()), whose callers handle the
+ * error and never report the data as stable.  Other writes, flushes and TRIMs
+ * succeed without doing anything, so syncing context drains through its
+ * normal success paths.
+ */
+static void
+zio_vdev_io_fence(zio_t *zio)
+{
+	zio_t *lio = (zio->io_logical != NULL) ? zio->io_logical : zio;
+
+	ASSERT(spa_failed(zio->io_spa));
+	ASSERT(zio->io_vd->vdev_ops->vdev_op_leaf);
+
+	zio_vdev_io_bypass(zio);
+
+	switch (zio->io_type) {
+	case ZIO_TYPE_READ:
+		zio->io_error = SET_ERROR(EIO);
+		break;
+	case ZIO_TYPE_WRITE:
+		if (lio->io_flags & ZIO_FLAG_CANFAIL)
+			zio->io_error = SET_ERROR(EIO);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
  * Issue an I/O to the underlying vdev. Typically the issue pipeline
  * stops after this stage and will resume upon I/O completion.
  * However, there are instances where the vdev layer may need to
@@ -3480,6 +3656,11 @@ zio_vdev_io_start(zio_t *zio)
 		 */
 		vdev_mirror_ops.vdev_op_io_start(zio);
 		return (ZIO_PIPELINE_STOP);
+	}
+
+	if (vd->vdev_ops->vdev_op_leaf && spa_failed(spa)) {
+		zio_vdev_io_fence(zio);
+		return (ZIO_PIPELINE_CONTINUE);
 	}
 
 	ASSERT3P(zio->io_logical, !=, zio);
@@ -4225,6 +4406,7 @@ zio_done(zio_t *zio)
 	uint64_t psize = zio->io_size;
 	zio_t *pio, *pio_next;
 	zio_link_t *zl = NULL;
+	boolean_t failed;
 
 	/*
 	 * If our children haven't all completed,
@@ -4233,6 +4415,13 @@ zio_done(zio_t *zio)
 	if (zio_wait_for_children(zio, ZIO_CHILD_ALL_BITS, ZIO_WAIT_DONE)) {
 		return (ZIO_PIPELINE_STOP);
 	}
+
+	/*
+	 * Once the pool has failed, errors are expected and are not worth
+	 * reporting one by one (spa_fail() posted a pool-level ereport), and
+	 * nothing is retried or suspended.
+	 */
+	failed = spa_failed(spa);
 
 	/*
 	 * If the allocation throttle is enabled, then update the accounting.
@@ -4290,6 +4479,14 @@ zio_done(zio_t *zio)
 	zio_inherit_child_errors(zio, ZIO_CHILD_GANG);
 	zio_inherit_child_errors(zio, ZIO_CHILD_DDT);
 
+	if (failed) {
+		while (zio->io_cksum_report != NULL) {
+			zio_cksum_report_t *zcr = zio->io_cksum_report;
+			zio->io_cksum_report = zcr->zcr_next;
+			zfs_ereport_free_checksum(zcr);
+		}
+	}
+
 	/*
 	 * If the I/O on the transformed data was successful, generate any
 	 * checksum reports now while we still have the transformed data.
@@ -4319,9 +4516,10 @@ zio_done(zio_t *zio)
 
 	zio_pop_transforms(zio);	/* note: may set zio->io_error */
 
-	vdev_stat_update(zio, psize);
+	if (!failed)
+		vdev_stat_update(zio, psize);
 
-	if (zio->io_delay >= MSEC2NSEC(zio_slow_io_ms)) {
+	if (!failed && zio->io_delay >= MSEC2NSEC(zio_slow_io_ms)) {
 		if (zio->io_vd != NULL && !vdev_is_dead(zio->io_vd)) {
 			/*
 			 * We want to only increment our slow IO counters if
@@ -4344,7 +4542,7 @@ zio_done(zio_t *zio)
 		}
 	}
 
-	if (zio->io_error) {
+	if (zio->io_error && !failed) {
 		/*
 		 * If this I/O is attached to a particular vdev,
 		 * generate an error message describing the I/O failure
@@ -4369,7 +4567,7 @@ zio_done(zio_t *zio)
 		}
 	}
 
-	if (zio->io_error && zio == lio) {
+	if (zio->io_error && zio == lio && !failed) {
 		/*
 		 * Determine whether zio should be reexecuted.  This will
 		 * propagate all the way to the root via zio_notify_parent().
@@ -4380,7 +4578,8 @@ zio_done(zio_t *zio)
 		if (IO_IS_ALLOCATING(zio) &&
 		    !(zio->io_flags & ZIO_FLAG_CANFAIL)) {
 			if (zio->io_error == ENOSPC) {
-				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND |
+				    ZIO_REEXECUTE_ENOSPC;
 			} else if (zio->io_reexecute_count <
 			    zio_reexecute_max) {
 				zio->io_reexecute_count++;
@@ -4396,10 +4595,12 @@ zio_done(zio_t *zio)
 		    zio->io_error == ENXIO &&
 		    spa_load_state(spa) == SPA_LOAD_NONE &&
 		    spa_get_failmode(spa) != ZIO_FAILURE_MODE_CONTINUE)
-			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND |
+			    ZIO_REEXECUTE_FAILED;
 
 		if (!(zio->io_flags & ZIO_FLAG_CANFAIL) && !zio->io_reexecute)
-			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND |
+			    ZIO_REEXECUTE_FAILED;
 
 		/*
 		 * Here is a possibly good place to attempt to do
@@ -4427,6 +4628,19 @@ zio_done(zio_t *zio)
 	 */
 	zio_inherit_child_errors(zio, ZIO_CHILD_LOGICAL);
 
+	/*
+	 * On a failed pool, writes, frees, claims and flushes that must not
+	 * fail succeed without having done anything: nothing written after
+	 * the failure can reach the disks anyway.  This lets syncing context
+	 * keep running its normal success paths.  I/O that was in flight when
+	 * the pool failed may still return an error; absorb it here, before
+	 * the unallocation below, so that the block keeps its DVA.  Reads keep
+	 * their error.
+	 */
+	if (failed && zio->io_error != 0 && zio->io_type != ZIO_TYPE_READ &&
+	    !(zio->io_flags & ZIO_FLAG_CANFAIL))
+		zio->io_error = 0;
+
 	if ((zio->io_error || zio->io_reexecute) &&
 	    IO_IS_ALLOCATING(zio) && zio->io_gang_leader == zio &&
 	    !(zio->io_flags & (ZIO_FLAG_IO_REWRITE | ZIO_FLAG_NOPWRITE)))
@@ -4439,7 +4653,7 @@ zio_done(zio_t *zio)
 	 */
 	if ((zio->io_flags & ZIO_FLAG_GODFATHER) &&
 	    (zio->io_reexecute & ZIO_REEXECUTE_SUSPEND))
-		zio->io_reexecute &= ~ZIO_REEXECUTE_SUSPEND;
+		zio->io_reexecute &= ~ZIO_REEXECUTE_SUSPEND_ALL;
 
 	if (zio->io_reexecute) {
 		/*
@@ -4513,7 +4727,8 @@ zio_done(zio_t *zio)
 
 	ASSERT(zio->io_child_count == 0);
 	ASSERT(zio->io_reexecute == 0);
-	ASSERT(zio->io_error == 0 || (zio->io_flags & ZIO_FLAG_CANFAIL));
+	ASSERT(zio->io_error == 0 || (zio->io_flags & ZIO_FLAG_CANFAIL) ||
+	    failed);
 
 	/*
 	 * Report any checksum errors, since the I/O is complete.

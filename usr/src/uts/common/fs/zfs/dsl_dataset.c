@@ -28,6 +28,7 @@
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2016, OmniTI Computer Consulting, Inc. All rights reserved.
  * Copyright 2017 Nexenta Systems, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu_objset.h>

@@ -25,6 +25,7 @@
 /*
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  * Copyright (c) 2025, Klara, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef _SYS_TXG_H
@@ -72,15 +73,29 @@ typedef struct txg_list {
  * the wait to break and return an error code describing the condition.
  */
 typedef enum {
-	/* No special flags. Guaranteed to block forever or return 0 */
+	/*
+	 * No special flags. Guaranteed to block forever or return 0, except on
+	 * a failed pool (see below).
+	 */
 	TXG_WAIT_NONE   = 0,
 
 	/* If a signal arrives while waiting, abort and return EINTR */
 	TXG_WAIT_SIGNAL = (1 << 0),
 
-	/* If the pool suspends while waiting, abort and return ESHUTDOWN. */
+	/*
+	 * If the pool suspends while waiting, abort and return ESHUTDOWN.
+	 * If it has failed, return EIO without waiting.
+	 */
 	TXG_WAIT_SUSPEND = (1 << 1),
 } txg_wait_flag_t;
+
+/*
+ * On a failed pool (see spa_fail()) the sync thread drains the remaining txgs
+ * without writing them, so they are not durable.  txg_wait_synced_flags()
+ * then returns EIO once the txg has drained, unless it was synced before the
+ * pool failed.  Waiting for the drain, rather than returning at once, keeps
+ * callers from freeing state the sync thread still refers to.
+ */
 
 struct dsl_pool;
 
@@ -117,6 +132,11 @@ extern void txg_wait_synced(struct dsl_pool *dp, uint64_t txg);
  * Wake all threads waiting in txg_wait_synced_flags() so they can reevaluate.
  */
 extern void txg_wait_kick(struct dsl_pool *dp);
+
+/*
+ * Wake every thread waiting on the pool's txg state, because it has failed.
+ */
+extern void txg_exit_wakeup(struct dsl_pool *dp);
 
 /*
  * Wait until the given transaction group, or one after it, is

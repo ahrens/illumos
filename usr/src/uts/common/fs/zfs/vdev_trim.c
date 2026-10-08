@@ -184,6 +184,15 @@ vdev_autotrim_should_stop(vdev_t *tvd)
 }
 
 /*
+ * Free the argument of a vdev_trim_zap_update_sync() that didn't run.
+ */
+static void
+vdev_trim_zap_update_free(void *arg)
+{
+	kmem_free(arg, sizeof (uint64_t));
+}
+
+/*
  * The sync task for updating the on-disk state of a manual TRIM.  This
  * is scheduled by vdev_trim_change_state().
  */
@@ -318,7 +327,8 @@ vdev_trim_change_state(vdev_t *vd, vdev_trim_state_t new_state,
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND));
-	dsl_sync_task_nowait(spa_get_dsl(spa), vdev_trim_zap_update_sync,
+	dsl_sync_task_nowait_free(spa_get_dsl(spa),
+	    vdev_trim_zap_update_sync, vdev_trim_zap_update_free,
 	    guid, 2, ZFS_SPACE_CHECK_NONE, tx);
 
 	switch (new_state) {
@@ -488,9 +498,9 @@ vdev_trim_range(trim_args_t *ta, uint64_t start, uint64_t size)
 		*guid = vd->vdev_guid;
 
 		/* This is the first write of this txg. */
-		dsl_sync_task_nowait(spa_get_dsl(spa),
-		    vdev_trim_zap_update_sync, guid, 2,
-		    ZFS_SPACE_CHECK_RESERVED, tx);
+		dsl_sync_task_nowait_free(spa_get_dsl(spa),
+		    vdev_trim_zap_update_sync, vdev_trim_zap_update_free,
+		    guid, 2, ZFS_SPACE_CHECK_RESERVED, tx);
 	}
 
 	/*

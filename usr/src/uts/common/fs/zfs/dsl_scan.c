@@ -26,6 +26,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright (c) 2017, 2019, Datto Inc. All rights reserved.
  * Copyright 2024 Bill Sommerfeld <sommerfeld@hamachi.org>
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dsl_scan.h>
@@ -3178,6 +3179,9 @@ dsl_scan_active(dsl_scan_t *scn)
 	if (spa->spa_load_state != SPA_LOAD_NONE)
 		return (B_FALSE);
 	if (spa_shutting_down(spa))
+		return (B_FALSE);
+	/* A failed pool doesn't scan; see spa_sync_iterate_to_convergence(). */
+	if (spa_failed(spa))
 		return (B_FALSE);
 	if ((dsl_scan_is_running(scn) && !dsl_scan_is_paused_scrub(scn)) ||
 	    (scn->scn_async_destroying && !scn->scn_async_stalled))

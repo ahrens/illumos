@@ -29,6 +29,7 @@
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2017 Nexenta Systems, Inc.
  * Copyright (c) 2017 Open-E, Inc. All Rights Reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -1988,6 +1989,36 @@ typedef struct userquota_updates_arg {
 	dmu_tx_t *uua_tx;
 } userquota_updates_arg_t;
 
+/*
+ * The accounting for a dnode that was synced in this txg has been updated (or
+ * dropped): take it off the synced list, and release its hold.
+ */
+static void
+userquota_synced_dnode_done(objset_t *os, multilist_sublist_t *list,
+    dnode_t *dn)
+{
+	mutex_enter(&dn->dn_mtx);
+	dn->dn_oldused = 0;
+	dn->dn_oldflags = 0;
+	if (dn->dn_id_flags & DN_ID_NEW_EXIST) {
+		dn->dn_olduid = dn->dn_newuid;
+		dn->dn_oldgid = dn->dn_newgid;
+		dn->dn_oldprojid = dn->dn_newprojid;
+		dn->dn_id_flags |= DN_ID_OLD_EXIST;
+		if (dn->dn_bonuslen == 0)
+			dn->dn_id_flags |= DN_ID_CHKED_SPILL;
+		else
+			dn->dn_id_flags |= DN_ID_CHKED_BONUS;
+	}
+	dn->dn_id_flags &= ~(DN_ID_NEW_EXIST);
+	if (dn->dn_dirty_txg == spa_syncing_txg(os->os_spa))
+		dn->dn_dirty_txg = 0;
+	mutex_exit(&dn->dn_mtx);
+
+	multilist_sublist_remove(list, dn);
+	dnode_rele(dn, os->os_synced_dnodes);
+}
+
 static void
 userquota_updates_task(void *arg)
 {
@@ -2038,30 +2069,33 @@ userquota_updates_task(void *arg)
 			    dn->dn_newprojid, B_FALSE);
 		}
 
-		mutex_enter(&dn->dn_mtx);
-		dn->dn_oldused = 0;
-		dn->dn_oldflags = 0;
-		if (dn->dn_id_flags & DN_ID_NEW_EXIST) {
-			dn->dn_olduid = dn->dn_newuid;
-			dn->dn_oldgid = dn->dn_newgid;
-			dn->dn_oldprojid = dn->dn_newprojid;
-			dn->dn_id_flags |= DN_ID_OLD_EXIST;
-			if (dn->dn_bonuslen == 0)
-				dn->dn_id_flags |= DN_ID_CHKED_SPILL;
-			else
-				dn->dn_id_flags |= DN_ID_CHKED_BONUS;
-		}
-		dn->dn_id_flags &= ~(DN_ID_NEW_EXIST);
-		if (dn->dn_dirty_txg == spa_syncing_txg(os->os_spa))
-			dn->dn_dirty_txg = 0;
-		mutex_exit(&dn->dn_mtx);
-
-		multilist_sublist_remove(list, dn);
-		dnode_rele(dn, os->os_synced_dnodes);
+		userquota_synced_dnode_done(os, list, dn);
 	}
 	do_userquota_cacheflush(os, &cache, tx);
 	multilist_sublist_unlock(list);
 	kmem_free(uua, sizeof (*uua));
+}
+
+/*
+ * Release the dnodes that were synced in this txg without updating the
+ * user/group/project accounting for them (see userquota_updates_task()).
+ */
+static void
+dmu_objset_discard_synced_dnodes(objset_t *os)
+{
+	multilist_t *ml = os->os_synced_dnodes;
+
+	if (ml == NULL)
+		return;
+
+	for (int i = 0; i < multilist_get_num_sublists(ml); i++) {
+		multilist_sublist_t *list = multilist_sublist_lock(ml, i);
+		dnode_t *dn;
+
+		while ((dn = multilist_sublist_head(list)) != NULL)
+			userquota_synced_dnode_done(os, list, dn);
+		multilist_sublist_unlock(list);
+	}
 }
 
 void
@@ -2069,6 +2103,15 @@ dmu_objset_do_userquota_updates(objset_t *os, dmu_tx_t *tx)
 {
 	if (!dmu_objset_userused_enabled(os))
 		return;
+
+	/*
+	 * A failed pool doesn't update its accounting objects: it would have
+	 * to read them, and none of it is ever written.
+	 */
+	if (spa_failed(dmu_objset_spa(os))) {
+		dmu_objset_discard_synced_dnodes(os);
+		return;
+	}
 
 	/*
 	 * If this is a raw receive just return and handle accounting

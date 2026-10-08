@@ -29,7 +29,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright (c) 2017, Intel Corporation.
  * Copyright 2020 Joyent, Inc.
- * Copyright 2022 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -118,6 +118,14 @@
  *		spa_namespace_lock	->	spa_config_lock[]
  *
  *	The namespace lock must always be taken before the config lock.
+ *
+ *		spa_namespace_lock	->	spa_namespace_avl_lock
+ *		spa_namespace_avl_lock	->	spa_suspend_lock
+ *
+ *	spa_namespace_avl_lock is a leaf lock, held only while adding a spa_t
+ *	to or removing it from the namespace AVL tree, and by
+ *	spa_exit_arm_by_name(), which has to find a pool to fail even while
+ *	a thread sleeps holding spa_namespace_lock.
  *
  *
  * The spa_namespace_lock can be acquired directly and is globally visible.
@@ -235,6 +243,7 @@
 
 avl_tree_t spa_namespace_avl;
 kmutex_t spa_namespace_lock;
+kmutex_t spa_namespace_avl_lock;
 kcondvar_t spa_namespace_cv;
 static int spa_active_count;
 int spa_max_replication_override = SPA_DVAS_PER_BP;
@@ -710,7 +719,9 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	spa_config_lock_init(spa);
 
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
+	mutex_enter(&spa_namespace_avl_lock);
 	avl_add(&spa_namespace_avl, spa);
+	mutex_exit(&spa_namespace_avl_lock);
 
 	/*
 	 * Set the alternate root, if there is one.
@@ -809,7 +820,9 @@ spa_remove(spa_t *spa)
 
 	nvlist_free(spa->spa_config_splitting);
 
+	mutex_enter(&spa_namespace_avl_lock);
 	avl_remove(&spa_namespace_avl, spa);
+	mutex_exit(&spa_namespace_avl_lock);
 
 	if (spa->spa_root) {
 		spa_strfree(spa->spa_root);
@@ -1274,7 +1287,30 @@ spa_vdev_config_enter(spa_t *spa)
 
 	spa_config_enter(spa, SCL_ALL, spa, RW_WRITER);
 
-	return (spa_last_synced_txg(spa) + 1);
+	return (spa_config_change_txg(spa));
+}
+
+/*
+ * The txg that a configuration change made now, with SCL_ALL held as writer,
+ * belongs to: normally the one after the last synced txg.  A failed pool's
+ * txgs sync into the void without writing an uberblock, so for it,
+ * spa_last_synced_txg() falls behind the txgs that spa_sync() has finished,
+ * and it is the one after those.  spa_sync() sets spa_syncing_txg with
+ * SCL_CONFIG held, and only drops it before it is done with that txg to
+ * dirty pending vdev state changes into it, so the txg after
+ * spa_syncing_txg is one that spa_sync() hasn't started.  (tx_synced_txg is
+ * no good: txg_sync_thread() updates it after spa_sync() drops SCL_CONFIG,
+ * so it can still name the txg before the one just finished.)
+ */
+uint64_t
+spa_config_change_txg(spa_t *spa)
+{
+	uint64_t txg = spa_last_synced_txg(spa);
+
+	ASSERT3U(spa_config_held(spa, SCL_ALL, RW_WRITER), ==, SCL_ALL);
+	if (spa_failed(spa))
+		txg = MAX(txg, spa_syncing_txg(spa));
+	return (txg + 1);
 }
 
 /*
@@ -1329,7 +1365,13 @@ spa_vdev_config_exit(spa_t *spa, vdev_t *vd, uint64_t txg, int error, char *tag)
 		txg_wait_synced(spa->spa_dsl_pool, txg);
 
 	if (vd != NULL) {
-		ASSERT(!vd->vdev_detached || vd->vdev_dtl_sm == NULL);
+		/*
+		 * A detached vdev's DTL is freed when its txg syncs, unless
+		 * the pool has failed, in which case vdev_free() just closes
+		 * it (see vdev_sync_discard()).
+		 */
+		ASSERT(!vd->vdev_detached || vd->vdev_dtl_sm == NULL ||
+		    spa_failed(spa));
 		if (vd->vdev_ops->vdev_op_leaf) {
 			mutex_enter(&vd->vdev_initialize_lock);
 			vdev_initialize_stop(vd, VDEV_INITIALIZE_CANCELED,
@@ -1370,6 +1412,11 @@ spa_vdev_exit(spa_t *spa, vdev_t *vd, uint64_t txg, int error)
 	vdev_autotrim_restart(spa);
 
 	spa_vdev_config_exit(spa, vd, txg, error, FTAG);
+
+	/* The pool failed before the change was committed. */
+	if (error == 0 && spa_failed(spa) && txg > spa_last_synced_txg(spa))
+		error = SET_ERROR(EIO);
+
 	mutex_exit(&spa_namespace_lock);
 	mutex_exit(&spa->spa_vdev_top_lock);
 
@@ -2271,6 +2318,7 @@ void
 spa_init(int mode)
 {
 	mutex_init(&spa_namespace_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&spa_namespace_avl_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa_spare_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa_l2cache_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&spa_namespace_cv, NULL, CV_DEFAULT, NULL);
@@ -2347,6 +2395,7 @@ spa_fini(void)
 
 	cv_destroy(&spa_namespace_cv);
 	mutex_destroy(&spa_namespace_lock);
+	mutex_destroy(&spa_namespace_avl_lock);
 	mutex_destroy(&spa_spare_lock);
 	mutex_destroy(&spa_l2cache_lock);
 }
