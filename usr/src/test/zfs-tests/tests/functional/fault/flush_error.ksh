@@ -18,7 +18,8 @@
 # DESCRIPTION:
 #	zinject can inject errors into the cache flushes of a device
 #	("-T ioctl"), and a failed cache flush, injected or real, does not
-#	make ZFS probe or reopen the device.
+#	make ZFS probe or reopen the device.  A flush that the device doesn't
+#	support completes as a success, since it has no write cache to flush.
 #
 # STRATEGY:
 #	1. Create a pool on a file and inject EIO into its flushes.  (A file
@@ -31,7 +32,8 @@
 #	   probed nor reopened, that the pool has no errors and that the
 #	   files can be read.
 #	4. Repeat 2 and 3 without injection on a pool on a ramdisk, which
-#	   does not support cache flushes, so every flush fails with ENOTSUP.
+#	   does not support cache flushes: each flush gets ENOTTY or ENOTSUP
+#	   from the device, and must then complete without an error.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -43,7 +45,7 @@ RAMDISK=zts_flush_error
 RDPOOL=${TESTPOOL}_rd
 DOUT=$TEST_BASE_DIR/flush_error.dtrace.out
 typeset dtrace_pid=""
-typeset -i flusherr eio probe reopen
+typeset -i flusherr eio notsup probe reopen
 
 function cleanup
 {
@@ -64,7 +66,7 @@ function cleanup
 # Count, for one pool, the leaf vdev flushes (ZIO_TYPE_IOCTL zios, 5) that
 # failed (in all, and with EIO) and the calls to vdev_probe() and
 # vdev_reopen(), while files are written and the pool synced.  Sets
-# flusherr, eio, probe and reopen.
+# flusherr, eio, notsup (flushes the device doesn't support), probe and reopen.
 #
 function count_flush_errors # pool
 {
@@ -83,6 +85,12 @@ function count_flush_errors # pool
 	    args[0]->io_vd->vdev_children == 0 && args[0]->io_error == 5 &&
 	    stringof(args[0]->io_spa->spa_name) == $$1/
 	    { @eio = count(); }
+	    fbt::zio_vdev_io_assess:entry
+	    /args[0]->io_type == 5 && args[0]->io_vd != NULL &&
+	    args[0]->io_vd->vdev_children == 0 &&
+	    (args[0]->io_error == 25 || args[0]->io_error == 48) &&
+	    stringof(args[0]->io_spa->spa_name) == $$1/
+	    { @notsup = count(); }
 	    fbt::vdev_probe:entry
 	    /stringof(args[0]->vdev_spa->spa_name) == $$1/
 	    { @probe = count(); }
@@ -92,6 +100,7 @@ function count_flush_errors # pool
 	    END {
 		printa("flusherr %@d\n", @flusherr);
 		printa("eio %@d\n", @eio);
+		printa("notsup %@d\n", @notsup);
 		printa("probe %@d\n", @probe);
 		printa("reopen %@d\n", @reopen);
 	    }' $pool &
@@ -120,10 +129,11 @@ function count_flush_errors # pool
 
 	flusherr=$(nawk '$1 == "flusherr" {print $2}' $DOUT)
 	eio=$(nawk '$1 == "eio" {print $2}' $DOUT)
+	notsup=$(nawk '$1 == "notsup" {print $2}' $DOUT)
 	probe=$(nawk '$1 == "probe" {print $2}' $DOUT)
 	reopen=$(nawk '$1 == "reopen" {print $2}' $DOUT)
 	log_note "$pool: failed flushes $flusherr (EIO $eio)," \
-	    "probes $probe, reopens $reopen"
+	    "unsupported $notsup, probes $probe, reopens $reopen"
 }
 
 function check_pool # pool
@@ -162,7 +172,8 @@ log_note "Flushing a ramdisk, which does not support cache flushes"
 log_must ramdiskadm -a $RAMDISK 256m
 log_must zpool create -f $RDPOOL /dev/ramdisk/$RAMDISK
 count_flush_errors $RDPOOL
-((flusherr > 0)) || log_fail "flushes of the ramdisk did not fail"
+((notsup > 0)) || log_fail "the ramdisk supports cache flushes"
+((flusherr == 0)) || log_fail "unsupported flushes of the ramdisk failed"
 ((probe == 0 && reopen == 0)) || \
     log_fail "flush errors probed or reopened the ramdisk"
 check_pool $RDPOOL
