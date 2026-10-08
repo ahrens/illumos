@@ -118,6 +118,7 @@
 #include <sys/zfeature.h>
 #include <sys/dsl_userhold.h>
 #include <sys/abd.h>
+#include <sys/zfs_ioctl.h>
 #include <stdio.h>
 #include <stdio_ext.h>
 #include <stdlib.h>
@@ -177,6 +178,7 @@ typedef struct ztest_shared_opts {
 	uint64_t zo_metaslab_force_ganging;
 	int zo_mmp_test;
 	int zo_special_vdevs;
+	int zo_no_force_exit;
 } ztest_shared_opts_t;
 
 static const ztest_shared_opts_t ztest_opts_defaults = {
@@ -376,6 +378,7 @@ ztest_func_t ztest_spa_checkpoint_create_discard;
 ztest_func_t ztest_initialize;
 ztest_func_t ztest_trim;
 ztest_func_t ztest_verify_dnode_bt;
+ztest_func_t ztest_force_exit;
 
 uint64_t zopt_always = 0ULL * NANOSEC;		/* all the time */
 uint64_t zopt_incessant = 1ULL * NANOSEC / 10;	/* every 1/10 second */
@@ -427,7 +430,8 @@ ztest_info_t ztest_info[] = {
 	{ ztest_spa_checkpoint_create_discard,	1,	&zopt_rarely	},
 	{ ztest_initialize,			1,	&zopt_sometimes },
 	{ ztest_trim,				1,	&zopt_sometimes },
-	{ ztest_verify_dnode_bt,		1,	&zopt_sometimes }
+	{ ztest_verify_dnode_bt,		1,	&zopt_sometimes },
+	{ ztest_force_exit,			1,	&zopt_rarely	}
 };
 
 #define	ZTEST_FUNCS	(sizeof (ztest_info) / sizeof (ztest_info_t))
@@ -487,6 +491,22 @@ static krwlock_t ztest_name_lock;
 
 static boolean_t ztest_dump_core = B_TRUE;
 static boolean_t ztest_exiting;
+
+/*
+ * ztest_force_exit() parks the other test threads between tests while it
+ * fails the pool, exports it and imports it again.  ztest_fe_lock protects
+ * the parking state.  ztest_spa_lock is held as writer while ztest_spa is
+ * replaced, and as reader by the background threads that use it.
+ * ztest_run() holds the pool with ZTEST_SPA_TAG.
+ */
+static kmutex_t ztest_fe_lock;
+static kcondvar_t ztest_fe_cv;
+static boolean_t ztest_fe_pending;
+static boolean_t ztest_fe_ready;	/* every dataset is open */
+static int ztest_fe_parked;
+static int ztest_fe_running;
+static krwlock_t ztest_spa_lock;
+#define	ZTEST_SPA_TAG	((void *)&ztest_spa)
 
 /* Global commit callback list */
 static ztest_cb_list_t zcl;
@@ -631,6 +651,7 @@ usage(boolean_t requested)
 	    "\t[-M] Multi-host simulate pool imported on remote host\n"
 	    "\t[-V] verbose (use multiple times for ever more blather)\n"
 	    "\t[-E] use existing pool instead of creating new one\n"
+	    "\t[-x] don't fail, export and import the pool (forced exit)\n"
 	    "\t[-T time (default: %llu sec)] total run time\n"
 	    "\t[-F freezeloops (default: %llu)] max loops in spa_freeze()\n"
 	    "\t[-P passtime (default: %llu sec)] time per pass\n"
@@ -713,7 +734,7 @@ process_options(int argc, char **argv)
 	bcopy(&ztest_opts_defaults, zo, sizeof (*zo));
 
 	while ((opt = getopt(argc, argv,
-	    "v:s:a:m:r:R:d:t:g:i:k:p:f:MVET:P:hF:B:C:o:")) != EOF) {
+	    "v:s:a:m:r:R:d:t:g:i:k:p:f:MVExT:P:hF:B:C:o:")) != EOF) {
 		value = 0;
 		switch (opt) {
 		case 'v':
@@ -790,6 +811,9 @@ process_options(int argc, char **argv)
 			break;
 		case 'E':
 			zo->zo_init = 0;
+			break;
+		case 'x':
+			zo->zo_no_force_exit = 1;
 			break;
 		case 'T':
 			zo->zo_time = value;
@@ -6553,14 +6577,15 @@ ztest_resume(spa_t *spa)
 	(void) zio_resume(spa);
 }
 
+/* ARGSUSED */
 static void *
 ztest_resume_thread(void *arg)
 {
-	spa_t *spa = arg;
-
 	while (!ztest_exiting) {
-		if (spa_suspended(spa))
-			ztest_resume(spa);
+		rw_enter(&ztest_spa_lock, RW_READER);
+		if (spa_suspended(ztest_spa))
+			ztest_resume(ztest_spa);
+		rw_exit(&ztest_spa_lock);
 		(void) poll(NULL, 0, 100);
 
 		/*
@@ -6582,7 +6607,7 @@ static void *
 ztest_deadman_thread(void *arg)
 {
 	ztest_shared_t *zs = arg;
-	spa_t *spa = ztest_spa;
+	spa_t *spa;
 	hrtime_t delta, total = 0;
 
 	for (;;) {
@@ -6590,6 +6615,9 @@ ztest_deadman_thread(void *arg)
 		    MSEC2NSEC(zfs_deadman_synctime_ms);
 
 		(void) poll(NULL, 0, (int)NSEC2MSEC(delta));
+
+		rw_enter(&ztest_spa_lock, RW_READER);
+		spa = ztest_spa;
 
 		/*
 		 * If the pool is suspended then fail immediately. Otherwise,
@@ -6604,6 +6632,7 @@ ztest_deadman_thread(void *arg)
 			return (NULL);
 		}
 		vdev_deadman(spa->spa_root_vdev);
+		rw_exit(&ztest_spa_lock);
 
 		total += zfs_deadman_synctime_ms/1000;
 		(void) printf("ztest has been running for %lld seconds\n",
@@ -6634,6 +6663,23 @@ ztest_execute(int test, ztest_info_t *zi, uint64_t id)
 	}
 }
 
+/*
+ * Wait here, between tests, while ztest_force_exit() runs.
+ */
+static void
+ztest_force_exit_park(void)
+{
+	mutex_enter(&ztest_fe_lock);
+	if (ztest_fe_pending) {
+		ztest_fe_parked++;
+		cv_broadcast(&ztest_fe_cv);
+		while (ztest_fe_pending)
+			cv_wait(&ztest_fe_cv, &ztest_fe_lock);
+		ztest_fe_parked--;
+	}
+	mutex_exit(&ztest_fe_lock);
+}
+
 static void *
 ztest_thread(void *arg)
 {
@@ -6645,7 +6691,15 @@ ztest_thread(void *arg)
 	ztest_info_t *zi;
 	ztest_shared_callstate_t *zc;
 
-	while ((now = gethrtime()) < zs->zs_thread_stop) {
+	mutex_enter(&ztest_fe_lock);
+	ztest_fe_running++;
+	mutex_exit(&ztest_fe_lock);
+
+	for (;;) {
+		ztest_force_exit_park();
+		if ((now = gethrtime()) >= zs->zs_thread_stop)
+			break;
+
 		/*
 		 * See if it's time to force a crash.
 		 */
@@ -6672,6 +6726,11 @@ ztest_thread(void *arg)
 			ztest_execute(rand, zi, id);
 		}
 	}
+
+	mutex_enter(&ztest_fe_lock);
+	ztest_fe_running--;
+	cv_broadcast(&ztest_fe_cv);
+	mutex_exit(&ztest_fe_lock);
 
 	return (NULL);
 }
@@ -6797,6 +6856,211 @@ ztest_dataset_close(int d)
 }
 
 /*
+ * Collect the guids of vd's leaf vdevs, or with guids == NULL, just count
+ * them.
+ */
+static int
+ztest_force_exit_leaves(vdev_t *vd, uint64_t *guids)
+{
+	int n = 0;
+
+	if (vd->vdev_ops->vdev_op_leaf) {
+		if (guids != NULL)
+			guids[0] = vd->vdev_guid;
+		return (1);
+	}
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		n += ztest_force_exit_leaves(vd->vdev_child[c],
+		    guids == NULL ? NULL : guids + n);
+	}
+	return (n);
+}
+
+/*
+ * Fail the pool at a random point, while it is syncing whatever the tests
+ * left dirty, then export it, and import it again.  Every leaf vdev gets
+ * write errors, so the pool can't write.  The pool fails either because it
+ * has failmode=death, or because it was armed for forced exit (as by "zpool
+ * export -F") and then suspended.  Half the time, the ARC is flushed first,
+ * so that syncing context finds nothing cached.
+ *
+ * The other test threads are parked between tests meanwhile, so that they
+ * don't have to cope with a pool that fails under them.  The pool must
+ * import at the last txg that synced before it failed: nothing written after
+ * that can reach the disks.  The parent runs zdb on the pool after the pass.
+ */
+/* ARGSUSED */
+void
+ztest_force_exit(ztest_ds_t *zd, uint64_t id)
+{
+	ztest_shared_opts_t *zo = &ztest_opts;
+	int datasets = MIN(zo->zo_datasets, zo->zo_threads);
+	boolean_t death = ztest_random(2);
+	boolean_t flush = ztest_random(2);
+	uint64_t *guids;
+	int *ids;
+	int nguids;
+	nvlist_t *config;
+	spa_t *spa;
+	uint64_t pool_guid, failmode, txg, birth, ondisk;
+	clock_t deadline;
+	boolean_t parked;
+
+	if (zo->zo_no_force_exit || zo->zo_mmp_test)
+		return;
+
+	/*
+	 * Park the other threads.  A thread that is in the middle of a long
+	 * test can keep us waiting, in which case we give up.
+	 */
+	mutex_enter(&ztest_fe_lock);
+	if (ztest_fe_pending || !ztest_fe_ready) {
+		mutex_exit(&ztest_fe_lock);
+		return;
+	}
+	ztest_fe_pending = B_TRUE;
+	deadline = ddi_get_lbolt() + SEC_TO_TICK(60);
+	while (ztest_fe_parked < ztest_fe_running - 1 &&
+	    cv_timedwait(&ztest_fe_cv, &ztest_fe_lock, deadline) != -1)
+		continue;
+	parked = (ztest_fe_parked == ztest_fe_running - 1);
+	mutex_exit(&ztest_fe_lock);
+	if (!parked) {
+		if (zo->zo_verbose >= 3) {
+			(void) printf("forced exit: test threads didn't "
+			    "park\n");
+		}
+		goto out;
+	}
+
+	rw_enter(&ztest_spa_lock, RW_WRITER);
+	spa = ztest_spa;
+	pool_guid = spa_guid(spa);
+	failmode = spa->spa_failmode;
+
+	if (zo->zo_verbose >= 3) {
+		(void) printf("forced exit: failing %s (%s%s)\n",
+		    spa_name(spa), death ? "failmode=death" : "armed",
+		    flush ? ", ARC flushed" : "");
+	}
+
+	/*
+	 * Make every write to the pool's disks fail.  The probe that follows
+	 * a write error (see vdev_probe()) has to fail too, as it does when a
+	 * disk dies: otherwise the vdevs look healthy, and failed writes are
+	 * reissued forever instead of failing the pool.  The probe uses the
+	 * vl_be area of the labels.
+	 */
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	nguids = ztest_force_exit_leaves(spa->spa_root_vdev, NULL);
+	guids = umem_alloc(nguids * sizeof (uint64_t), UMEM_NOFAIL);
+	VERIFY3S(ztest_force_exit_leaves(spa->spa_root_vdev, guids), ==,
+	    nguids);
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+
+	if (death) {
+		spa->spa_failmode = ZIO_FAILURE_MODE_DEATH;
+	} else {
+		spa->spa_failmode = ZIO_FAILURE_MODE_WAIT;
+		spa_exit_arm(spa);
+	}
+	if (flush)
+		arc_flush(spa, B_FALSE);
+
+	ids = umem_alloc(2 * nguids * sizeof (int), UMEM_NOFAIL);
+	for (int i = 0; i < nguids; i++) {
+		zinject_record_t record = { 0 };
+
+		record.zi_cmd = ZINJECT_DEVICE_FAULT;
+		record.zi_guid = guids[i];
+		record.zi_error = EIO;
+		record.zi_iotype = ZIO_TYPE_WRITE;
+		VERIFY0(zio_inject_fault(spa_name(spa), 0, &ids[2 * i],
+		    &record));
+
+		bzero(&record, sizeof (record));
+		record.zi_cmd = ZINJECT_LABEL_FAULT;
+		record.zi_guid = guids[i];
+		record.zi_error = EIO;
+		record.zi_start = offsetof(vdev_label_t, vl_be);
+		record.zi_end = record.zi_start + VDEV_PAD_SIZE - 1;
+		VERIFY0(zio_inject_fault(spa_name(spa), 0, &ids[2 * i + 1],
+		    &record));
+	}
+
+	/*
+	 * Whatever the tests left dirty will fail the pool when it syncs.
+	 * If they left nothing, dirty the pool ourselves.
+	 */
+	for (int i = 0; !spa_failed(spa); i++) {
+		if (i == 60)
+			fatal(0, "forced exit: pool didn't fail");
+		(void) spa_history_log(spa, "ztest forced exit");
+		if (!spa_failed(spa))
+			(void) poll(NULL, 0, 1000);
+	}
+
+	/*
+	 * Nothing reaches the disks now, injected or not.  The injection
+	 * handlers hold the pool, so they have to go before the export.
+	 */
+	for (int i = 0; i < 2 * nguids; i++)
+		VERIFY0(zio_clear_fault(ids[i]));
+	umem_free(ids, 2 * nguids * sizeof (int));
+	umem_free(guids, nguids * sizeof (uint64_t));
+
+	/*
+	 * The last txg that synced, and the last one that changed anything
+	 * (a txg that changes nothing doesn't write the uberblock).
+	 */
+	txg = spa_last_synced_txg(spa);
+	birth = spa->spa_ubsync.ub_rootbp.blk_birth;
+
+	for (int d = 0; d < datasets; d++)
+		ztest_dataset_close(d);
+	spa_close(spa, ZTEST_SPA_TAG);
+	ztest_spa = NULL;
+
+	VERIFY0(spa_export(zo->zo_pool, &config, B_FALSE, B_TRUE));
+
+	if (zo->zo_verbose >= 3) {
+		(void) printf("forced exit: importing %s, last synced txg "
+		    "%llu, last changed in %llu\n", zo->zo_pool,
+		    (u_longlong_t)txg, (u_longlong_t)birth);
+	}
+	VERIFY0(spa_import(zo->zo_pool, config, NULL, 0));
+	nvlist_free(config);
+	VERIFY0(spa_open(zo->zo_pool, &spa, ZTEST_SPA_TAG));
+	VERIFY3U(spa_guid(spa), ==, pool_guid);
+	VERIFY(!spa_failed(spa));
+
+	/*
+	 * The disks held the pool as of the last txg that synced: nothing
+	 * written after it reached them, and nothing before it was lost.
+	 */
+	ondisk = spa_first_txg(spa) - 1;
+	if (ondisk < birth || ondisk > txg) {
+		fatal(0, "forced exit: pool imported at txg %llu, but the "
+		    "last txg that synced before it failed was %llu (last "
+		    "changed in %llu)", (u_longlong_t)ondisk,
+		    (u_longlong_t)txg, (u_longlong_t)birth);
+	}
+	spa->spa_failmode = failmode;
+	spa->spa_dedup_ditto = 2 * ZIO_DEDUPDITTO_MIN;
+	ztest_spa = spa;
+	rw_exit(&ztest_spa_lock);
+
+	for (int d = 0; d < datasets; d++)
+		VERIFY0(ztest_dataset_open(d));
+
+out:
+	mutex_enter(&ztest_fe_lock);
+	ztest_fe_pending = B_FALSE;
+	cv_broadcast(&ztest_fe_cv);
+	mutex_exit(&ztest_fe_lock);
+}
+
+/*
  * Kick off threads to run tests on all datasets in parallel.
  */
 static void
@@ -6816,6 +7080,13 @@ ztest_run(ztest_shared_t *zs)
 	mutex_init(&ztest_checkpoint_lock, NULL, USYNC_THREAD, NULL);
 	mutex_init(&ztest_vdev_lock, NULL, USYNC_THREAD, NULL);
 	rw_init(&ztest_name_lock, NULL, USYNC_THREAD, NULL);
+	mutex_init(&ztest_fe_lock, NULL, USYNC_THREAD, NULL);
+	cv_init(&ztest_fe_cv, NULL, USYNC_THREAD, NULL);
+	rw_init(&ztest_spa_lock, NULL, USYNC_THREAD, NULL);
+	ztest_fe_pending = B_FALSE;
+	ztest_fe_ready = B_FALSE;
+	ztest_fe_parked = 0;
+	ztest_fe_running = 0;
 
 	zs->zs_thread_start = gethrtime();
 	zs->zs_thread_stop =
@@ -6836,7 +7107,7 @@ ztest_run(ztest_shared_t *zs)
 	 * Open our pool.
 	 */
 	kernel_init(FREAD | FWRITE);
-	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, FTAG));
+	VERIFY0(spa_open(ztest_opts.zo_pool, &spa, ZTEST_SPA_TAG));
 	metaslab_preload_limit = ztest_random(20) + 1;
 	ztest_spa = spa;
 
@@ -6864,7 +7135,7 @@ ztest_run(ztest_shared_t *zs)
 	/*
 	 * Create a thread to periodically resume suspended I/O.
 	 */
-	VERIFY(thr_create(0, 0, ztest_resume_thread, spa, THR_BOUND,
+	VERIFY(thr_create(0, 0, ztest_resume_thread, NULL, THR_BOUND,
 	    &resume_tid) == 0);
 
 	/*
@@ -6936,6 +7207,14 @@ ztest_run(ztest_shared_t *zs)
 	}
 
 	/*
+	 * ztest_force_exit() can't run while we're still opening datasets
+	 * here, or before every test thread is there to be parked.
+	 */
+	mutex_enter(&ztest_fe_lock);
+	ztest_fe_ready = B_TRUE;
+	mutex_exit(&ztest_fe_lock);
+
+	/*
 	 * Wait for all of the tests to complete.  We go in reverse order
 	 * so we don't close datasets while threads are still using them.
 	 */
@@ -6945,6 +7224,8 @@ ztest_run(ztest_shared_t *zs)
 			ztest_dataset_close(t);
 	}
 
+	/* ztest_force_exit() may have replaced the pool's spa_t. */
+	spa = ztest_spa;
 	txg_wait_synced(spa_get_dsl(spa), 0);
 
 	zs->zs_alloc = metaslab_class_get_alloc(spa_normal_class(spa));
@@ -6967,7 +7248,7 @@ ztest_run(ztest_shared_t *zs)
 		    ZIO_PRIORITY_SYNC_READ);
 	}
 
-	spa_close(spa, FTAG);
+	spa_close(spa, ZTEST_SPA_TAG);
 
 	/*
 	 * Verify that we can loop over all pools.
@@ -6996,6 +7277,9 @@ ztest_run(ztest_shared_t *zs)
 
 	mutex_destroy(&zcl.zcl_callbacks_lock);
 
+	rw_destroy(&ztest_spa_lock);
+	cv_destroy(&ztest_fe_cv);
+	mutex_destroy(&ztest_fe_lock);
 	rw_destroy(&ztest_name_lock);
 	mutex_destroy(&ztest_vdev_lock);
 	mutex_destroy(&ztest_checkpoint_lock);
