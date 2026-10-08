@@ -28,6 +28,7 @@
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2016 Nexenta Systems, Inc.
  * Copyright (c) 2017 Datto Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_LIBZFS_H
@@ -421,6 +422,7 @@ extern boolean_t zpool_is_bootable(zpool_handle_t *);
  */
 extern int zpool_export(zpool_handle_t *, boolean_t, const char *);
 extern int zpool_export_force(zpool_handle_t *, const char *);
+extern int zpool_force_exit(zpool_handle_t *);
 extern int zpool_import(libzfs_handle_t *, nvlist_t *, const char *,
     char *altroot);
 extern int zpool_import_props(libzfs_handle_t *, nvlist_t *, const char *,

@@ -16,6 +16,7 @@
 /*
  * Copyright (c) 2018 by Delphix. All rights reserved.
  * Copyright 2020 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <errno.h>
@@ -83,6 +84,7 @@ static unsigned ioc_skip[] = {
 	ZFS_IOC_INJECT_LIST_NEXT,
 	ZFS_IOC_ERROR_LOG,
 	ZFS_IOC_CLEAR,
+	ZFS_IOC_POOL_FORCE_EXIT,
 	ZFS_IOC_PROMOTE,
 	ZFS_IOC_DSOBJ_TO_DSNAME,
 	ZFS_IOC_OBJ_TO_PATH,
@@ -995,6 +997,7 @@ validate_ioc_values(void)
 	CHECK(ZFS_IOC_BASE + 80 == ZFS_IOC_REDACT);
 	CHECK(ZFS_IOC_BASE + 81 == ZFS_IOC_GET_BOOKMARK_PROPS);
 	CHECK(ZFS_IOC_BASE + 82 == ZFS_IOC_WAIT);
+	CHECK(ZFS_IOC_BASE + 83 == ZFS_IOC_POOL_FORCE_EXIT);
 #endif
 	CHECK(ZFS_IOC_PLATFORM_BASE + 7 == ZFS_IOC_SET_BOOTENV);
 	CHECK(ZFS_IOC_PLATFORM_BASE + 8 == ZFS_IOC_GET_BOOTENV);
