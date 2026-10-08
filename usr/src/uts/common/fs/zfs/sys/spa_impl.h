@@ -369,6 +369,8 @@ struct spa {
 	zio_suspend_reason_t	spa_suspended;	/* pool is suspended */
 	spa_exit_state_t spa_exit;		/* forced exit state */
 	uint64_t	spa_exit_offset;	/* next fake DVA offset */
+	uint_t		spa_exit_holds;		/* see spa_exit_hold() */
+	boolean_t	spa_exit_unloading;	/* no more spa_exit_hold()s */
 	uint8_t		spa_claiming;		/* pool is doing zil_claim() */
 	boolean_t	spa_is_root;		/* pool is root */
 	int		spa_minref;		/* num refs when first opened */

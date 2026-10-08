@@ -24,6 +24,7 @@
 # Copyright (c) 2011, 2017 by Delphix. All rights reserved.
 # Copyright 2016 Nexenta Systems, Inc.
 # Copyright 2020 Joyent, Inc.
+# Copyright 2026 Oxide Computer Company
 #
 
 #
@@ -234,6 +235,7 @@ $endif
 	zpool_export_force;
 	zpool_find_vdev;
 	zpool_find_vdev_by_physpath;
+	zpool_force_exit;
 	zpool_fru_set;
 	zpool_get_bootenv;
 	zpool_get_config;

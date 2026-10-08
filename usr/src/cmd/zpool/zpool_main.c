@@ -32,6 +32,7 @@
  * Copyright 2020 Joyent, Inc.
  * Copyright (c) 2012 by Cyril Plisko. All rights reserved.
  * Copyright 2019 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <assert.h>
@@ -1625,6 +1626,36 @@ zpool_export_one(zpool_handle_t *zhp, void *data)
 	if (cb->rootpool != NULL &&
 	    strcmp(zpool_get_name(zhp), cb->rootpool) == 0)
 		return (0);
+
+	/*
+	 * With -F, arm the pool before unmounting its file systems: if it is
+	 * suspended, unmounting would otherwise wait for it forever.  It fails
+	 * instead, and its unsynced changes are lost.
+	 */
+	if (cb->hardforce && zpool_force_exit(zhp) != 0)
+		return (1);
+
+	/*
+	 * Without -F, a suspended pool can't be exported (the kernel refuses
+	 * with EAGAIN), and unmounting its file systems would wait for it to
+	 * resume.  Leave them mounted and fail now.
+	 */
+	if (!cb->hardforce) {
+		zpool_errata_t errata;
+		char *msgid;
+
+		switch (zpool_get_status(zhp, &msgid, &errata)) {
+		case ZPOOL_STATUS_IO_FAILURE_WAIT:
+		case ZPOOL_STATUS_IO_FAILURE_CONTINUE:
+		case ZPOOL_STATUS_IO_FAILURE_MMP:
+			(void) fprintf(stderr, gettext("cannot export '%s': "
+			    "pool is suspended; use '-F' to discard unsynced "
+			    "changes\n"), zpool_get_name(zhp));
+			return (1);
+		default:
+			break;
+		}
+	}
 
 	/*
 	 * zpool_disable_datasets() is not thread-safe for mnttab access.

@@ -5497,6 +5497,20 @@ zfs_ioc_clear(zfs_cmd_t *zc)
 	return (error);
 }
 
+/*
+ * inputs:
+ * zc_name		name of the pool
+ *
+ * Arm the pool for forced exit ("zpool export -F"): it fails, dropping its
+ * unsynced changes, if it is or becomes suspended.  This doesn't take
+ * spa_namespace_lock, which may be held by a thread waiting on the pool.
+ */
+static int
+zfs_ioc_pool_force_exit(zfs_cmd_t *zc)
+{
+	return (spa_exit_arm_by_name(zc->zc_name));
+}
+
 static int
 zfs_ioc_pool_reopen(zfs_cmd_t *zc)
 {
@@ -7008,6 +7022,15 @@ zfs_ioctl_init(void)
 	    zfs_secpolicy_config, B_TRUE, POOL_CHECK_READONLY);
 	zfs_ioctl_register_pool(ZFS_IOC_POOL_REOPEN, zfs_ioc_pool_reopen,
 	    zfs_secpolicy_config, B_TRUE, POOL_CHECK_SUSPENDED);
+
+	/*
+	 * No pool check and no history: either would need the pool, which
+	 * may be suspended (logging history would wait for it under
+	 * failmode=wait).
+	 */
+	zfs_ioctl_register_pool(ZFS_IOC_POOL_FORCE_EXIT,
+	    zfs_ioc_pool_force_exit, zfs_secpolicy_config, B_FALSE,
+	    POOL_CHECK_NONE);
 
 	zfs_ioctl_register_dataset_read(ZFS_IOC_SPACE_WRITTEN,
 	    zfs_ioc_space_written);

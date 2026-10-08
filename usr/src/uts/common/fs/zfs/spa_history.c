@@ -24,6 +24,7 @@
  * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2017 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/spa.h>
@@ -392,6 +393,7 @@ spa_history_log_nvl(spa_t *spa, nvlist_t *nvl)
 	int err = 0;
 	dmu_tx_t *tx;
 	nvlist_t *nvarg, *in_nvl = NULL;
+	boolean_t waited = B_FALSE;
 
 	if (spa_version(spa) < SPA_VERSION_ZPOOL_HISTORY || !spa_writeable(spa))
 		return (SET_ERROR(EINVAL));
@@ -401,10 +403,25 @@ spa_history_log_nvl(spa_t *spa, nvlist_t *nvl)
 		(void) nvlist_remove_all(in_nvl, ZPOOL_HIDDEN_ARGS);
 	}
 
+	/*
+	 * Don't wait for a suspended pool to resume: the command that logs
+	 * this entry would wait too, and "zpool export" of a suspended pool
+	 * must return EAGAIN instead of hanging.  The entry is lost then.
+	 */
+top:
 	tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
-	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	err = dmu_tx_assign(tx, waited ? DMU_TX_NOTHROTTLE : DMU_TX_NOWAIT);
+	if (err == ERESTART && !spa_suspended(spa)) {
+		waited = B_TRUE;
+		dmu_tx_wait(tx);
+		dmu_tx_abort(tx);
+		goto top;
+	}
 	if (err) {
 		dmu_tx_abort(tx);
+		/* ERESTART would reach userland as a bogus errno. */
+		if (err == ERESTART)
+			err = SET_ERROR(EAGAIN);
 		return (err);
 	}
 

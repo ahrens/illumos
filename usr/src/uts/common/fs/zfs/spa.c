@@ -1161,6 +1161,17 @@ spa_activate(spa_t *spa, int mode)
 	spa->spa_state = POOL_STATE_ACTIVE;
 	spa->spa_mode = mode;
 
+	/*
+	 * A pool that failed and was reset (see spa_reset()), or whose load is
+	 * being retried, starts out healthy.  Nothing can arm it yet: it has
+	 * no DSL pool (see spa_exit_hold()).
+	 */
+	mutex_enter(&spa->spa_suspend_lock);
+	spa->spa_exit = SPA_EXIT_NONE;
+	mutex_exit(&spa->spa_suspend_lock);
+	spa->spa_exit_offset = 0;
+	spa->spa_exit_unloading = B_FALSE;
+
 	spa->spa_normal_class = metaslab_class_create(spa, zfs_metaslab_ops);
 	spa->spa_log_class = metaslab_class_create(spa, zfs_metaslab_ops);
 	spa->spa_special_class = metaslab_class_create(spa, zfs_metaslab_ops);
@@ -1446,6 +1457,9 @@ spa_unload(spa_t *spa)
 
 	spa_import_progress_remove(spa);
 	spa_load_note(spa, "UNLOADING");
+
+	/* Nothing can arm the pool once its DSL pool is gone. */
+	spa_exit_unload_wait(spa);
 
 	spa_wake_waiters(spa);
 

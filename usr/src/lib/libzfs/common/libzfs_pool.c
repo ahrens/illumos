@@ -28,7 +28,7 @@
  * Copyright (c) 2017 Datto Inc.
  * Copyright (c) 2017, Intel Corporation.
  * Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
- * Copyright 2022 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <ctype.h>
@@ -1590,6 +1590,28 @@ int
 zpool_export_force(zpool_handle_t *zhp, const char *log_str)
 {
 	return (zpool_export_common(zhp, B_TRUE, B_TRUE, log_str));
+}
+
+/*
+ * Arm the pool for forced exit: if it is suspended, or becomes suspended, it
+ * fails rather than waiting to be resumed, and can then be exported.  This
+ * goes straight to the kernel, without waiting for the pool or for an import
+ * or export in progress.
+ */
+int
+zpool_force_exit(zpool_handle_t *zhp)
+{
+	zfs_cmd_t zc = { 0 };
+	char msg[1024];
+
+	(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
+	    "cannot force '%s' to exit"), zhp->zpool_name);
+
+	(void) strlcpy(zc.zc_name, zhp->zpool_name, sizeof (zc.zc_name));
+	if (zfs_ioctl(zhp->zpool_hdl, ZFS_IOC_POOL_FORCE_EXIT, &zc) != 0)
+		return (zpool_standard_error_fmt(zhp->zpool_hdl, errno, msg));
+
+	return (0);
 }
 
 static void
