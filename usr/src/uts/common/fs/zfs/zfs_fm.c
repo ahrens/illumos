@@ -25,6 +25,7 @@
 
 /*
  * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/spa.h>
@@ -181,7 +182,9 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 		    spa_get_failmode(spa) == ZIO_FAILURE_MODE_WAIT ?
 		    FM_EREPORT_FAILMODE_WAIT :
 		    spa_get_failmode(spa) == ZIO_FAILURE_MODE_CONTINUE ?
-		    FM_EREPORT_FAILMODE_CONTINUE : FM_EREPORT_FAILMODE_PANIC,
+		    FM_EREPORT_FAILMODE_CONTINUE :
+		    spa_get_failmode(spa) == ZIO_FAILURE_MODE_DEATH ?
+		    FM_EREPORT_FAILMODE_DEATH : FM_EREPORT_FAILMODE_PANIC,
 		    NULL);
 	}
 

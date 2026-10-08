@@ -3184,6 +3184,9 @@ dsl_scan_active(dsl_scan_t *scn)
 		return (B_FALSE);
 	if (spa_shutting_down(spa))
 		return (B_FALSE);
+	/* A failed pool doesn't scan; see spa_sync_iterate_to_convergence(). */
+	if (spa_failed(spa))
+		return (B_FALSE);
 	if ((dsl_scan_is_running(scn) && !dsl_scan_is_paused_scrub(scn)) ||
 	    (scn->scn_async_destroying && !scn->scn_async_stalled))
 		return (B_TRUE);

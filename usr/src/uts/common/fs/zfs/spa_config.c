@@ -24,6 +24,7 @@
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
  * Copyright 2017 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/spa.h>
@@ -524,7 +525,7 @@ spa_config_update(spa_t *spa, int what)
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
 
 	spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
-	txg = spa_last_synced_txg(spa) + 1;
+	txg = spa_config_change_txg(spa);
 	if (what == SPA_CONFIG_UPDATE_POOL) {
 		vdev_config_dirty(rvd);
 	} else {

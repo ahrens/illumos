@@ -147,6 +147,7 @@ enum zio_checksum {
 #define	ZIO_FAILURE_MODE_WAIT		0
 #define	ZIO_FAILURE_MODE_CONTINUE	1
 #define	ZIO_FAILURE_MODE_PANIC		2
+#define	ZIO_FAILURE_MODE_DEATH		3
 
 typedef enum zio_suspend_reason {
 	ZIO_SUSPEND_NONE = 0,
@@ -616,6 +617,7 @@ extern enum zio_compress zio_compress_select(spa_t *spa,
 extern void zio_suspend(spa_t *spa, zio_t *zio, zio_suspend_reason_t);
 extern int zio_resume(spa_t *spa);
 extern void zio_resume_wait(spa_t *spa);
+extern void zio_exit_reexecute(zio_t *pio);
 
 /*
  * Initial setup and teardown.

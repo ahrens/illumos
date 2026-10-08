@@ -161,6 +161,7 @@ static void spa_sync_props(void *arg, dmu_tx_t *tx);
 static boolean_t spa_has_active_shared_spare(spa_t *spa);
 static int spa_load_impl(spa_t *spa, spa_import_type_t type, char **ereport);
 static void spa_vdev_resilver_done(spa_t *spa);
+static int spa_export_failed_wait(spa_t *spa);
 
 uint_t		zio_taskq_batch_pct = 75;	/* 1 thread per cpu in pset */
 id_t		zio_taskq_psrset_bind = PS_NONE;
@@ -636,7 +637,7 @@ spa_prop_validate(spa_t *spa, nvlist_t *props)
 		case ZPOOL_PROP_FAILUREMODE:
 			error = nvpair_value_uint64(elem, &intval);
 			if (!error && (intval < ZIO_FAILURE_MODE_WAIT ||
-			    intval > ZIO_FAILURE_MODE_PANIC))
+			    intval > ZIO_FAILURE_MODE_DEATH))
 				error = SET_ERROR(EINVAL);
 
 			/*
@@ -652,6 +653,9 @@ spa_prop_validate(spa_t *spa, nvlist_t *props)
 			if (!error && spa_suspended(spa)) {
 				spa->spa_failmode = intval;
 				error = SET_ERROR(EIO);
+				/* A suspended pool set to death fails now. */
+				if (intval == ZIO_FAILURE_MODE_DEATH)
+					spa_fail(spa);
 			}
 			break;
 
@@ -1261,7 +1265,8 @@ spa_deactivate(spa_t *spa)
 
 	for (size_t i = 0; i < TXG_SIZE; i++) {
 		ASSERT3P(spa->spa_txg_zio[i], !=, NULL);
-		VERIFY0(zio_wait(spa->spa_txg_zio[i]));
+		int err = zio_wait(spa->spa_txg_zio[i]);
+		VERIFY(err == 0 || spa_failed(spa));
 		spa->spa_txg_zio[i] = NULL;
 	}
 
@@ -1378,6 +1383,10 @@ spa_should_flush_logs_on_unload(spa_t *spa)
 		return (B_FALSE);
 
 	if (zfs_keep_log_spacemaps_at_export)
+		return (B_FALSE);
+
+	/* A failed pool writes nothing more. */
+	if (spa_failed(spa))
 		return (B_FALSE);
 
 	return (B_TRUE);
@@ -5961,6 +5970,30 @@ spa_tryimport(nvlist_t *tryconfig)
 }
 
 /*
+ * Wait for the pool to sync what is dirty, for spa_export_common().  Give up
+ * with EAGAIN if it is or becomes suspended, unless it is armed for forced
+ * exit, in which case it fails instead, and there's nothing left to wait for.
+ */
+static int
+spa_export_sync(spa_t *spa, boolean_t armed)
+{
+	int error = txg_wait_synced_flags(spa->spa_dsl_pool, 0,
+	    TXG_WAIT_SUSPEND | TXG_WAIT_SIGNAL);
+
+	/*
+	 * We may have seen the suspension before the pool, which is armed,
+	 * failed because of it.  Make sure it has.
+	 */
+	if (error != 0 && armed)
+		spa_exit_check(spa);
+	if (error != 0 && spa_failed(spa))
+		return (0);
+	if (error == ESHUTDOWN)
+		return (SET_ERROR(EAGAIN));
+	return (error);
+}
+
+/*
  * Pool export/destroy
  *
  * The act of destroying or exporting a pool is very simple.  We make sure there
@@ -6008,43 +6041,67 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	    spa->spa_sync_on);
 
 	/*
+	 * A failed pool (see spa_fail()) is exported whatever its state: it
+	 * writes nothing more, so its labels and final txgs are left alone.
+	 * Arming a pool for forced exit makes it fail now if it is suspended,
+	 * or as soon as it suspends while we wait for it below.
+	 */
+	if (active && hardforce)
+		spa_exit_arm(spa);
+
+	/*
 	 * Objsets may be open only because they're dirty, so we have to force
 	 * it to sync before checking spa_refcnt.  First let the pool sync
 	 * without holding spa_namespace_lock, which would block administration
-	 * of every other pool if this one is slow.  If the pool is or becomes
-	 * suspended, give up.
+	 * of every other pool if this one is slow.  If it is or becomes
+	 * suspended, give up, unless we armed it.  A failed pool drains
+	 * without writing anything.
 	 */
-	if (active && txg_wait_synced_flags(spa->spa_dsl_pool, 0,
-	    TXG_WAIT_SUSPEND) != 0) {
-		mutex_enter(&spa_namespace_lock);
-		spa_close(spa, FTAG);
-		error = SET_ERROR(EAGAIN);
-		goto fail;
+	if (active && !spa_failed(spa)) {
+		error = spa_export_sync(spa, hardforce);
+		if (error != 0) {
+			mutex_enter(&spa_namespace_lock);
+			spa_close(spa, FTAG);
+			goto fail;
+		}
 	}
 
 	mutex_enter(&spa_namespace_lock);
-	spa->spa_export_thread = curthread;
 	spa_close(spa, FTAG);
+
+	/*
+	 * Whatever was dirtied while we weren't holding spa_namespace_lock
+	 * must sync too, and from here until the reference check below we
+	 * must keep holding it, so that nothing opens the pool in between.
+	 * This is normally quick, since we just synced.
+	 */
+	if (active && !spa_failed(spa)) {
+		error = spa_export_sync(spa, hardforce);
+		if (error != 0)
+			goto fail;
+	}
+
+	boolean_t failed = active && spa_failed(spa);
+
+	/*
+	 * A failed pool has nothing to sync, but its holders take a while to
+	 * let go.  Wait for them before marking the pool as being exported:
+	 * spa_lookup() waits for an export to finish, so every command that
+	 * looks the pool up, "zpool list" among them, would wait as long as
+	 * we do.  spa_is_exporting keeps other exports out meanwhile.
+	 */
+	if (failed) {
+		error = spa_export_failed_wait(spa);
+		if (error != 0)
+			goto fail;
+	}
+	spa->spa_export_thread = curthread;
 
 	/*
 	 * The pool will be in core if it's openable,
 	 * in which case we can modify its state.
 	 */
 	if (active) {
-		/*
-		 * Whatever was dirtied while we weren't holding
-		 * spa_namespace_lock must sync too, and from here until the
-		 * reference check below we must keep holding it, so that
-		 * nothing opens the pool in between.  This is normally quick,
-		 * since we just synced.  Again, give up if the pool is or
-		 * becomes suspended, rather than wait forever while holding
-		 * spa_namespace_lock.
-		 */
-		if (txg_wait_synced_flags(spa->spa_dsl_pool, 0,
-		    TXG_WAIT_SUSPEND) != 0) {
-			error = SET_ERROR(EAGAIN);
-			goto fail;
-		}
 		spa_evicting_os_wait(spa);
 
 		/*
@@ -6101,7 +6158,8 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 * so mark them all dirty.  spa_unload() will do the
 		 * final sync that pushes these changes out.
 		 */
-		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce) {
+		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce &&
+		    !failed) {
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 			spa->spa_state = new_state;
 			vdev_config_dirty(spa->spa_root_vdev);
@@ -6129,7 +6187,8 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 * waits behind its spa_sync(), and the open txg is then one
 		 * further along, which would sync a txg past spa_final_txg.
 		 */
-		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce) {
+		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce &&
+		    !failed) {
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 			spa->spa_final_txg = MAX(spa_last_synced_txg(spa) + 1,
 			    spa->spa_dsl_pool->dp_tx.tx_open_txg) +
@@ -6187,6 +6246,42 @@ fail:
 	cv_broadcast(&spa_namespace_cv);
 	mutex_exit(&spa_namespace_lock);
 	return (error);
+}
+
+/*
+ * Wait for the references on a failed pool to go away, for up to
+ * TXG_SIZE * zfs_txg_timeout seconds.  Its file systems have been unmounted,
+ * and threads that were waiting on it have been woken up and are failing out.
+ * Fault injection handlers, which also keep a pool from being exported, are
+ * waited for too.  Called and returns with spa_namespace_lock held, which is
+ * dropped while we wait.  Returns EBUSY if references remain, or EINTR.
+ */
+static int
+spa_export_failed_wait(spa_t *spa)
+{
+	extern int zfs_txg_timeout;
+	clock_t deadline = ddi_get_lbolt() + TXG_SIZE * zfs_txg_timeout * hz;
+
+	ASSERT(MUTEX_HELD(&spa_namespace_lock));
+	ASSERT(spa_failed(spa));
+
+	while (!spa_refcount_zero(spa) || spa->spa_inject_ref != 0) {
+		clock_t now = ddi_get_lbolt();
+
+		if (now >= deadline) {
+			zfs_dbgmsg("spa=%s failed pool still has %lld "
+			    "references and %d injection handlers",
+			    spa_name(spa),
+			    (longlong_t)zfs_refcount_count(&spa->spa_refcount),
+			    spa->spa_inject_ref);
+			return (SET_ERROR(EBUSY));
+		}
+		/* Holders don't signal us when they let go, so poll. */
+		if (cv_timedwait_sig(&spa_namespace_cv, &spa_namespace_lock,
+		    MIN(deadline, now + hz)) == 0)
+			return (SET_ERROR(EINTR));
+	}
+	return (0);
 }
 
 /*
@@ -8577,6 +8672,13 @@ spa_sync_condense_indirect(spa_t *spa, dmu_tx_t *tx)
 	}
 }
 
+/* ARGSUSED */
+static int
+spa_free_discard_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
+{
+	return (0);
+}
+
 static void
 spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 {
@@ -8587,6 +8689,24 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 
 	do {
 		int pass = ++spa->spa_sync_pass;
+
+		/*
+		 * A failed pool only drains its dirty datasets, which releases
+		 * the holds that dirty data has on dbufs, dnodes and datasets.
+		 * Nothing it writes reaches the disks (see
+		 * zio_vdev_io_fence()), so the phases that only update on-disk
+		 * metadata, or that would have to read it, are skipped.  Their
+		 * in-core state is discarded when the pool is exported.
+		 */
+		if (spa_failed(spa)) {
+			dsl_pool_sync(dp, txg);
+			bplist_iterate(free_bpl, spa_free_discard_cb, NULL, tx);
+			vdev_t *vd;
+			while ((vd = txg_list_remove(&spa->spa_vdev_txg_list,
+			    txg)) != NULL)
+				vdev_sync_discard(vd, txg);
+			continue;
+		}
 
 		spa_sync_config_object(spa, tx);
 		spa_sync_aux_dev(spa, &spa->spa_spares, tx,
@@ -8663,8 +8783,10 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
  * top-level vdevs that are known to be visible in the config cache
  * (see spa_vdev_add() for a complete description). If there *are* dirty
  * vdevs, sync the uberblock to all vdevs.
+ *
+ * Returns B_FALSE if the pool has failed, and the txg was not committed.
  */
-static void
+static boolean_t
 spa_sync_rewrite_vdev_config(spa_t *spa, dmu_tx_t *tx)
 {
 	vdev_t *rvd = spa->spa_root_vdev;
@@ -8672,6 +8794,9 @@ spa_sync_rewrite_vdev_config(spa_t *spa, dmu_tx_t *tx)
 
 	for (;;) {
 		int error = 0;
+
+		if (spa_failed(spa))
+			return (B_FALSE);
 
 		/*
 		 * We hold SCL_STATE to prevent vdev open/close/etc.
@@ -8714,7 +8839,9 @@ spa_sync_rewrite_vdev_config(spa_t *spa, dmu_tx_t *tx)
 		spa_config_exit(spa, SCL_STATE, FTAG);
 
 		if (error == 0)
-			break;
+			return (B_TRUE);
+
+		/* This may fail the pool instead (failmode=death). */
 		zio_suspend(spa, NULL, ZIO_SUSPEND_IOERR);
 		zio_resume_wait(spa);
 	}
@@ -8808,12 +8935,13 @@ spa_sync(spa_t *spa, uint64_t txg)
 
 	spa_sync_adjust_vdev_max_queue_depth(spa);
 
-	spa_sync_condense_indirect(spa, tx);
+	if (!spa_failed(spa))
+		spa_sync_condense_indirect(spa, tx);
 
 	spa_sync_iterate_to_convergence(spa, tx);
 
 #ifdef ZFS_DEBUG
-	if (!list_is_empty(&spa->spa_config_dirty_list)) {
+	if (!list_is_empty(&spa->spa_config_dirty_list) && !spa_failed(spa)) {
 		/*
 		 * Make sure that the number of ZAPs for all the vdevs matches
 		 * the number of ZAPs in the per-vdev ZAP list. This only gets
@@ -8833,7 +8961,7 @@ spa_sync(spa_t *spa, uint64_t txg)
 		ASSERT0(spa->spa_vdev_removal->svr_bytes_done[txg & TXG_MASK]);
 	}
 
-	spa_sync_rewrite_vdev_config(spa, tx);
+	boolean_t committed = spa_sync_rewrite_vdev_config(spa, tx);
 	dmu_tx_commit(tx);
 
 	VERIFY(cyclic_reprogram(spa->spa_deadman_cycid, CY_INFINITY));
@@ -8863,14 +8991,18 @@ spa_sync(spa_t *spa, uint64_t txg)
 	}
 
 	/*
-	 * Update usable space statistics.
+	 * Update usable space statistics.  This only finishes, in core, what
+	 * vdev_sync() started, so a pool that failed after its vdevs were
+	 * synced does it too, which keeps its space accounting consistent.
 	 */
 	while ((vd = txg_list_remove(&spa->spa_vdev_txg_list, TXG_CLEAN(txg)))
 	    != NULL)
 		vdev_sync_done(vd, txg);
 
-	metaslab_class_evict_old(spa->spa_normal_class, txg);
-	metaslab_class_evict_old(spa->spa_log_class, txg);
+	if (!spa_failed(spa)) {
+		metaslab_class_evict_old(spa->spa_normal_class, txg);
+		metaslab_class_evict_old(spa->spa_log_class, txg);
+	}
 
 	spa_sync_close_syncing_log_sm(spa);
 
@@ -8893,9 +9025,12 @@ spa_sync(spa_t *spa, uint64_t txg)
 	 * Update the last synced uberblock here. We want to do this at
 	 * the end of spa_sync() so that consumers of spa_last_synced_txg()
 	 * will be guaranteed that all the processing associated with
-	 * that txg has been completed.
+	 * that txg has been completed.  If the pool has failed, the txg was
+	 * not committed, and spa_last_synced_txg() stays the last txg that
+	 * is on disk (see txg_wait_synced_flags()).
 	 */
-	spa->spa_ubsync = spa->spa_uberblock;
+	if (committed)
+		spa->spa_ubsync = spa->spa_uberblock;
 	spa_config_exit(spa, SCL_CONFIG, FTAG);
 
 	spa_handle_ignored_writes(spa);

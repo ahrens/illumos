@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2017 by Lawrence Livermore National Security, LLC.
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/abd.h>
@@ -547,7 +548,8 @@ mmp_thread(void *arg)
 {
 	spa_t *spa = (spa_t *)arg;
 	mmp_thread_t *mmp = &spa->spa_mmp;
-	boolean_t suspended = spa_suspended(spa);
+	/* A failed pool writes nothing more, as though it were suspended. */
+	boolean_t suspended = spa_suspended(spa) || spa_failed(spa);
 	boolean_t multihost = spa_multihost(spa);
 	uint64_t mmp_interval = MSEC2NSEC(MMP_INTERVAL_OK(
 	    zfs_multihost_interval));
@@ -573,7 +575,7 @@ mmp_thread(void *arg)
 
 		last_spa_suspended = suspended;
 		last_spa_multihost = multihost;
-		suspended = spa_suspended(spa);
+		suspended = spa_suspended(spa) || spa_failed(spa);
 		multihost = spa_multihost(spa);
 
 		last_mmp_interval = mmp_interval;

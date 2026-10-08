@@ -27,6 +27,7 @@
  * Copyright (c) 2017 Datto Inc.
  * Copyright (c) 2017, Intel Corporation.
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef _SYS_SPA_IMPL_H
@@ -179,6 +180,19 @@ typedef struct spa_taskqs {
 	uint_t stqs_count;
 	taskq_t **stqs_taskq;
 } spa_taskqs_t;
+
+/*
+ * Forced exit.  A FAILED pool (see spa_fail()) drops its unsynced changes,
+ * lets no I/O reach its devices, and fails every wait, until it is exported.
+ * An ARMED pool fails when it suspends.  The state only ever moves forward.
+ * Protected by spa_suspend_lock; readers may look at it without the lock (see
+ * spa_failed()).
+ */
+typedef enum spa_exit_state {
+	SPA_EXIT_NONE = 0,
+	SPA_EXIT_ARMED,
+	SPA_EXIT_FAILED
+} spa_exit_state_t;
 
 typedef enum spa_all_vdev_zap_action {
 	AVZ_ACTION_NONE = 0,
@@ -353,6 +367,8 @@ struct spa {
 	kmutex_t	spa_suspend_lock;	/* protects suspend_zio_root */
 	kcondvar_t	spa_suspend_cv;		/* notification of resume */
 	zio_suspend_reason_t	spa_suspended;	/* pool is suspended */
+	spa_exit_state_t spa_exit;		/* forced exit state */
+	uint64_t	spa_exit_offset;	/* next fake DVA offset */
 	uint8_t		spa_claiming;		/* pool is doing zil_claim() */
 	boolean_t	spa_is_root;		/* pool is root */
 	int		spa_minref;		/* num refs when first opened */

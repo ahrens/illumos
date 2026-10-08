@@ -51,6 +51,15 @@ vdev_initialize_should_stop(vdev_t *vd)
 	    vd->vdev_detached || vd->vdev_top->vdev_removing);
 }
 
+/*
+ * Free the argument of a vdev_initialize_zap_update_sync() that didn't run.
+ */
+static void
+vdev_initialize_zap_update_free(void *arg)
+{
+	kmem_free(arg, sizeof (uint64_t));
+}
+
 static void
 vdev_initialize_zap_update_sync(void *arg, dmu_tx_t *tx)
 {
@@ -121,7 +130,8 @@ vdev_initialize_change_state(vdev_t *vd, vdev_initializing_state_t new_state)
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND));
-	dsl_sync_task_nowait(spa_get_dsl(spa), vdev_initialize_zap_update_sync,
+	dsl_sync_task_nowait_free(spa_get_dsl(spa),
+	    vdev_initialize_zap_update_sync, vdev_initialize_zap_update_free,
 	    guid, 2, ZFS_SPACE_CHECK_NONE, tx);
 
 	switch (new_state) {
@@ -211,8 +221,9 @@ vdev_initialize_write(vdev_t *vd, uint64_t start, uint64_t size, abd_t *data)
 		*guid = vd->vdev_guid;
 
 		/* This is the first write of this txg. */
-		dsl_sync_task_nowait(spa_get_dsl(spa),
-		    vdev_initialize_zap_update_sync, guid, 2,
+		dsl_sync_task_nowait_free(spa_get_dsl(spa),
+		    vdev_initialize_zap_update_sync,
+		    vdev_initialize_zap_update_free, guid, 2,
 		    ZFS_SPACE_CHECK_RESERVED, tx);
 	}
 

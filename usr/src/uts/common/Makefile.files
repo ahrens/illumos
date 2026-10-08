@@ -1411,6 +1411,7 @@ ZFS_COMMON_OBJS +=		\
 	spa_checkpoint.o	\
 	spa_config.o		\
 	spa_errlog.o		\
+	spa_exit.o		\
 	spa_history.o		\
 	spa_log_spacemap.o	\
 	spa_misc.o		\

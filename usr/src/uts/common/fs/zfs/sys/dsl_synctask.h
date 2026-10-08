@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_DSL_SYNCTASK_H
@@ -38,6 +39,7 @@ struct dsl_pool;
 typedef int (dsl_checkfunc_t)(void *, dmu_tx_t *);
 typedef void (dsl_syncfunc_t)(void *, dmu_tx_t *);
 typedef void (dsl_sigfunc_t)(void *, dmu_tx_t *);
+typedef void (dsl_freefunc_t)(void *);
 
 typedef enum zfs_space_check {
 	/*
@@ -106,6 +108,7 @@ typedef struct dsl_sync_task {
 	void *dst_arg;
 	int dst_error;
 	boolean_t dst_nowaiter;
+	dsl_freefunc_t *dst_freefunc;
 } dsl_sync_task_t;
 
 void dsl_sync_task_sync(dsl_sync_task_t *, dmu_tx_t *);
@@ -113,6 +116,8 @@ int dsl_sync_task(const char *, dsl_checkfunc_t *,
     dsl_syncfunc_t *, void *, int, zfs_space_check_t);
 void dsl_sync_task_nowait(struct dsl_pool *, dsl_syncfunc_t *,
     void *, int, zfs_space_check_t, dmu_tx_t *);
+void dsl_sync_task_nowait_free(struct dsl_pool *, dsl_syncfunc_t *,
+    dsl_freefunc_t *, void *, int, zfs_space_check_t, dmu_tx_t *);
 int dsl_early_sync_task(const char *, dsl_checkfunc_t *,
     dsl_syncfunc_t *, void *, int, zfs_space_check_t);
 void dsl_early_sync_task_nowait(struct dsl_pool *, dsl_syncfunc_t *,

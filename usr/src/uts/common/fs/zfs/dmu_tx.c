@@ -881,6 +881,15 @@ dmu_tx_try_assign(dmu_tx_t *tx)
 	if (tx->tx_err)
 		return (tx->tx_err);
 
+	/*
+	 * A failed pool accepts no new changes, whatever its failmode.  The
+	 * exception is callers that can't handle failure (DMU_TX_SUSPEND):
+	 * they get a txg, and what they change is drained without being
+	 * written, like everything else that was dirty when the pool failed.
+	 */
+	if (spa_failed(spa) && !tx->tx_must_assign)
+		return (SET_ERROR(EIO));
+
 	if (spa_suspended(spa)) {
 		/*
 		 * Let dmu_tx_assign() know specifically what happened, so
@@ -1020,6 +1029,7 @@ dmu_tx_assign(dmu_tx_t *tx, dmu_tx_flag_t flags)
 
 	if (!(flags & DMU_TX_SUSPEND))
 		tx->tx_break_on_suspend = B_TRUE;
+	tx->tx_must_assign = !!(flags & DMU_TX_SUSPEND);
 
 	while ((err = dmu_tx_try_assign(tx)) != 0) {
 		dmu_tx_unassign(tx);
@@ -1124,7 +1134,8 @@ dmu_tx_wait(dmu_tx_t *tx)
 		 * space.
 		 */
 		mutex_enter(&dp->dp_lock);
-		while (dp->dp_dirty_total >= zfs_dirty_data_max)
+		while (dp->dp_dirty_total >= zfs_dirty_data_max &&
+		    !spa_failed(spa))
 			cv_wait(&dp->dp_spaceavail_cv, &dp->dp_lock);
 		uint64_t dirty = dp->dp_dirty_total;
 		mutex_exit(&dp->dp_lock);

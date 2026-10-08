@@ -20,6 +20,7 @@
  */
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  * Use is subject to license terms.
  */
 
@@ -91,6 +92,7 @@ extern "C" {
 #define	FM_EREPORT_FAILMODE_WAIT		"wait"
 #define	FM_EREPORT_FAILMODE_CONTINUE		"continue"
 #define	FM_EREPORT_FAILMODE_PANIC		"panic"
+#define	FM_EREPORT_FAILMODE_DEATH		"death"
 
 #define	FM_RESOURCE_REMOVED			"removed"
 #define	FM_RESOURCE_AUTOREPLACE			"autoreplace"
