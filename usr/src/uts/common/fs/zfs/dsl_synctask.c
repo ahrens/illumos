@@ -210,21 +210,19 @@ dsl_sync_task_nowait_common(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
 	VERIFY(txg_list_add_tail(task_list, dst, dst->dst_txg));
 }
 
-void
-dsl_sync_task_nowait(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc, void *arg,
-    int blocks_modified, zfs_space_check_t space_check, dmu_tx_t *tx)
-{
-	dsl_sync_task_nowait_common(dp, syncfunc, NULL, arg,
-	    blocks_modified, space_check, tx, B_FALSE);
-}
-
 /*
- * Like dsl_sync_task_nowait(), for a sync function that frees its argument.
- * If the task doesn't run, because the pool has failed (see
- * dsl_sync_task_sync()), freefunc frees the argument instead.
+ * Called from open context to perform a callback in syncing context, in the
+ * txg of the given tx.  Doesn't wait for the operation to complete.
+ *
+ * The syncfunc doesn't always run: the task is dropped if there isn't
+ * enough space for it, or if the pool has failed (see dsl_sync_task_sync()).
+ * So whatever must be freed or cleaned up whether or not the syncfunc ran,
+ * such as the argument, is done by the freefunc, not the syncfunc.  The
+ * freefunc is called once in syncing context, after the syncfunc has run or
+ * the task was dropped.  It may be NULL only if there is nothing to clean up.
  */
 void
-dsl_sync_task_nowait_free(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
+dsl_sync_task_nowait(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
     dsl_freefunc_t *freefunc, void *arg, int blocks_modified,
     zfs_space_check_t space_check, dmu_tx_t *tx)
 {
@@ -233,10 +231,11 @@ dsl_sync_task_nowait_free(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
 }
 
 void
-dsl_early_sync_task_nowait(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc, void *arg,
-    int blocks_modified, zfs_space_check_t space_check, dmu_tx_t *tx)
+dsl_early_sync_task_nowait(dsl_pool_t *dp, dsl_syncfunc_t *syncfunc,
+    dsl_freefunc_t *freefunc, void *arg, int blocks_modified,
+    zfs_space_check_t space_check, dmu_tx_t *tx)
 {
-	dsl_sync_task_nowait_common(dp, syncfunc, NULL, arg,
+	dsl_sync_task_nowait_common(dp, syncfunc, freefunc, arg,
 	    blocks_modified, space_check, tx, B_TRUE);
 }
 
@@ -256,12 +255,7 @@ dsl_sync_task_sync(dsl_sync_task_t *dst, dmu_tx_t *tx)
 	 */
 	if (spa_failed(dp->dp_spa)) {
 		dst->dst_error = SET_ERROR(EIO);
-		if (dst->dst_nowaiter) {
-			if (dst->dst_freefunc != NULL)
-				dst->dst_freefunc(dst->dst_arg);
-			kmem_free(dst, sizeof (*dst));
-		}
-		return;
+		goto out;
 	}
 
 	/*
@@ -285,9 +279,7 @@ dsl_sync_task_sync(dsl_sync_task_t *dst, dmu_tx_t *tx)
 		/* MOS space is triple-dittoed, so we multiply by 3. */
 		if (used + dst->dst_space * 3 > quota) {
 			dst->dst_error = SET_ERROR(ENOSPC);
-			if (dst->dst_nowaiter)
-				kmem_free(dst, sizeof (*dst));
-			return;
+			goto out;
 		}
 	}
 
@@ -299,6 +291,10 @@ dsl_sync_task_sync(dsl_sync_task_t *dst, dmu_tx_t *tx)
 	if (dst->dst_error == 0)
 		dst->dst_syncfunc(dst->dst_arg, tx);
 	rrw_exit(&dp->dp_config_rwlock, FTAG);
-	if (dst->dst_nowaiter)
+out:
+	if (dst->dst_nowaiter) {
+		if (dst->dst_freefunc != NULL)
+			dst->dst_freefunc(dst->dst_arg, tx);
 		kmem_free(dst, sizeof (*dst));
+	}
 }

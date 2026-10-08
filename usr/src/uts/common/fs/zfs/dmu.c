@@ -618,15 +618,22 @@ dmu_buf_hold_array_by_dnode(dnode_t *dn, uint64_t offset, uint64_t length,
 		return (err);
 	}
 
-	/* wait for other io to complete */
+	/*
+	 * Wait for other io to complete.  A block that a failed pool
+	 * couldn't read is cached as zeros (see dbuf_poison()), which only
+	 * syncing context can use.
+	 */
 	if (read) {
+		boolean_t syncing =
+		    dsl_pool_sync_context(dmu_objset_pool(dn->dn_objset));
 		for (i = 0; i < nblks; i++) {
 			dmu_buf_impl_t *db = (dmu_buf_impl_t *)dbp[i];
 			mutex_enter(&db->db_mtx);
 			while (db->db_state == DB_READ ||
 			    db->db_state == DB_FILL)
 				cv_wait(&db->db_changed, &db->db_mtx);
-			if (db->db_state == DB_UNCACHED)
+			if (db->db_state == DB_UNCACHED ||
+			    (db->db_poisoned && !syncing))
 				err = SET_ERROR(EIO);
 			mutex_exit(&db->db_mtx);
 			if (err) {
@@ -1145,8 +1152,15 @@ dmu_write(objset_t *os, uint64_t object, uint64_t offset, uint64_t size,
 	if (size == 0)
 		return;
 
-	VERIFY0(dmu_buf_hold_array(os, object, offset, size,
-	    FALSE, FTAG, &numbufs, &dbp));
+	/*
+	 * Open context can't read an uncached block from a failed pool, and
+	 * the write would never reach disk anyway.
+	 */
+	if (dmu_buf_hold_array(os, object, offset, size,
+	    FALSE, FTAG, &numbufs, &dbp) != 0) {
+		VERIFY(spa_failed(os->os_spa));
+		return;
+	}
 	dmu_write_impl(dbp, numbufs, offset, size, buf, tx);
 	dmu_buf_rele_array(dbp, numbufs, FTAG);
 }
@@ -1161,8 +1175,12 @@ dmu_write_by_dnode(dnode_t *dn, uint64_t offset, uint64_t size,
 	if (size == 0)
 		return;
 
-	VERIFY0(dmu_buf_hold_array_by_dnode(dn, offset, size,
-	    FALSE, FTAG, &numbufs, &dbp, DMU_READ_PREFETCH));
+	/* See dmu_write(). */
+	if (dmu_buf_hold_array_by_dnode(dn, offset, size,
+	    FALSE, FTAG, &numbufs, &dbp, DMU_READ_PREFETCH) != 0) {
+		VERIFY(spa_failed(dn->dn_objset->os_spa));
+		return;
+	}
 	dmu_write_impl(dbp, numbufs, offset, size, buf, tx);
 	dmu_buf_rele_array(dbp, numbufs, FTAG);
 }
@@ -1317,8 +1335,11 @@ dmu_write_embedded(objset_t *os, uint64_t object, uint64_t offset,
 
 	ASSERT3U(etype, <, NUM_BP_EMBEDDED_TYPES);
 	ASSERT3U(comp, <, ZIO_COMPRESS_FUNCTIONS);
-	VERIFY0(dmu_buf_hold_noread(os, object, offset,
-	    FTAG, &db));
+	/* See dmu_write(). */
+	if (dmu_buf_hold_noread(os, object, offset, FTAG, &db) != 0) {
+		VERIFY(spa_failed(os->os_spa));
+		return;
+	}
 
 	dmu_buf_write_embedded(db,
 	    data, (bp_embedded_type_t)etype, (enum zio_compress)comp,

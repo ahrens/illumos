@@ -25,6 +25,7 @@
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2017 Nexenta Systems, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zio.h>
@@ -390,6 +391,15 @@ mzap_open(objset_t *os, uint64_t obj, dmu_buf_t *db)
 	zap->zap_object = obj;
 	zap->zap_dbuf = db;
 
+	/*
+	 * Syncing context on a failed pool gets zeros for a block that it
+	 * can't read (see dbuf_poison()).  Open it as an empty microzap:
+	 * nothing written to it reaches the disks.
+	 */
+	boolean_t poisoned = (zap_block_type == 0 && dmu_buf_is_poisoned(db));
+	if (poisoned)
+		zap_block_type = ZBT_MICRO;
+
 	if (zap_block_type != ZBT_MICRO) {
 		mutex_init(&zap->zap_f.zap_num_entries_mtx, 0, 0, 0);
 		zap->zap_f.zap_block_shift = highbit64(db->db_size) - 1;
@@ -413,6 +423,10 @@ mzap_open(objset_t *os, uint64_t obj, dmu_buf_t *db)
 		goto handle_winner;
 
 	if (zap->zap_ismicro) {
+		if (poisoned) {
+			zap_m_phys(zap)->mz_block_type = ZBT_MICRO;
+			zap_m_phys(zap)->mz_salt = (obj << 1) | 1;
+		}
 		zap->zap_salt = zap_m_phys(zap)->mz_salt;
 		zap->zap_normflags = zap_m_phys(zap)->mz_normflags;
 		zap->zap_m.zap_num_chunks = db->db_size / MZAP_ENT_LEN - 1;

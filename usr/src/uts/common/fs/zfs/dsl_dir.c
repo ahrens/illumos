@@ -182,6 +182,12 @@ dsl_dir_hold_obj(dsl_pool_t *dp, uint64_t ddobj,
 	if (dd == NULL) {
 		dsl_dir_t *winner;
 
+		/* See dsl_dataset_hold_obj(). */
+		if (spa_failed(dp->dp_spa) && !dsl_pool_sync_context(dp)) {
+			dmu_buf_rele(dbuf, tag);
+			return (SET_ERROR(EIO));
+		}
+
 		dd = kmem_zalloc(sizeof (dsl_dir_t), KM_SLEEP);
 		dd->dd_object = ddobj;
 		dd->dd_dbuf = dbuf;
@@ -1041,16 +1047,28 @@ dsl_dir_get_usedchild(dsl_dir_t *dd)
 	    dsl_dir_phys(dd)->dd_used_breakdown[DD_USED_CHILD_RSRV]);
 }
 
-void
+/*
+ * A failed pool may not be able to read the origin (see
+ * dsl_dataset_hold_obj()); then buf is empty.
+ */
+int
 dsl_dir_get_origin(dsl_dir_t *dd, char *buf)
 {
 	dsl_dataset_t *ds;
-	VERIFY0(dsl_dataset_hold_obj(dd->dd_pool,
-	    dsl_dir_phys(dd)->dd_origin_obj, FTAG, &ds));
+	int err;
 
-	dsl_dataset_name(ds, buf);
+	buf[0] = '\0';
+	err = dsl_dataset_hold_obj(dd->dd_pool,
+	    dsl_dir_phys(dd)->dd_origin_obj, FTAG, &ds);
+	if (err != 0)
+		return (err);
+
+	err = dsl_dataset_get_snapname(ds);
+	if (err == 0)
+		dsl_dataset_name(ds, buf);
 
 	dsl_dataset_rele(ds, FTAG);
+	return (err);
 }
 
 int
@@ -1127,8 +1145,8 @@ dsl_dir_stats(dsl_dir_t *dd, nvlist_t *nv)
 
 	if (dsl_dir_is_clone(dd)) {
 		char buf[ZFS_MAX_DATASET_NAME_LEN];
-		dsl_dir_get_origin(dd, buf);
-		dsl_prop_nvlist_add_string(nv, ZFS_PROP_ORIGIN, buf);
+		if (dsl_dir_get_origin(dd, buf) == 0)
+			dsl_prop_nvlist_add_string(nv, ZFS_PROP_ORIGIN, buf);
 	}
 
 }

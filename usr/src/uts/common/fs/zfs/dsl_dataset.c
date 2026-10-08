@@ -328,8 +328,7 @@ load_zfeature(objset_t *mos, dsl_dataset_t *ds, spa_feature_t f)
 		    spa_feature_table[f].fi_guid);
 		if (err == 0) {
 			ds->ds_feature[f] = (void *)(uintptr_t)B_TRUE;
-		} else {
-			ASSERT3U(err, ==, ENOENT);
+		} else if (err == ENOENT) {
 			err = 0;
 		}
 	break;
@@ -340,14 +339,18 @@ load_zfeature(objset_t *mos, dsl_dataset_t *ds, spa_feature_t f)
 		err = zap_length(mos, ds->ds_object,
 		    spa_feature_table[f].fi_guid, &int_size, &num_int);
 		if (err != 0) {
-			ASSERT3U(err, ==, ENOENT);
-			err = 0;
+			if (err == ENOENT)
+				err = 0;
 			break;
 		}
 		ASSERT3U(int_size, ==, sizeof (uint64_t));
 		data = kmem_alloc(int_size * num_int, KM_SLEEP);
-		VERIFY0(zap_lookup(mos, ds->ds_object,
-		    spa_feature_table[f].fi_guid, int_size, num_int, data));
+		err = zap_lookup(mos, ds->ds_object,
+		    spa_feature_table[f].fi_guid, int_size, num_int, data);
+		if (err != 0) {
+			kmem_free(data, int_size * num_int);
+			break;
+		}
 		struct feature_type_uint64_array_arg *ftuaa =
 		    kmem_alloc(sizeof (*ftuaa), KM_SLEEP);
 		ftuaa->length = num_int;
@@ -535,6 +538,17 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 	if (ds == NULL) {
 		dsl_dataset_t *winner = NULL;
 
+		/*
+		 * Setting up a dataset reads its ZAP entries, deadlists and
+		 * properties, which on a failed pool fail unless they happen
+		 * to be cached (see dbuf_poison()).  Only the datasets that
+		 * are already set up can be held then.
+		 */
+		if (spa_failed(dp->dp_spa) && !dsl_pool_sync_context(dp)) {
+			dmu_buf_rele(dbuf, tag);
+			return (SET_ERROR(EIO));
+		}
+
 		ds = kmem_zalloc(sizeof (dsl_dataset_t), KM_SLEEP);
 		ds->ds_dbuf = dbuf;
 		ds->ds_object = dsobj;
@@ -568,7 +582,8 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 		    offsetof(dsl_prop_cb_record_t, cbr_ds_node));
 
 		if (doi.doi_type == DMU_OTN_ZAP_METADATA) {
-			for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
+			for (spa_feature_t f = 0; err == 0 && f < SPA_FEATURES;
+			    f++) {
 				if (!(spa_feature_table[f].fi_flags &
 				    ZFEATURE_FLAG_PER_DATASET))
 					continue;
@@ -578,7 +593,8 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 
 		if (!ds->ds_is_snapshot) {
 			ds->ds_snapname[0] = '\0';
-			if (dsl_dataset_phys(ds)->ds_prev_snap_obj != 0) {
+			if (err == 0 &&
+			    dsl_dataset_phys(ds)->ds_prev_snap_obj != 0) {
 				err = dsl_dataset_hold_obj(dp,
 				    dsl_dataset_phys(ds)->ds_prev_snap_obj,
 				    ds, &ds->ds_prev);
@@ -588,11 +604,11 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 				    DS_FIELD_BOOKMARK_NAMES,
 				    sizeof (ds->ds_bookmarks), 1,
 				    &ds->ds_bookmarks);
-				if (zaperr != ENOENT)
-					VERIFY0(zaperr);
+				if (zaperr != 0 && zaperr != ENOENT && err == 0)
+					err = zaperr;
 			}
 		} else {
-			if (zfs_flags & ZFS_DEBUG_SNAPNAMES)
+			if (err == 0 && (zfs_flags & ZFS_DEBUG_SNAPNAMES))
 				err = dsl_dataset_get_snapname(ds);
 			if (err == 0 &&
 			    dsl_dataset_phys(ds)->ds_userrefs_obj != 0) {
@@ -648,6 +664,10 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 			winner = dmu_buf_set_user_ie(dbuf, &ds->ds_dbu);
 
 		if (err != 0 || winner != NULL) {
+			for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
+				if (dsl_dataset_feature_is_active(ds, f))
+					unload_zfeature(ds, f);
+			}
 			bplist_destroy(&ds->ds_pending_deadlist);
 			if (dsl_deadlist_is_open(&ds->ds_deadlist))
 				dsl_deadlist_close(&ds->ds_deadlist);
@@ -857,7 +877,16 @@ dsl_dataset_name(dsl_dataset_t *ds, char *name)
 		(void) strcpy(name, "mos");
 	} else {
 		dsl_dir_name(ds->ds_dir, name);
-		VERIFY0(dsl_dataset_get_snapname(ds));
+		if (dsl_dataset_get_snapname(ds) != 0) {
+			/*
+			 * A failed pool may not be able to read a snapshot's
+			 * name.  "?" can't be part of a real one.
+			 */
+			VERIFY(spa_failed(ds->ds_dir->dd_pool->dp_spa));
+			VERIFY3U(strlcat(name, "@?", ZFS_MAX_DATASET_NAME_LEN),
+			    <, ZFS_MAX_DATASET_NAME_LEN);
+			return;
+		}
 		if (ds->ds_snapname[0]) {
 			VERIFY3U(strlcat(name, "@", ZFS_MAX_DATASET_NAME_LEN),
 			    <, ZFS_MAX_DATASET_NAME_LEN);
@@ -883,7 +912,11 @@ dsl_dataset_name(dsl_dataset_t *ds, char *name)
 int
 dsl_dataset_namelen(dsl_dataset_t *ds)
 {
-	VERIFY0(dsl_dataset_get_snapname(ds));
+	if (dsl_dataset_get_snapname(ds) != 0) {
+		/* See dsl_dataset_name(). */
+		VERIFY(spa_failed(ds->ds_dir->dd_pool->dp_spa));
+		return (dsl_dir_namelen(ds->ds_dir) + 2);
+	}
 	mutex_enter(&ds->ds_lock);
 	int len = dsl_dir_namelen(ds->ds_dir) + 1 + strlen(ds->ds_snapname);
 	mutex_exit(&ds->ds_lock);
@@ -2133,8 +2166,10 @@ get_clones_stat_impl(dsl_dataset_t *ds, nvlist_t *val)
 	 * Only trust it if it has the right number of entries.
 	 */
 	if (dsl_dataset_phys(ds)->ds_next_clones_obj != 0) {
-		VERIFY0(zap_count(mos, dsl_dataset_phys(ds)->ds_next_clones_obj,
-		    &count));
+		int err = zap_count(mos,
+		    dsl_dataset_phys(ds)->ds_next_clones_obj, &count);
+		if (err != 0)
+			return (err);
 	}
 	if (count != dsl_dataset_phys(ds)->ds_num_children - 1) {
 		return (ENOENT);
@@ -2145,8 +2180,13 @@ get_clones_stat_impl(dsl_dataset_t *ds, nvlist_t *val)
 	    zap_cursor_advance(&zc)) {
 		dsl_dataset_t *clone;
 		char buf[ZFS_MAX_DATASET_NAME_LEN];
-		VERIFY0(dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
-		    za.za_first_integer, FTAG, &clone));
+		/* A failed pool may not be able to read the clone. */
+		int err = dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
+		    za.za_first_integer, FTAG, &clone);
+		if (err != 0) {
+			zap_cursor_fini(&zc);
+			return (err);
+		}
 		dsl_dir_name(clone->ds_dir, buf);
 		fnvlist_add_boolean(val, buf);
 		dsl_dataset_rele(clone, FTAG);
@@ -2673,7 +2713,8 @@ dsl_dataset_fast_stat(dsl_dataset_t *ds, dmu_objset_stats_t *stat)
 		stat->dds_num_clones = 0;
 
 		if (dsl_dir_is_clone(ds->ds_dir)) {
-			dsl_dir_get_origin(ds->ds_dir, stat->dds_origin);
+			(void) dsl_dir_get_origin(ds->ds_dir,
+			    stat->dds_origin);
 		}
 	}
 }
@@ -4330,6 +4371,14 @@ dsl_dataset_space_written(dsl_dataset_t *oldsnap, dsl_dataset_t *new,
 		}
 
 	}
+
+	/*
+	 * A failed pool's deadlists stopped being updated when it failed (see
+	 * dsl_deadlist_insert()), but its datasets' space accounting didn't,
+	 * so they no longer add up.
+	 */
+	if (err == 0 && spa_failed(dp->dp_spa))
+		err = SET_ERROR(EIO);
 	return (err);
 }
 
@@ -4391,6 +4440,13 @@ dsl_dataset_space_wouldfree(dsl_dataset_t *firstsnap,
 		ASSERT3U(snapobj, !=, 0);
 		dsl_dataset_rele(ds, FTAG);
 	}
+
+	/*
+	 * A failed pool's deadlists stopped being updated when it failed (see
+	 * dsl_deadlist_insert()), so they're out of date.
+	 */
+	if (err == 0 && spa_failed(dp->dp_spa))
+		err = SET_ERROR(EIO);
 	return (err);
 }
 

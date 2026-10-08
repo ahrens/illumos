@@ -146,7 +146,7 @@ uint64_t dsl_dir_get_usedsnap(dsl_dir_t *dd);
 uint64_t dsl_dir_get_usedds(dsl_dir_t *dd);
 uint64_t dsl_dir_get_usedrefreserv(dsl_dir_t *dd);
 uint64_t dsl_dir_get_usedchild(dsl_dir_t *dd);
-void dsl_dir_get_origin(dsl_dir_t *dd, char *buf);
+int dsl_dir_get_origin(dsl_dir_t *dd, char *buf);
 int dsl_dir_get_filesystem_count(dsl_dir_t *dd, uint64_t *count);
 int dsl_dir_get_snapshot_count(dsl_dir_t *dd, uint64_t *count);
 int dsl_dir_get_remaptxg(dsl_dir_t *dd, uint64_t *count);

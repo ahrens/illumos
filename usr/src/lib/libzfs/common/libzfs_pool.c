@@ -119,6 +119,22 @@ zpool_props_refresh(zpool_handle_t *zhp)
 	return (0);
 }
 
+/*
+ * The kernel can't read some properties of a failed pool, and returns them
+ * with no value (see spa_prop_get_failed()).  zpool_get_prop() shows them as
+ * "-"; zpool_get_prop_int() returns the default value for them, with a source
+ * of ZPROP_SRC_NONE.
+ */
+static boolean_t
+zpool_prop_unknown(zpool_handle_t *zhp, zpool_prop_t prop)
+{
+	nvlist_t *nv;
+
+	return (zhp->zpool_props != NULL &&
+	    nvlist_lookup_nvlist(zhp->zpool_props, zpool_prop_to_name(prop),
+	    &nv) == 0 && !nvlist_exists(nv, ZPROP_VALUE));
+}
+
 static char *
 zpool_get_prop_string(zpool_handle_t *zhp, zpool_prop_t prop,
     zprop_source_t *src)
@@ -132,7 +148,8 @@ zpool_get_prop_string(zpool_handle_t *zhp, zpool_prop_t prop,
 	if (nvlist_lookup_nvlist(nvl, zpool_prop_to_name(prop), &nv) == 0) {
 		verify(nvlist_lookup_uint64(nv, ZPROP_SOURCE, &ival) == 0);
 		source = ival;
-		verify(nvlist_lookup_string(nv, ZPROP_VALUE, &value) == 0);
+		if (nvlist_lookup_string(nv, ZPROP_VALUE, &value) != 0)
+			value = "-";	/* unknown; see zpool_prop_unknown() */
 	} else {
 		source = ZPROP_SRC_DEFAULT;
 		if ((value = (char *)zpool_prop_default_string(prop)) == NULL)
@@ -145,6 +162,12 @@ zpool_get_prop_string(zpool_handle_t *zhp, zpool_prop_t prop,
 	return (value);
 }
 
+/*
+ * If the pool has failed, some of its properties can't be read, and for those
+ * this returns the property's default value, with a source of ZPROP_SRC_NONE
+ * (see zpool_prop_unknown()).  The default may not be the value that is in
+ * effect.
+ */
 uint64_t
 zpool_get_prop_int(zpool_handle_t *zhp, zpool_prop_t prop, zprop_source_t *src)
 {
@@ -172,7 +195,9 @@ zpool_get_prop_int(zpool_handle_t *zhp, zpool_prop_t prop, zprop_source_t *src)
 	if (nvlist_lookup_nvlist(nvl, zpool_prop_to_name(prop), &nv) == 0) {
 		verify(nvlist_lookup_uint64(nv, ZPROP_SOURCE, &value) == 0);
 		source = value;
-		verify(nvlist_lookup_uint64(nv, ZPROP_VALUE, &value) == 0);
+		/* If it's unknown, see zpool_prop_unknown(). */
+		if (nvlist_lookup_uint64(nv, ZPROP_VALUE, &value) != 0)
+			value = zpool_prop_default_numeric(prop);
 	} else {
 		source = ZPROP_SRC_DEFAULT;
 		value = zpool_prop_default_numeric(prop);
@@ -299,6 +324,13 @@ zpool_get_prop(zpool_handle_t *zhp, zpool_prop_t prop, char *buf, size_t len,
 	if (zhp->zpool_props == NULL && zpool_get_all_props(zhp) &&
 	    prop != ZPOOL_PROP_NAME)
 		return (-1);
+
+	if (zpool_prop_unknown(zhp, prop)) {
+		(void) strlcpy(buf, "-", len);
+		if (srctype != NULL)
+			*srctype = ZPROP_SRC_NONE;
+		return (0);
+	}
 
 	switch (zpool_prop_get_type(prop)) {
 	case PROP_TYPE_STRING:

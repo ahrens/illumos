@@ -1309,7 +1309,14 @@ zfs_get_data(void *arg, uint64_t gen, lr_write_t *lr, char *buf,
 			error = dmu_read(os, object, offset, size, buf,
 			    DMU_READ_NO_PREFETCH);
 		}
-		ASSERT(error == 0 || error == ENOENT);
+		/*
+		 * The data need not still be cached: a failed pool drops it
+		 * unwritten, and with primarycache=metadata it goes once it
+		 * is written.  Reading it back can then fail (on a failed pool
+		 * it always does), and zil_lwb_commit() waits for the txg.
+		 */
+		if (error != 0 && error != ENOENT)
+			error = SET_ERROR(EIO);
 	} else { /* indirect write */
 		/*
 		 * Have to lock the whole block to ensure when it's

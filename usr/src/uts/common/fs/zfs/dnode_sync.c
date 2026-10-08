@@ -562,9 +562,12 @@ dnode_sync_free(dnode_t *dn, dmu_tx_t *tx)
 
 	/*
 	 * Our contents should have been freed in dnode_sync() by the
-	 * free range record inserted by the caller of dnode_free().
+	 * free range record inserted by the caller of dnode_free().  On a
+	 * failed pool, some of them may have been under an indirect block
+	 * that was poisoned (see dbuf_poison()), and so were never found.
 	 */
-	ASSERT0(DN_USED_BYTES(dn->dn_phys));
+	ASSERT(DN_USED_BYTES(dn->dn_phys) == 0 ||
+	    spa_failed(dn->dn_objset->os_spa));
 	ASSERT(BP_IS_HOLE(dn->dn_phys->dn_blkptr));
 
 	dnode_undirty_dbufs(&dn->dn_dirty_records[txgoff]);

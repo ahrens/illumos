@@ -280,7 +280,7 @@ get_special_prop(lua_State *state, dsl_dataset_t *ds, const char *dsname,
 		numval = dsl_get_objsetid(ds);
 		break;
 	case ZFS_PROP_ORIGIN:
-		dsl_dir_get_origin(ds->ds_dir, strval);
+		error = dsl_dir_get_origin(ds->ds_dir, strval);
 		break;
 	case ZFS_PROP_USERACCOUNTING:
 		error = dmu_objset_from_ds(ds, &os);

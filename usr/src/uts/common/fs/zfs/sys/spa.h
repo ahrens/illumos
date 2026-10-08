@@ -978,6 +978,9 @@ extern void spa_exit_check(spa_t *spa);
 extern void spa_exit_init(void);
 extern void spa_exit_fini(void);
 extern void spa_exit_unload_wait(spa_t *spa);
+struct zbookmark_phys;
+extern void spa_exit_poisoned_read(spa_t *spa,
+    const struct zbookmark_phys *zb);
 extern uint64_t spa_bootfs(spa_t *spa);
 extern uint64_t spa_delegation(spa_t *spa);
 extern objset_t *spa_meta_objset(spa_t *spa);
