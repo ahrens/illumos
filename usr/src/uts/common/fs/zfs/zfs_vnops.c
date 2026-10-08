@@ -670,8 +670,13 @@ zfs_read(vnode_t *vp, uio_t *uio, int ioflag, cred_t *cr, caller_context_t *ct)
 #endif
 
 	if (zfsvfs->z_log &&
-	    (frsync || zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS))
-		zil_commit(zfsvfs->z_log, zp->z_id);
+	    (frsync || zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)) {
+		error = zil_commit(zfsvfs->z_log, zp->z_id);
+		if (error != 0) {
+			ZFS_EXIT(zfsvfs);
+			return (error);
+		}
+	}
 
 	/*
 	 * Lock the range against changes.
@@ -1188,8 +1193,13 @@ zfs_write(vnode_t *vp, uio_t *uio, int ioflag, cred_t *cr, caller_context_t *ct)
 		return (error);
 	}
 
-	if (commit)
-		zil_commit(zilog, zp->z_id);
+	if (commit) {
+		error = zil_commit(zilog, zp->z_id);
+		if (error != 0) {
+			ZFS_EXIT(zfsvfs);
+			return (error);
+		}
+	}
 
 	ZFS_EXIT(zfsvfs);
 	return (0);
@@ -1810,8 +1820,13 @@ out:
 		error = specvp_check(vpp, cr);
 	}
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS) {
+		error = zil_commit(zilog, 0);
+		if (error != 0) {
+			VN_RELE(*vpp);
+			*vpp = NULL;
+		}
+	}
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -2047,8 +2062,8 @@ out:
 	if (xzp)
 		VN_RELE(ZTOV(xzp));
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+		error = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -2232,11 +2247,17 @@ top:
 
 	zfs_dirent_unlock(dl);
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	error = 0;
+	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS) {
+		error = zil_commit(zilog, 0);
+		if (error != 0) {
+			VN_RELE(*vpp);
+			*vpp = NULL;
+		}
+	}
 
 	ZFS_EXIT(zfsvfs);
-	return (0);
+	return (error);
 }
 
 /*
@@ -2364,8 +2385,8 @@ out:
 
 	VN_RELE(vp);
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+		error = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -2668,6 +2689,7 @@ zfs_fsync(vnode_t *vp, int syncflag, cred_t *cr, caller_context_t *ct)
 {
 	znode_t	*zp = VTOZ(vp);
 	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
+	int error = 0;
 
 	/*
 	 * Regardless of whether this is required for standards conformance,
@@ -2682,10 +2704,10 @@ zfs_fsync(vnode_t *vp, int syncflag, cred_t *cr, caller_context_t *ct)
 	if (zfsvfs->z_os->os_sync != ZFS_SYNC_DISABLED) {
 		ZFS_ENTER(zfsvfs);
 		ZFS_VERIFY_ZP(zp);
-		zil_commit(zfsvfs->z_log, zp->z_id);
+		error = zil_commit(zfsvfs->z_log, zp->z_id);
 		ZFS_EXIT(zfsvfs);
 	}
-	return (0);
+	return (error);
 }
 
 
@@ -3779,8 +3801,8 @@ out:
 	}
 
 out2:
-	if (os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (err == 0 && os->os_sync == ZFS_SYNC_ALWAYS)
+		err = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (err);
@@ -4262,8 +4284,8 @@ out:
 	if (tzp)
 		VN_RELE(ZTOV(tzp));
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+		error = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -4416,8 +4438,8 @@ top:
 
 	VN_RELE(ZTOV(zp));
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+		error = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -4629,8 +4651,8 @@ top:
 		vnevent_link(svp, ct);
 	}
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+		error = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -4870,8 +4892,12 @@ zfs_putpage(vnode_t *vp, offset_t off, size_t len, int flags, cred_t *cr,
 	}
 out:
 	rangelock_exit(lr);
-	if ((flags & B_ASYNC) == 0 || zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zfsvfs->z_log, zp->z_id);
+	if ((flags & B_ASYNC) == 0 ||
+	    zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS) {
+		int cerror = zil_commit(zfsvfs->z_log, zp->z_id);
+		if (error == 0)
+			error = cerror;
+	}
 	ZFS_EXIT(zfsvfs);
 	return (error);
 }
@@ -5510,8 +5536,8 @@ zfs_setsecattr(vnode_t *vp, vsecattr_t *vsecp, int flag, cred_t *cr,
 
 	error = zfs_setacl(zp, vsecp, skipaclchk, cr);
 
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zilog, 0);
+	if (error == 0 && zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+		error = zil_commit(zilog, 0);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);

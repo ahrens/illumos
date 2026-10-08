@@ -1879,8 +1879,11 @@ zvol_strategy(buf_t *bp)
 	if ((bp->b_resid = resid) == bp->b_bcount)
 		bioerror(bp, off > volsize ? EINVAL : error);
 
-	if (commit)
-		zil_commit(zv->zv_zilog, ZVOL_OBJ);
+	if (commit) {
+		int cerror = zil_commit(zv->zv_zilog, ZVOL_OBJ);
+		if (cerror != 0 && geterror(bp) == 0)
+			bioerror(bp, cerror);
+	}
 	biodone(bp);
 
 	smt_end_unsafe();
@@ -2102,8 +2105,11 @@ zvol_write(dev_t dev, uio_t *uio, cred_t *cr)
 	}
 	rangelock_exit(lr);
 
-	if (commit)
-		zil_commit(zv->zv_zilog, ZVOL_OBJ);
+	if (commit) {
+		int cerror = zil_commit(zv->zv_zilog, ZVOL_OBJ);
+		if (error == 0)
+			error = cerror;
+	}
 
 	smt_end_unsafe();
 
@@ -2447,7 +2453,7 @@ out:
 
 		smt_begin_unsafe();
 
-		zil_commit(zv->zv_zilog, ZVOL_OBJ);
+		error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
 		if ((flag & FKIOCTL) && dkc != NULL && dkc->dkc_callback) {
 			(*dkc->dkc_callback)(dkc->dkc_cookie, error);
 			error = 0;
@@ -2480,10 +2486,10 @@ out:
 			zv->zv_flags &= ~ZVOL_WCE;
 			mutex_exit(&zfsdev_state_lock);
 			smt_begin_unsafe();
-			zil_commit(zv->zv_zilog, ZVOL_OBJ);
+			error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
 			smt_end_unsafe();
 		}
-		return (0);
+		return (error);
 	}
 
 	case DKIOCGGEOM:
@@ -2592,7 +2598,7 @@ out:
 		    (!(zv->zv_flags & ZVOL_WCE) ||
 		    (zv->zv_objset->os_sync == ZFS_SYNC_ALWAYS) ||
 		    (dfl->dfl_flags & DF_WAIT_SYNC))) {
-			zil_commit(zv->zv_zilog, ZVOL_OBJ);
+			error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
 		}
 
 		if (!(flag & FKIOCTL))
