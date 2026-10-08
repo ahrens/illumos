@@ -15,6 +15,7 @@
 
 /*
  * Copyright (c) 2015, 2017 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu_tx.h>
@@ -547,22 +548,26 @@ load_obsolete_sm_callback(space_map_entry_t *sme, void *arg)
 }
 
 /*
- * Modify the counts (increment them) based on the spacemap.
+ * Modify the counts (increment them) based on the spacemap.  Fails only if
+ * the pool has failed.
  */
-void
+int
 vdev_indirect_mapping_load_obsolete_spacemap(vdev_indirect_mapping_t *vim,
     uint32_t *counts, space_map_t *obsolete_space_sm)
 {
 	load_obsolete_space_map_arg_t losma;
 	losma.losma_counts = counts;
 	losma.losma_vim = vim;
-	VERIFY0(space_map_iterate(obsolete_space_sm,
+	int error = space_map_iterate(obsolete_space_sm,
 	    space_map_length(obsolete_space_sm),
-	    load_obsolete_sm_callback, &losma));
+	    load_obsolete_sm_callback, &losma);
+	VERIFY(error == 0 || spa_failed(dmu_objset_spa(vim->vim_objset)));
+	return (error);
 }
 
 /*
- * Read the obsolete counts from disk, returning them in an array.
+ * Read the obsolete counts from disk, returning them in an array.  Fails,
+ * returning NULL, only if the pool has failed.
  */
 uint32_t *
 vdev_indirect_mapping_load_obsolete_counts(vdev_indirect_mapping_t *vim)
@@ -573,10 +578,15 @@ vdev_indirect_mapping_load_obsolete_counts(vdev_indirect_mapping_t *vim)
 	    vim->vim_phys->vimp_num_entries * sizeof (uint32_t);
 	uint32_t *counts = kmem_alloc(counts_size, KM_SLEEP);
 	if (vim->vim_havecounts) {
-		VERIFY0(dmu_read(vim->vim_objset,
+		int error = dmu_read(vim->vim_objset,
 		    vim->vim_phys->vimp_counts_object,
 		    0, counts_size,
-		    counts, DMU_READ_PREFETCH));
+		    counts, DMU_READ_PREFETCH);
+		if (error != 0) {
+			VERIFY(spa_failed(dmu_objset_spa(vim->vim_objset)));
+			kmem_free(counts, counts_size);
+			return (NULL);
+		}
 	} else {
 		bzero(counts, counts_size);
 	}

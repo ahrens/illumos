@@ -573,7 +573,7 @@ spa_condense_indirect_commit_free(void *arg, dmu_tx_t *tx)
  * Open-context function to add one entry to the new mapping.  The new
  * entry will be remembered and written from syncing context.
  */
-static void
+static int
 spa_condense_indirect_commit_entry(spa_t *spa,
     vdev_indirect_mapping_entry_phys_t *vimep, uint32_t count)
 {
@@ -583,7 +583,13 @@ spa_condense_indirect_commit_entry(spa_t *spa,
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 	dmu_tx_hold_space(tx, sizeof (*vimep) + sizeof (count));
-	VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND));
+	int error = dmu_tx_assign(tx, DMU_TX_WAIT | DMU_TX_SUSPEND);
+	if (error != 0) {
+		/* The pool has failed. */
+		VERIFY(spa_failed(spa));
+		dmu_tx_abort(tx);
+		return (error);
+	}
 	int txgoff = dmu_tx_get_txg(tx) & TXG_MASK;
 
 	/*
@@ -604,6 +610,7 @@ spa_condense_indirect_commit_entry(spa_t *spa,
 	list_insert_tail(&sci->sci_new_mapping_entries[txgoff], vime);
 
 	dmu_tx_commit(tx);
+	return (0);
 }
 
 static void
@@ -637,8 +644,9 @@ spa_condense_indirect_generate_new_mapping(vdev_t *vd,
 		uint64_t entry_size = DVA_GET_ASIZE(&entry->vimep_dst);
 		ASSERT3U(obsolete_counts[mapi], <=, entry_size);
 		if (obsolete_counts[mapi] < entry_size) {
-			spa_condense_indirect_commit_entry(spa, entry,
-			    obsolete_counts[mapi]);
+			if (spa_condense_indirect_commit_entry(spa, entry,
+			    obsolete_counts[mapi]) != 0)
+				break;
 
 			/*
 			 * This delay may be requested for testing, debugging,
@@ -657,7 +665,8 @@ spa_condense_indirect_thread_check(void *arg, zthr_t *zthr)
 {
 	spa_t *spa = arg;
 
-	return (spa->spa_condensing_indirect != NULL);
+	/* A failed pool can't change. */
+	return (spa->spa_condensing_indirect != NULL && !spa_failed(spa));
 }
 
 /* ARGSUSED */
@@ -697,14 +706,26 @@ spa_condense_indirect_thread(void *arg, zthr_t *zthr)
 		ASSERT(list_is_empty(&sci->sci_new_mapping_entries[i]));
 	}
 
-	VERIFY0(space_map_open(&prev_obsolete_sm, spa->spa_meta_objset,
-	    scip->scip_prev_obsolete_sm_object, 0, vd->vdev_asize, 0));
+	/*
+	 * The pool can fail after spa_condense_indirect_thread_check(), and
+	 * then these reads fail.  A failed pool can't condense, so give up.
+	 */
+	int error = space_map_open(&prev_obsolete_sm, spa->spa_meta_objset,
+	    scip->scip_prev_obsolete_sm_object, 0, vd->vdev_asize, 0);
+	if (error != 0) {
+		VERIFY(spa_failed(spa));
+		return;
+	}
 	counts = vdev_indirect_mapping_load_obsolete_counts(old_mapping);
-	if (prev_obsolete_sm != NULL) {
-		vdev_indirect_mapping_load_obsolete_spacemap(old_mapping,
-		    counts, prev_obsolete_sm);
+	if (counts != NULL && prev_obsolete_sm != NULL &&
+	    vdev_indirect_mapping_load_obsolete_spacemap(old_mapping,
+	    counts, prev_obsolete_sm) != 0) {
+		vdev_indirect_mapping_free_obsolete_counts(old_mapping, counts);
+		counts = NULL;
 	}
 	space_map_close(prev_obsolete_sm);
+	if (counts == NULL)
+		return;
 
 	/*
 	 * Generate new mapping.  Determine what index to continue from
@@ -756,12 +777,13 @@ spa_condense_indirect_thread(void *arg, zthr_t *zthr)
 	 * early. We don't want to complete the condense if the spa is
 	 * shutting down.
 	 */
-	if (zthr_iscancelled(zthr))
+	if (zthr_iscancelled(zthr) || spa_failed(spa))
 		return;
 
-	VERIFY0(dsl_sync_task(spa_name(spa), NULL,
+	error = dsl_sync_task(spa_name(spa), NULL,
 	    spa_condense_indirect_complete_sync, sci, 0,
-	    ZFS_SPACE_CHECK_EXTRA_RESERVED));
+	    ZFS_SPACE_CHECK_EXTRA_RESERVED);
+	VERIFY(error == 0 || spa_failed(spa));
 }
 
 /*

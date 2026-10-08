@@ -21,6 +21,7 @@
 
 /*
  * Copyright (c) 2016, 2024 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/spa.h>
@@ -361,9 +362,14 @@ vdev_initialize_calculate_progress(vdev_t *vd)
 		/*
 		 * If we get here, we're in the middle of initializing this
 		 * metaslab. Load it and walk the free tree for more accurate
-		 * progress estimation.
+		 * progress estimation.  A pool that has failed can't load it,
+		 * and the estimate doesn't matter then.
 		 */
-		VERIFY0(metaslab_load(msp));
+		if (metaslab_load(msp) != 0) {
+			VERIFY(spa_failed(vd->vdev_spa));
+			mutex_exit(&msp->ms_lock);
+			continue;
+		}
 
 		zfs_btree_index_t where;
 		range_tree_t *rt = msp->ms_allocatable;
@@ -487,15 +493,18 @@ vdev_initialize_thread(void *arg)
 	 * below doesn't run.
 	 */
 	vd->vdev_initialize_last_offset = 0;
-	if (!vd->vdev_detached)
-		VERIFY0(vdev_initialize_load(vd));
+	if (!vd->vdev_detached) {
+		error = vdev_initialize_load(vd);
+		/* The pool has failed, and can't read the leaf ZAP. */
+		VERIFY(error == 0 || spa_failed(spa));
+	}
 
 	abd_t *deadbeef = vdev_initialize_block_alloc();
 
 	vd->vdev_initialize_tree = range_tree_create(NULL, RANGE_SEG64, NULL,
 	    0, 0);
 
-	for (uint64_t i = 0; !vd->vdev_detached &&
+	for (uint64_t i = 0; error == 0 && !vd->vdev_detached &&
 	    i < vd->vdev_top->vdev_ms_count; i++) {
 		metaslab_t *msp = vd->vdev_top->vdev_ms[i];
 		boolean_t unload_when_done = B_FALSE;
@@ -514,7 +523,15 @@ vdev_initialize_thread(void *arg)
 		mutex_enter(&msp->ms_lock);
 		if (!msp->ms_loaded && !msp->ms_loading)
 			unload_when_done = B_TRUE;
-		VERIFY0(metaslab_load(msp));
+		error = metaslab_load(msp);
+		if (error != 0) {
+			/* The pool has failed, and can't read the metaslab. */
+			VERIFY(spa_failed(spa));
+			mutex_exit(&msp->ms_lock);
+			metaslab_enable(msp, B_FALSE, unload_when_done);
+			spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+			break;
+		}
 
 		range_tree_walk(msp->ms_allocatable, vdev_initialize_range_add,
 		    vd);

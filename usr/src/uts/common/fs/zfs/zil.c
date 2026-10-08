@@ -556,7 +556,8 @@ zil_free_lwb(zilog_t *zilog, lwb_t *lwb)
 	ASSERT(avl_is_empty(&lwb->lwb_vdev_tree));
 	ASSERT3P(lwb->lwb_write_zio, ==, NULL);
 	ASSERT3P(lwb->lwb_root_zio, ==, NULL);
-	ASSERT3U(lwb->lwb_max_txg, <=, spa_syncing_txg(zilog->zl_spa));
+	ASSERT(lwb->lwb_max_txg <= spa_syncing_txg(zilog->zl_spa) ||
+	    spa_failed(zilog->zl_spa));
 	ASSERT(lwb->lwb_state == LWB_STATE_CLOSED ||
 	    lwb->lwb_state == LWB_STATE_FLUSH_DONE);
 
@@ -3074,6 +3075,55 @@ zil_open(objset_t *os, zil_get_data_t *get_data)
 }
 
 /*
+ * Close the intent log of a failed pool.  Nothing can be committed: the log
+ * is left on disk as it was when the pool failed, and whatever wasn't written
+ * by then is discarded.  Writes to a failed pool's disks complete without
+ * doing anything (see zio_vdev_io_fence()), so an lwb that is still open is
+ * issued, and the ones in flight finish quickly.  None of the lwbs will be
+ * cleaned up by zil_sync(), since the pool's txgs are never committed, so
+ * free them all here.
+ */
+static void
+zil_failed_close(zilog_t *zilog)
+{
+	lwb_t *lwb;
+
+	ASSERT(spa_failed(zilog->zl_spa));
+
+	mutex_enter(&zilog->zl_issuer_lock);
+	lwb = zilog->zl_last_lwb_opened;
+	if (lwb != NULL && lwb->lwb_state == LWB_STATE_OPENED)
+		(void) zil_lwb_write_issue(zilog, lwb);
+	mutex_exit(&zilog->zl_issuer_lock);
+
+	mutex_enter(&zilog->zl_lock);
+	for (;;) {
+		for (lwb = list_head(&zilog->zl_lwb_list); lwb != NULL;
+		    lwb = list_next(&zilog->zl_lwb_list, lwb)) {
+			if (lwb->lwb_state == LWB_STATE_ISSUED ||
+			    lwb->lwb_state == LWB_STATE_WRITE_DONE)
+				break;
+		}
+		if (lwb == NULL)
+			break;
+		mutex_exit(&zilog->zl_lock);
+		delay(MAX(1, MSEC_TO_TICK(10)));
+		mutex_enter(&zilog->zl_lock);
+	}
+	while ((lwb = list_head(&zilog->zl_lwb_list)) != NULL) {
+		ASSERT(lwb->lwb_state == LWB_STATE_CLOSED ||
+		    lwb->lwb_state == LWB_STATE_FLUSH_DONE);
+		list_remove(&zilog->zl_lwb_list, lwb);
+		if (lwb->lwb_buf != NULL)
+			zio_buf_free(lwb->lwb_buf, lwb->lwb_sz);
+		zil_free_lwb(zilog, lwb);
+	}
+	mutex_exit(&zilog->zl_lock);
+
+	zilog->zl_get_data = NULL;
+}
+
+/*
  * Close an intent log.
  */
 void
@@ -3081,6 +3131,11 @@ zil_close(zilog_t *zilog)
 {
 	lwb_t *lwb;
 	uint64_t txg;
+
+	if (spa_failed(zilog->zl_spa)) {
+		zil_failed_close(zilog);
+		return;
+	}
 
 	if (!dmu_objset_is_snapshot(zilog->zl_os)) {
 		if (zil_commit(zilog, 0) != 0)
