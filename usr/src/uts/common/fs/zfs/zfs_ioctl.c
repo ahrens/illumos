@@ -1707,7 +1707,16 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	boolean_t hardforce = (boolean_t)zc->zc_guid;
 
 	zfs_log_history(zc);
+
+	/*
+	 * The open volumes of a failed pool would keep it from being
+	 * exported, so fail them first (see zvol_fail()).  If the pool fails
+	 * while we export it, they are still open, so try again once.
+	 */
+	(void) zvol_fail_minors(zc->zc_name);
 	error = spa_export(zc->zc_name, NULL, force, hardforce);
+	if (error == EBUSY && zvol_fail_minors(zc->zc_name) != 0)
+		error = spa_export(zc->zc_name, NULL, force, hardforce);
 	if (error == 0)
 		zvol_remove_minors(zc->zc_name);
 	return (error);

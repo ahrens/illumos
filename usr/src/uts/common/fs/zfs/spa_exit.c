@@ -232,44 +232,70 @@ spa_exit_unload_wait(spa_t *spa)
 }
 
 /*
+ * Find the named pool (or the pool of the named dataset) in
+ * spa_namespace_avl, with spa_namespace_avl_lock held rather than
+ * spa_namespace_lock.  Unlike spa_lookup(), this does not wait for an import
+ * or export in progress.
+ */
+static spa_t *
+spa_exit_find(const char *name)
+{
+	size_t len = strcspn(name, "/@#");
+
+	ASSERT(MUTEX_HELD(&spa_namespace_avl_lock));
+
+	/* A spa_t is too big for the stack, so walk the tree. */
+	for (spa_t *spa = avl_first(&spa_namespace_avl); spa != NULL;
+	    spa = AVL_NEXT(&spa_namespace_avl, spa)) {
+		if (strncmp(spa->spa_name, name, len) == 0 &&
+		    spa->spa_name[len] == '\0')
+			return (spa);
+	}
+	return (NULL);
+}
+
+/*
  * Arm the named pool for forced exit (see spa_exit_arm()) without taking
  * spa_namespace_lock, which may be held indefinitely by a thread sleeping on
- * that very pool.  spa_namespace_avl_lock keeps the tree intact while we look,
- * and spa_exit_hold() keeps the pool while we arm it.  Unlike spa_lookup(),
- * this does not wait for an import or export in progress.  A pool that has
- * nothing to arm (see spa_exit_hold()) is exported as usual, so that isn't an
- * error.
+ * that very pool.  spa_exit_hold() keeps the pool while we arm it.  A pool
+ * that has nothing to arm (see spa_exit_hold()) is exported as usual, so that
+ * isn't an error.
  */
 int
 spa_exit_arm_by_name(const char *name)
 {
-	size_t len = strcspn(name, "/@#");
-	int error = SET_ERROR(ENOENT);
-	spa_t *spa;
-
-	/* A spa_t is too big for the stack, so walk the tree. */
 	mutex_enter(&spa_namespace_avl_lock);
-	for (spa = avl_first(&spa_namespace_avl); spa != NULL;
-	    spa = AVL_NEXT(&spa_namespace_avl, spa)) {
-		if (strncmp(spa->spa_name, name, len) == 0 &&
-		    spa->spa_name[len] == '\0')
-			break;
+	spa_t *spa = spa_exit_find(name);
+	if (spa == NULL) {
+		mutex_exit(&spa_namespace_avl_lock);
+		return (SET_ERROR(ENOENT));
 	}
-	if (spa != NULL) {
-		error = 0;
-		if (!spa_exit_hold(spa))
-			spa = NULL;
-	}
+	boolean_t held = spa_exit_hold(spa);
 	mutex_exit(&spa_namespace_avl_lock);
 
-	if (spa != NULL) {
+	if (held) {
 		spa_exit_arm(spa);
 		mutex_enter(&spa_namespace_avl_lock);
 		spa_exit_rele(spa);
 		mutex_exit(&spa_namespace_avl_lock);
 	}
 
-	return (error);
+	return (0);
+}
+
+/*
+ * Has the named pool failed (see spa_failed())?  Like
+ * spa_exit_arm_by_name(), this doesn't take spa_namespace_lock.
+ */
+boolean_t
+spa_failed_by_name(const char *name)
+{
+	mutex_enter(&spa_namespace_avl_lock);
+	spa_t *spa = spa_exit_find(name);
+	boolean_t failed = (spa != NULL && spa_failed(spa));
+	mutex_exit(&spa_namespace_avl_lock);
+
+	return (failed);
 }
 
 void

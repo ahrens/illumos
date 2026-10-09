@@ -2511,7 +2511,20 @@ zfs_resume_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 	objset_t *os;
 	VERIFY3P(ds->ds_owner, ==, zfsvfs);
 	VERIFY(dsl_dataset_long_held(ds));
-	VERIFY0(dmu_objset_from_ds(ds, &os));
+	err = dmu_objset_from_ds(ds, &os);
+	if (err != 0) {
+		/*
+		 * We can't read the objset back: a failed pool can't read
+		 * the one that a receive has just swapped in.  Give the file
+		 * system up: release the dataset, and leave it with no
+		 * objset, so that its vops fail with EIO (ZFS_ENTER()), and
+		 * teardown and zfs_umount() skip the objset when we force
+		 * the unmount below.
+		 */
+		zfsvfs->z_os = NULL;
+		dsl_dataset_disown(ds, DS_HOLD_FLAG_DECRYPT, zfsvfs);
+		goto bail;
+	}
 
 	err = zfsvfs_init(zfsvfs, os);
 	if (err != 0)

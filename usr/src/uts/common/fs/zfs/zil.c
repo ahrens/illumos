@@ -1763,6 +1763,28 @@ zil_aitx_compare(const void *x1, const void *x2)
 }
 
 /*
+ * The first txg whose itxs may still have to be committed: the itxs of the
+ * txgs before it are on disk, and zil_clean() takes care of them.  A failed
+ * pool's last synced txg stays where it was when the pool failed, while the
+ * txgs after it drain (and zil_clean() runs for them too), so for a failed
+ * pool, start after the last txg that drained.
+ */
+static uint64_t
+zil_first_unsynced_txg(zilog_t *zilog)
+{
+	spa_t *spa = zilog->zl_spa;
+	uint64_t otxg;
+
+	if (spa_freeze_txg(spa) != UINT64_MAX) /* ziltest support */
+		return (ZILTEST_TXG);
+
+	otxg = spa_last_synced_txg(spa) + 1;
+	if (spa_failed(spa))
+		otxg = MAX(otxg, zilog->zl_dmu_pool->dp_tx.tx_synced_txg + 1);
+	return (otxg);
+}
+
+/*
  * Remove all async itx with the given oid.
  */
 void
@@ -1778,10 +1800,7 @@ zil_remove_async(zilog_t *zilog, uint64_t oid)
 	ASSERT(oid != 0);
 	list_create(&clean_list, sizeof (itx_t), offsetof(itx_t, itx_node));
 
-	if (spa_freeze_txg(zilog->zl_spa) != UINT64_MAX) /* ziltest support */
-		otxg = ZILTEST_TXG;
-	else
-		otxg = spa_last_synced_txg(zilog->zl_spa) + 1;
+	otxg = zil_first_unsynced_txg(zilog);
 
 	for (txg = otxg; txg < (otxg + TXG_CONCURRENT_STATES); txg++) {
 		itxg_t *itxg = &zilog->zl_itxg[txg & TXG_MASK];
@@ -1939,10 +1958,7 @@ zil_get_commit_list(zilog_t *zilog)
 
 	ASSERT(MUTEX_HELD(&zilog->zl_issuer_lock));
 
-	if (spa_freeze_txg(zilog->zl_spa) != UINT64_MAX) /* ziltest support */
-		otxg = ZILTEST_TXG;
-	else
-		otxg = spa_last_synced_txg(zilog->zl_spa) + 1;
+	otxg = zil_first_unsynced_txg(zilog);
 
 	/*
 	 * This is inherently racy, since there is nothing to prevent
@@ -1985,10 +2001,7 @@ zil_async_to_sync(zilog_t *zilog, uint64_t foid)
 	avl_tree_t *t;
 	avl_index_t where;
 
-	if (spa_freeze_txg(zilog->zl_spa) != UINT64_MAX) /* ziltest support */
-		otxg = ZILTEST_TXG;
-	else
-		otxg = spa_last_synced_txg(zilog->zl_spa) + 1;
+	otxg = zil_first_unsynced_txg(zilog);
 
 	/*
 	 * This is inherently racy, since there is nothing to prevent
@@ -2802,8 +2815,14 @@ zil_commit(zilog_t *zilog, uint64_t foid)
 	 */
 	if (zilog->zl_suspend > 0) {
 		txg_wait_synced(zilog->zl_dmu_pool, 0);
-		return (0);
+		return (spa_failed(zilog->zl_spa) ? SET_ERROR(EIO) : 0);
 	}
+
+	/*
+	 * Nothing committed once the pool has failed can reach the disk.
+	 */
+	if (spa_failed(zilog->zl_spa))
+		return (SET_ERROR(EIO));
 
 	return (zil_commit_impl(zilog, foid));
 }
@@ -2858,6 +2877,16 @@ zil_commit_impl(zilog_t *zilog, uint64_t foid)
 	}
 
 	zil_free_commit_waiter(zcw);
+
+	/*
+	 * If the pool failed while we waited, the lwbs or the txg we waited
+	 * for may have completed without reaching the disk: a failed pool's
+	 * writes succeed without doing any I/O.  How they completed can't
+	 * tell us whether the commit is on disk, so we report that it may
+	 * not be.
+	 */
+	if (spa_failed(zilog->zl_spa))
+		return (SET_ERROR(EIO));
 
 	return (0);
 }
@@ -3075,17 +3104,17 @@ zil_open(objset_t *os, zil_get_data_t *get_data)
 }
 
 /*
- * Close the intent log of a failed pool.  Nothing can be committed: the log
- * is left on disk as it was when the pool failed, and whatever wasn't written
- * by then is discarded.  Writes to a failed pool's disks complete without
- * doing anything (see zio_vdev_io_fence()), so an lwb that is still open is
- * issued, and the ones in flight finish quickly.  None of the lwbs will be
- * cleaned up by zil_sync(), since the pool's txgs are never committed, so
- * free them all here.
+ * Wait for the lwb writes of a failed pool's intent log to finish, for up to
+ * timeout ticks (forever if it is zero).  Writes to a failed pool's disks
+ * complete without doing anything (see zio_vdev_io_fence()), so an lwb that
+ * is still open is issued, and it finishes at once.  An lwb whose write
+ * reached a device before the pool failed waits for the device, which may
+ * not answer.  Returns EBUSY if lwbs are still in flight.
  */
-static void
-zil_failed_close(zilog_t *zilog)
+int
+zil_failed_wait(zilog_t *zilog, clock_t timeout)
 {
+	clock_t deadline = ddi_get_lbolt() + timeout;
 	lwb_t *lwb;
 
 	ASSERT(spa_failed(zilog->zl_spa));
@@ -3106,10 +3135,33 @@ zil_failed_close(zilog_t *zilog)
 		}
 		if (lwb == NULL)
 			break;
+		if (timeout != 0 && ddi_get_lbolt() >= deadline) {
+			mutex_exit(&zilog->zl_lock);
+			return (SET_ERROR(EBUSY));
+		}
 		mutex_exit(&zilog->zl_lock);
 		delay(MAX(1, MSEC_TO_TICK(10)));
 		mutex_enter(&zilog->zl_lock);
 	}
+	mutex_exit(&zilog->zl_lock);
+	return (0);
+}
+
+/*
+ * Close the intent log of a failed pool.  Nothing can be committed: the log
+ * is left on disk as it was when the pool failed, and whatever wasn't written
+ * by then is discarded.  Wait for the lwbs in flight (see zil_failed_wait()).
+ * None of the lwbs will be cleaned up by zil_sync(), since the pool's txgs
+ * are never committed, so free them all here.
+ */
+static void
+zil_failed_close(zilog_t *zilog)
+{
+	lwb_t *lwb;
+
+	VERIFY0(zil_failed_wait(zilog, 0));
+
+	mutex_enter(&zilog->zl_lock);
 	while ((lwb = list_head(&zilog->zl_lwb_list)) != NULL) {
 		ASSERT(lwb->lwb_state == LWB_STATE_CLOSED ||
 		    lwb->lwb_state == LWB_STATE_FLUSH_DONE);

@@ -26,6 +26,7 @@
  * Copyright 2020 Joyent, Inc.
  * Copyright 2020 Tintri by DDN, Inc. All rights reserved.
  * Copyright 2015-2024 RackTop Systems, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /* Portions Copyright 2007 Jeremy Teo */
@@ -4939,11 +4940,18 @@ zfs_inactive(vnode_t *vp, cred_t *cr, caller_context_t *ct)
 
 	/*
 	 * Attempt to push any data in the page cache.  If this fails
-	 * we will get kicked out later in zfs_zinactive().
+	 * we will get kicked out later in zfs_zinactive().  A failed pool
+	 * can't write the pages, and they would keep the znode around with
+	 * no holds, so throw them away.
 	 */
 	if (vn_has_cached_data(vp)) {
-		(void) pvn_vplist_dirty(vp, 0, zfs_putapage, B_INVAL|B_ASYNC,
-		    cr);
+		if (spa_failed(dmu_objset_spa(zfsvfs->z_os))) {
+			(void) pvn_vplist_dirty(vp, 0, zfs_null_putapage,
+			    B_INVAL, cr);
+		} else {
+			(void) pvn_vplist_dirty(vp, 0, zfs_putapage,
+			    B_INVAL|B_ASYNC, cr);
+		}
 	}
 
 	if (zp->z_atime_dirty && zp->z_unlinked == 0) {

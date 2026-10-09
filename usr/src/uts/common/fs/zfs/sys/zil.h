@@ -22,6 +22,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
+ * Copyright 2026 Oxide Computer Company
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -419,6 +420,7 @@ extern void	zil_free(zilog_t *zilog);
 
 extern zilog_t	*zil_open(objset_t *os, zil_get_data_t *get_data);
 extern void	zil_close(zilog_t *zilog);
+extern int	zil_failed_wait(zilog_t *zilog, clock_t timeout);
 
 extern void	zil_replay(objset_t *os, void *arg,
     zil_replay_func_t *replay_func[TX_MAX_TYPE]);
