@@ -171,18 +171,23 @@ spa_fail(spa_t *spa)
 }
 
 /*
- * Arm the pool for forced exit: it fails as soon as it is (or becomes)
- * suspended.  An armed pool that never suspends behaves normally.
+ * Arm the pool for forced exit: it fails now if it is suspended, or instead
+ * of suspending later (see zio_suspend()).  An armed pool that never
+ * suspends behaves normally.
  */
 void
 spa_exit_arm(spa_t *spa)
 {
+	boolean_t fail;
+
 	mutex_enter(&spa->spa_suspend_lock);
 	if (spa->spa_exit == SPA_EXIT_NONE)
 		spa->spa_exit = SPA_EXIT_ARMED;
+	fail = (spa->spa_exit == SPA_EXIT_ARMED && spa_suspended(spa));
 	mutex_exit(&spa->spa_suspend_lock);
 
-	spa_exit_check(spa);
+	if (fail)
+		spa_fail(spa);
 }
 
 /*
@@ -296,19 +301,6 @@ spa_failed_by_name(const char *name)
 	mutex_exit(&spa_namespace_avl_lock);
 
 	return (failed);
-}
-
-void
-spa_exit_check(spa_t *spa)
-{
-	boolean_t fail;
-
-	mutex_enter(&spa->spa_suspend_lock);
-	fail = (spa->spa_exit == SPA_EXIT_ARMED && spa_suspended(spa));
-	mutex_exit(&spa->spa_suspend_lock);
-
-	if (fail)
-		spa_fail(spa);
 }
 
 /*

@@ -398,6 +398,11 @@ zpool_get_prop(zpool_handle_t *zhp, zpool_prop_t prop, char *buf, size_t len,
 				    (u_longlong_t)(intval % 100));
 			break;
 		case ZPOOL_PROP_HEALTH:
+			if (nvlist_exists(zpool_get_config(zhp, NULL),
+			    ZPOOL_CONFIG_FAILED)) {
+				(void) strlcpy(buf, gettext("FAILED"), len);
+				break;
+			}
 			verify(nvlist_lookup_nvlist(zpool_get_config(zhp, NULL),
 			    ZPOOL_CONFIG_VDEV_TREE, &nvroot) == 0);
 			verify(nvlist_lookup_uint64_array(nvroot,
@@ -1400,6 +1405,19 @@ zpool_destroy(zpool_handle_t *zhp, const char *log_str)
 	libzfs_handle_t *hdl = zhp->zpool_hdl;
 	char msg[1024];
 
+	/*
+	 * A failed pool can't write the labels that would mark it destroyed;
+	 * all it can do is go away, which is what exporting it does.
+	 */
+	if (nvlist_exists(zpool_get_config(zhp, NULL), ZPOOL_CONFIG_FAILED)) {
+		(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
+		    "cannot destroy '%s'"), zhp->zpool_name);
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "pool has failed, "
+		    "and can't be marked destroyed; use 'zpool export -f' "
+		    "to remove it"));
+		return (zfs_error(hdl, EZFS_POOLUNAVAIL, msg));
+	}
+
 	if (zhp->zpool_state == POOL_STATE_ACTIVE &&
 	    (zfp = zfs_open(hdl, zhp->zpool_name, ZFS_TYPE_FILESYSTEM)) == NULL)
 		return (-1);
@@ -1603,6 +1621,15 @@ zpool_export_common(zpool_handle_t *zhp, boolean_t force, boolean_t hardforce,
 			    zhp->zpool_name, zhp->zpool_name);
 			return (zfs_error(zhp->zpool_hdl, EZFS_ACTIVE_SPARE,
 			    msg));
+		case EAGAIN:
+			if (!hardforce) {
+				zfs_error_aux(zhp->zpool_hdl, dgettext(
+				    TEXT_DOMAIN, "pool is suspended; use '-F' "
+				    "to discard unsynced changes"));
+				return (zfs_error(zhp->zpool_hdl,
+				    EZFS_POOLUNAVAIL, msg));
+			}
+			/* FALLTHROUGH */
 		default:
 			return (zpool_standard_error_fmt(zhp->zpool_hdl, errno,
 			    msg));
@@ -1633,15 +1660,33 @@ zpool_export_force(zpool_handle_t *zhp, const char *log_str)
 int
 zpool_force_exit(zpool_handle_t *zhp)
 {
-	zfs_cmd_t zc = { 0 };
 	char msg[1024];
+	int error;
 
 	(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
 	    "cannot force '%s' to exit"), zhp->zpool_name);
 
-	(void) strlcpy(zc.zc_name, zhp->zpool_name, sizeof (zc.zc_name));
-	if (zfs_ioctl(zhp->zpool_hdl, ZFS_IOC_POOL_FORCE_EXIT, &zc) != 0)
-		return (zpool_standard_error_fmt(zhp->zpool_hdl, errno, msg));
+	error = zpool_force_exit_name(zhp->zpool_hdl, zhp->zpool_name);
+	if (error != 0)
+		return (zpool_standard_error_fmt(zhp->zpool_hdl, error, msg));
+
+	return (0);
+}
+
+/*
+ * zpool_force_exit() of a pool that hasn't been opened.  Opening a pool needs
+ * spa_namespace_lock, which a command waiting on the pool may hold until the
+ * pool exits, so "zpool export -F" arms its pools by name first.  Returns an
+ * errno, and reports nothing.
+ */
+int
+zpool_force_exit_name(libzfs_handle_t *hdl, const char *pool)
+{
+	zfs_cmd_t zc = { 0 };
+
+	(void) strlcpy(zc.zc_name, pool, sizeof (zc.zc_name));
+	if (zfs_ioctl(hdl, ZFS_IOC_POOL_FORCE_EXIT, &zc) != 0)
+		return (errno);
 
 	return (0);
 }
@@ -4285,8 +4330,10 @@ zpool_get_errlog(zpool_handle_t *zhp, nvlist_t **nverrlistp)
 	 * has increased, allocate more space and continue until we get the
 	 * entire list.
 	 */
-	verify(nvlist_lookup_uint64(zhp->zpool_config, ZPOOL_CONFIG_ERRCOUNT,
-	    &count) == 0);
+	/* A failed pool has no error count; its error log can't be read. */
+	if (nvlist_lookup_uint64(zhp->zpool_config, ZPOOL_CONFIG_ERRCOUNT,
+	    &count) != 0)
+		return (-1);
 	if (count == 0)
 		return (0);
 	if ((zc.zc_nvlist_dst = (uintptr_t)zfs_alloc(zhp->zpool_hdl,

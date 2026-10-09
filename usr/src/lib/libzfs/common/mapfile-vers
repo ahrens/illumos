@@ -236,6 +236,7 @@ $endif
 	zpool_find_vdev;
 	zpool_find_vdev_by_physpath;
 	zpool_force_exit;
+	zpool_force_exit_name;
 	zpool_fru_set;
 	zpool_get_bootenv;
 	zpool_get_config;

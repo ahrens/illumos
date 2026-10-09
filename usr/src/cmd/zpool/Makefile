@@ -24,6 +24,7 @@
 # Copyright (c) 2015 by Delphix. All rights reserved.
 # Copyright 2020 Joyent, Inc.
 # Copyright 2025 Hans Rosenfeld
+# Copyright 2026 Oxide Computer Company
 #
 
 PROG= zpool
@@ -39,7 +40,7 @@ include ../Makefile.ctf
 include ../stat/Makefile.stat
 
 LDLIBS += -lzfs -lnvpair -ldevid -lefi -ldiskmgt -luutil -lumem -lzutil \
-	-lm -lzpool
+	-lm -lzpool -lkstat
 
 INCS += -I../../common/zfs -I../../uts/common/fs/zfs
 INCS += -I../../lib/libzutil/common

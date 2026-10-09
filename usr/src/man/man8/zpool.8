@@ -30,7 +30,7 @@
 .\" Copyright 2025 Hans Rosenfeld
 .\" Copyright 2026 Oxide Computer Company
 .\"
-.Dd October 8, 2026
+.Dd October 9, 2026
 .Dt ZPOOL 8
 .Os
 .Sh NAME
@@ -77,7 +77,7 @@
 .Ar pool device
 .Nm
 .Cm export
-.Op Fl f
+.Op Fl fF
 .Fl a Ns | Ns Ar pool Ns ...
 .Nm
 .Cm get
@@ -1257,6 +1257,11 @@ whose pools live on network block devices.
 .Xc
 Destroys the given pool, freeing up any devices for other use.
 This command tries to unmount any active datasets before destroying the pool.
+A pool that has failed
+.Pq see Cm export Fl F
+can't be destroyed, because it can't mark its devices as destroyed; use
+.Nm zpool Cm export Fl f
+to remove it.
 .Bl -tag -width Ds
 .It Fl f
 Forces any active datasets contained within the pool to be unmounted.
@@ -1273,7 +1278,7 @@ The operation is refused if there are no other valid replicas of the data.
 .It Xo
 .Nm
 .Cm export
-.Op Fl f
+.Op Fl fF
 .Fl a Ns | Ns Ar pool Ns ...
 .Xc
 Exports the given pools from the system.
@@ -1305,6 +1310,30 @@ command.
 This command will forcefully export the pool even if it has a shared spare that
 is currently being used.
 This may lead to potential data corruption.
+.It Fl F
+Export the pool even if it is suspended, discarding the changes that it has
+not yet written.
+Implies
+.Fl f .
+.Pp
+The pool is armed for forced exit before its datasets are unmounted: if it is
+suspended, or becomes suspended while it is being exported, it fails, as
+though it had
+.Sy failmode Ns = Ns Sy death ,
+rather than waiting for its devices to come back.
+Operations that are waiting for it return
+.Er EIO ,
+open volumes are let go of, and nothing more is written to its devices, which
+remain at the last committed transaction group.
+A pool that does not suspend is exported as usual, and loses nothing.
+.Pp
+If the export fails after the pool has failed, for example because a file
+system mounted on top of one of its datasets cannot be unmounted, the pool
+remains failed, and the command can be run again.
+A pool that has already failed
+.Pq its health is Sy FAILED
+can also be exported without
+.Fl F .
 .El
 .It Xo
 .Nm

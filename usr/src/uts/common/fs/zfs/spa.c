@@ -4992,9 +4992,16 @@ spa_get_stats(const char *name, nvlist_t **config,
 			VERIFY(nvlist_add_uint64_array(*config,
 			    ZPOOL_CONFIG_LOADED_TIME, loadtimes, 2) == 0);
 
-			VERIFY(nvlist_add_uint64(*config,
-			    ZPOOL_CONFIG_ERRCOUNT,
-			    spa_get_errlog_size(spa)) == 0);
+			/*
+			 * A failed pool can't count its persistent errors
+			 * unless the logs happen to be cached (see
+			 * spa_get_errlog()), so it reports no count at all.
+			 */
+			if (!spa_failed(spa)) {
+				VERIFY(nvlist_add_uint64(*config,
+				    ZPOOL_CONFIG_ERRCOUNT,
+				    spa_get_errlog_size(spa)) == 0);
+			}
 
 			if (spa_suspended(spa)) {
 				VERIFY(nvlist_add_uint64(*config,
@@ -5003,6 +5010,11 @@ spa_get_stats(const char *name, nvlist_t **config,
 				VERIFY(nvlist_add_uint64(*config,
 				    ZPOOL_CONFIG_SUSPENDED_REASON,
 				    spa->spa_suspended) == 0);
+			}
+
+			if (spa_failed(spa)) {
+				VERIFY0(nvlist_add_boolean(*config,
+				    ZPOOL_CONFIG_FAILED));
 			}
 
 			spa_add_spares(spa, *config);
@@ -6087,17 +6099,11 @@ spa_tryimport(nvlist_t *tryconfig)
  * exit, in which case it fails instead, and there's nothing left to wait for.
  */
 static int
-spa_export_sync(spa_t *spa, boolean_t armed)
+spa_export_sync(spa_t *spa)
 {
 	int error = txg_wait_synced_flags(spa->spa_dsl_pool, 0,
 	    TXG_WAIT_SUSPEND | TXG_WAIT_SIGNAL);
 
-	/*
-	 * We may have seen the suspension before the pool, which is armed,
-	 * failed because of it.  Make sure it has.
-	 */
-	if (error != 0 && armed)
-		spa_exit_check(spa);
 	if (error != 0 && spa_failed(spa))
 		return (0);
 	if (error == ESHUTDOWN)
@@ -6111,9 +6117,18 @@ spa_export_sync(spa_t *spa, boolean_t armed)
  * The act of destroying or exporting a pool is very simple.  We make sure there
  * is no more pending I/O and any references to the pool are gone.  Then, we
  * update the pool state and sync all the labels to disk, removing the
- * configuration from the cache afterwards. If the 'hardforce' flag is set, then
- * we don't sync the labels or remove the configuration cache.
+ * configuration from the cache afterwards.
+ *
+ * If the 'hardforce' flag is set, the pool is armed for forced exit (see
+ * spa_exit_arm()): if it is or becomes suspended, it fails, dropping its
+ * unsynced changes, and a failed pool doesn't sync its labels.
+ *
+ * If spa_export_skip_update is set (for testing), an export neither updates
+ * the labels nor removes the pool from the cache file, leaving the pool on
+ * disk as though the system had lost power.
  */
+int spa_export_skip_update = 0;
+
 static int
 spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
     boolean_t force, boolean_t hardforce)
@@ -6121,6 +6136,8 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	int error = 0;
 	spa_t *spa;
 	hrtime_t export_start = gethrtime();
+	boolean_t skip_update = (new_state == POOL_STATE_EXPORTED &&
+	    spa_export_skip_update != 0);
 
 	if (oldconfig)
 		*oldconfig = NULL;
@@ -6138,6 +6155,15 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		/* the pool is being exported by another thread */
 		mutex_exit(&spa_namespace_lock);
 		return (SET_ERROR(ZFS_ERR_EXPORT_IN_PROGRESS));
+	}
+
+	/*
+	 * A failed pool can't write the labels that would mark it destroyed.
+	 * It can only be exported.
+	 */
+	if (new_state == POOL_STATE_DESTROYED && spa_failed(spa)) {
+		mutex_exit(&spa_namespace_lock);
+		return (SET_ERROR(EIO));
 	}
 	spa->spa_is_exporting = B_TRUE;
 
@@ -6170,7 +6196,7 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	 * without writing anything.
 	 */
 	if (active && !spa_failed(spa)) {
-		error = spa_export_sync(spa, hardforce);
+		error = spa_export_sync(spa);
 		if (error != 0) {
 			mutex_enter(&spa_namespace_lock);
 			spa_close(spa, FTAG);
@@ -6188,7 +6214,7 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	 * This is normally quick, since we just synced.
 	 */
 	if (active && !spa_failed(spa)) {
-		error = spa_export_sync(spa, hardforce);
+		error = spa_export_sync(spa);
 		if (error != 0)
 			goto fail;
 	}
@@ -6270,7 +6296,7 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 * so mark them all dirty.  spa_unload() will do the
 		 * final sync that pushes these changes out.
 		 */
-		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce &&
+		if (new_state != POOL_STATE_UNINITIALIZED && !skip_update &&
 		    !failed) {
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 			spa->spa_state = new_state;
@@ -6299,7 +6325,7 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 		 * waits behind its spa_sync(), and the open txg is then one
 		 * further along, which would sync a txg past spa_final_txg.
 		 */
-		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce &&
+		if (new_state != POOL_STATE_UNINITIALIZED && !skip_update &&
 		    !failed) {
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
 			spa->spa_final_txg = MAX(spa_last_synced_txg(spa) + 1,
@@ -6327,7 +6353,7 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	 */
 	mutex_enter(&spa_namespace_lock);
 	if (new_state != POOL_STATE_UNINITIALIZED) {
-		if (!hardforce)
+		if (!skip_update)
 			spa_write_cachefile(spa, B_TRUE, B_TRUE);
 		spa_remove(spa);
 	} else {

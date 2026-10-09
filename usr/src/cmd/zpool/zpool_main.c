@@ -65,6 +65,7 @@
 #include <sys/stat.h>
 #include <sys/debug.h>
 #include <math.h>
+#include <kstat.h>
 #include <sys/sysmacros.h>
 #include <sys/termios.h>
 
@@ -347,7 +348,7 @@ get_usage(zpool_help_t idx)
 	case HELP_DETACH:
 		return (gettext("\tdetach <pool> <device>\n"));
 	case HELP_EXPORT:
-		return (gettext("\texport [-f] <-a | pool> ...\n"));
+		return (gettext("\texport [-fF] <-a | pool> ...\n"));
 	case HELP_HISTORY:
 		return (gettext("\thistory [-il] [<pool>] ...\n"));
 	case HELP_IMPORT:
@@ -1555,6 +1556,17 @@ zpool_do_destroy(int argc, char **argv)
 		return (1);
 	}
 
+	/*
+	 * A failed pool can't be destroyed (zpool_destroy() says why); don't
+	 * unmount its file systems first.
+	 */
+	if (nvlist_exists(zpool_get_config(zhp, NULL),
+	    ZPOOL_CONFIG_FAILED)) {
+		ret = (zpool_destroy(zhp, NULL) != 0);
+		zpool_close(zhp);
+		return (ret);
+	}
+
 	if (zpool_disable_datasets(zhp, force) != 0) {
 		(void) fprintf(stderr, gettext("could not destroy '%s': "
 		    "could not unmount datasets\n"), zpool_get_name(zhp));
@@ -1608,6 +1620,35 @@ root_pool_name(void)
 	}
 	(void) fclose(fp);
 	return (pool);
+}
+
+/*
+ * Arm every imported pool but the root pool for forced exit before "zpool
+ * export -aF" lists them: listing the pools takes spa_namespace_lock, which a
+ * command sleeping on a suspended pool can hold until the pool fails (see
+ * zpool_do_export()).  The kernel keeps an I/O kstat, zfs:0:<pool>, for each
+ * pool, whose name we can read without that lock.  A kstat name is cut off at
+ * KSTAT_STRLEN - 1 characters, so a pool with a longer name isn't found, and
+ * is armed only when zpool_export_one() gets to it.
+ */
+static void
+zpool_force_exit_all(const char *rootpool)
+{
+	kstat_ctl_t *kc;
+
+	if ((kc = kstat_open()) == NULL)
+		return;
+	for (kstat_t *ksp = kc->kc_chain; ksp != NULL; ksp = ksp->ks_next) {
+		if (ksp->ks_type != KSTAT_TYPE_IO || ksp->ks_instance != 0 ||
+		    strcmp(ksp->ks_module, "zfs") != 0 ||
+		    strcmp(ksp->ks_class, "disk") != 0 ||
+		    ksp->ks_name[0] == '$')
+			continue;
+		if (rootpool != NULL && strcmp(ksp->ks_name, rootpool) == 0)
+			continue;
+		(void) zpool_force_exit_name(g_zfs, ksp->ks_name);
+	}
+	(void) kstat_close(kc);
 }
 
 /*
@@ -1759,6 +1800,7 @@ zpool_do_export(int argc, char **argv)
 			break;
 		case 'F':
 			hardforce = B_TRUE;
+			force = B_TRUE;
 			break;
 		case '?':
 			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
@@ -1793,6 +1835,8 @@ zpool_do_export(int argc, char **argv)
 		}
 		(void) pthread_mutex_init(&cb.mnttab_lock, NULL);
 		cb.rootpool = root_pool_name();
+		if (hardforce)
+			zpool_force_exit_all(cb.rootpool);
 
 		/* Asynchronously call zpool_export_one using thread pool */
 		ret = for_each_pool(argc, argv, B_TRUE, NULL,
@@ -1810,6 +1854,17 @@ zpool_do_export(int argc, char **argv)
 	if (argc < 1) {
 		(void) fprintf(stderr, gettext("missing pool argument\n"));
 		usage(B_FALSE);
+	}
+
+	/*
+	 * Arm the pools before opening them: a command sleeping on a
+	 * suspended pool can hold spa_namespace_lock, which opening a pool
+	 * needs, until the pool fails.  zpool_export_one() arms them again and
+	 * reports any error.
+	 */
+	if (hardforce) {
+		for (int i = 0; i < argc; i++)
+			(void) zpool_force_exit_name(g_zfs, argv[i]);
 	}
 
 	return (for_each_pool(argc, argv, B_TRUE, NULL, zpool_export_one,
@@ -7404,7 +7459,10 @@ status_callback(zpool_handle_t *zhp, void *data)
 	nvroot = fnvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE);
 	verify(nvlist_lookup_uint64_array(nvroot, ZPOOL_CONFIG_VDEV_STATS,
 	    (uint64_t **)&vs, &c) == 0);
-	health = zpool_state_to_name(vs->vs_state, vs->vs_aux);
+	if (reason == ZPOOL_STATUS_FAILED)
+		health = gettext("FAILED");
+	else
+		health = zpool_state_to_name(vs->vs_state, vs->vs_aux);
 
 	(void) printf(gettext("  pool: %s\n"), zpool_get_name(zhp));
 	(void) printf(gettext(" state: %s\n"), health);
@@ -7582,6 +7640,14 @@ status_callback(zpool_handle_t *zhp, void *data)
 		    "pool.\n"));
 		break;
 
+	case ZPOOL_STATUS_FAILED:
+		(void) printf(gettext("status: The pool has failed: it can no "
+		    "longer write to its devices, and\n\tthe changes it "
+		    "had not written when it failed have been lost.\n"));
+		(void) printf(gettext("action: Export the pool, make sure its "
+		    "devices are working, then import\n\tit again.\n"));
+		break;
+
 	case ZPOOL_STATUS_IO_FAILURE_WAIT:
 	case ZPOOL_STATUS_IO_FAILURE_CONTINUE:
 		(void) printf(gettext("status: One or more devices are "
@@ -7741,6 +7807,9 @@ status_callback(zpool_handle_t *zhp, void *data)
 				    (u_longlong_t)nerr);
 			else
 				print_error_log(zhp);
+		} else if (nvlist_exists(config, ZPOOL_CONFIG_FAILED)) {
+			(void) printf(gettext("\nerrors: Unknown, the pool has "
+			    "failed\n"));
 		}
 
 		if (cbp->cb_dedup_stats)
