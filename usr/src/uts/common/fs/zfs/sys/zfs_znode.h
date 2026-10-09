@@ -245,11 +245,14 @@ zfs_inherit_projid(znode_t *dzp)
 #define	ZTOV(ZP)	((ZP)->z_vnode)
 #define	VTOZ(VP)	((znode_t *)(VP)->v_data)
 
-/* Called on entry to each ZFS vnode and vfs operation  */
+/*
+ * Called on entry to each ZFS vnode and vfs operation.  A file system with no
+ * objset is one that zfs_resume_fs() couldn't reopen, waiting to be unmounted.
+ */
 #define	ZFS_ENTER(zfsvfs) \
 	{ \
 		rrm_enter_read(&(zfsvfs)->z_teardown_lock, FTAG); \
-		if ((zfsvfs)->z_unmounted) { \
+		if ((zfsvfs)->z_unmounted || (zfsvfs)->z_os == NULL) { \
 			ZFS_EXIT(zfsvfs); \
 			return (EIO); \
 		} \

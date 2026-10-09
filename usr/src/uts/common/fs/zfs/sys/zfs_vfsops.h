@@ -94,6 +94,11 @@ struct zfsvfs {
 #define	ZFS_OBJ_MTX_SZ	64
 	kmutex_t	z_hold_mtx[ZFS_OBJ_MTX_SZ];	/* znode hold locks */
 	taskqid_t	z_drain_task;	/* task id for the unlink drain task */
+	list_node_t	z_mounts_node;	/* on zfs_mounts while it owns z_os */
+	struct spa	*z_spa;		/* pool, while on zfs_mounts */
+	boolean_t	z_mounting;	/* zfs_domount() in progress */
+	boolean_t	z_failing;	/* zfs_fail_mounts() detaching it */
+	uint64_t	z_fail_gen;	/* last zfs_fail_mounts() to try it */
 };
 
 /*
@@ -146,6 +151,7 @@ typedef struct zfid_long {
 
 extern int zfs_suspend_fs(zfsvfs_t *zfsvfs);
 extern int zfs_resume_fs(zfsvfs_t *zfsvfs, struct dsl_dataset *ds);
+extern int zfs_fail_mounts(const char *pool);
 extern int zfs_userspace_one(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
     const char *domain, uint64_t rid, uint64_t *valuep);
 extern int zfs_userspace_many(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,

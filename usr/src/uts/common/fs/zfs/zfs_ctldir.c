@@ -1326,7 +1326,13 @@ zfsctl_umount_snapshots(vfs_t *vfsp, int fflags, cred_t *cr)
 	int error;
 
 	ASSERT(zfsvfs->z_ctldir != NULL);
-	error = zfsctl_root_lookup(zfsvfs->z_ctldir, "snapshot", &dvp,
+	/*
+	 * Not zfsctl_root_lookup(): its ZFS_ENTER() fails for a file system
+	 * that zfs_resume_fs() has given up (marked unmounted, with no
+	 * objset), which must still unmount.  Looking up the snapshot
+	 * directory doesn't touch the objset.
+	 */
+	error = gfs_vop_lookup(zfsvfs->z_ctldir, "snapshot", &dvp,
 	    NULL, 0, NULL, cr, NULL, NULL, NULL);
 	if (error != 0)
 		return (error);
