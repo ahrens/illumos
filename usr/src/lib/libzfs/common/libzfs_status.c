@@ -78,6 +78,7 @@ static char *zfs_msgid_table[] = {
 	 *	ZPOOL_STATUS_UNSUP_FEAT_WRITE
 	 *	ZPOOL_STATUS_FAULTED_DEV_R
 	 *	ZPOOL_STATUS_FAULTED_DEV_NR
+	 *	ZPOOL_STATUS_FAILED
 	 *	ZPOOL_STATUS_VERSION_OLDER
 	 *	ZPOOL_STATUS_FEAT_DISABLED
 	 *	ZPOOL_STATUS_RESILVERING
@@ -222,6 +223,13 @@ check_status(nvlist_t *config, boolean_t isimport, zpool_errata_t *erratap)
 	    (uint64_t **)&vs, &vsc) == 0);
 	verify(nvlist_lookup_uint64(config, ZPOOL_CONFIG_POOL_STATE,
 	    &stateval) == 0);
+
+	/*
+	 * A pool that has failed (failmode=death, or "zpool export -F") can
+	 * only be exported.
+	 */
+	if (nvlist_exists(config, ZPOOL_CONFIG_FAILED))
+		return (ZPOOL_STATUS_FAILED);
 
 	/*
 	 * Check whether the pool has suspended.  This comes before the
