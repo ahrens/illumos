@@ -233,6 +233,14 @@ spa_get_errlog(spa_t *spa, void *uaddr, size_t *count)
 {
 	int ret = 0;
 
+	/*
+	 * The persistent logs are in the MOS, which a failed pool can read
+	 * only where it happens to be cached (see dbuf_poison()).  Rather than
+	 * return a list that depends on that, return none.
+	 */
+	if (spa_failed(spa))
+		return (SET_ERROR(EIO));
+
 #ifdef _KERNEL
 	mutex_enter(&spa->spa_errlog_lock);
 
