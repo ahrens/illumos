@@ -30,6 +30,7 @@
  * Copyright 2017 Joyent, Inc.
  * Copyright 2017 RackTop Systems.
  * Copyright 2018 OmniOS Community Edition (OmniOSce) Association.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*
@@ -66,6 +67,7 @@
  *
  *	zpool_enable_datasets()
  *	zpool_disable_datasets()
+ *	zpool_unmount_detached()
  */
 
 #include <dirent.h>
@@ -1188,11 +1190,10 @@ zfs_iter_cb(zfs_handle_t *zhp, void *data)
 		return (0);
 	}
 
+	/* cbp owns zhp now, and closes it. */
 	libzfs_add_handle(cbp, zhp);
-	if (zfs_iter_filesystems(zhp, zfs_iter_cb, cbp) != 0) {
-		zfs_close(zhp);
+	if (zfs_iter_filesystems(zhp, zfs_iter_cb, cbp) != 0)
 		return (-1);
-	}
 	return (0);
 }
 
@@ -1523,6 +1524,7 @@ zpool_enable_datasets(zpool_handle_t *zhp, const char *mntopts, int flags)
 	zfs_handle_t *zfsp;
 	sa_init_selective_arg_t sharearg;
 	int ret = 0;
+	int iter_err = 0;
 
 	if ((zfsp = zfs_open(zhp->zpool_hdl, zhp->zpool_name,
 	    ZFS_TYPE_DATASET)) == NULL)
@@ -1535,8 +1537,10 @@ zpool_enable_datasets(zpool_handle_t *zhp, const char *mntopts, int flags)
 	 * over all child filesystems.
 	 */
 	libzfs_add_handle(&cb, zfsp);
-	if (zfs_iter_filesystems(zfsp, zfs_iter_cb, &cb) != 0)
-		goto out;
+	if (zfs_iter_filesystems(zfsp, zfs_iter_cb, &cb) != 0) {
+		/* The pool may have failed; mount what we found. */
+		iter_err = -1;
+	}
 
 	ms.ms_mntopts = mntopts;
 	ms.ms_mntflags = flags;
@@ -1567,7 +1571,7 @@ out:
 		zfs_close(cb.cb_handles[i]);
 	free(cb.cb_handles);
 
-	return (ret);
+	return (ret != 0 ? ret : iter_err);
 }
 
 static int
@@ -1577,6 +1581,20 @@ mountpoint_compare(const void *a, const void *b)
 	const char *mountb = *((char **)b);
 
 	return (strcmp(mountb, mounta));
+}
+
+/*
+ * Has the pool failed (see zpool_force_exit())?
+ */
+static boolean_t
+zpool_has_failed(zpool_handle_t *zhp)
+{
+	boolean_t missing;
+
+	if (zpool_refresh_stats(zhp, &missing) != 0 || missing)
+		return (B_FALSE);
+	return (nvlist_exists(zpool_get_config(zhp, NULL),
+	    ZPOOL_CONFIG_FAILED));
 }
 
 /* alias for 2002/240 */
@@ -1601,6 +1619,7 @@ zpool_disable_datasets(zpool_handle_t *zhp, boolean_t force)
 	int ret = -1;
 	int flags = (force ? MS_FORCE : 0);
 	sa_init_selective_arg_t sharearg;
+	boolean_t failed = zpool_has_failed(zhp);
 
 	namelen = strlen(zhp->zpool_name);
 
@@ -1679,12 +1698,14 @@ zpool_disable_datasets(zpool_handle_t *zhp, boolean_t force)
 	sharearg.zhandle_len = used;
 	ret = zfs_init_libshare_arg(hdl, SA_INIT_SHARE_API_SELECTIVE,
 	    &sharearg);
-	if (ret != 0)
+	if (ret != 0 && !failed)
 		goto out;
+	ret = -1;
 	qsort(mountpoints, used, sizeof (char *), mountpoint_compare);
 
 	/*
-	 * Walk through and first unshare everything.
+	 * Walk through and first unshare everything.  A failed pool's
+	 * file systems are unshared as far as possible.
 	 */
 	for (i = 0; i < used; i++) {
 		zfs_share_proto_t *curr_proto;
@@ -1692,9 +1713,22 @@ zpool_disable_datasets(zpool_handle_t *zhp, boolean_t force)
 		    curr_proto++) {
 			if (is_shared(hdl, mountpoints[i], *curr_proto) &&
 			    unshare_one(hdl, mountpoints[i],
-			    mountpoints[i], *curr_proto) != 0)
+			    mountpoints[i], *curr_proto) != 0 && !failed)
 				goto out;
 		}
+	}
+
+	/*
+	 * A failed pool's file systems are left mounted for the kernel to
+	 * detach as it exports the pool (see zfs_fail_mounts()), and
+	 * zpool_unmount_detached() unmounts them afterwards.  Unmounting one
+	 * now would close its log, which waits for log writes that may never
+	 * finish, and would race with the mounts and receives that the
+	 * pool's failure woke up.
+	 */
+	if (failed) {
+		ret = 0;
+		goto out;
 	}
 
 	/*
@@ -1722,4 +1756,92 @@ out:
 	free(mountpoints);
 
 	return (ret);
+}
+
+/*
+ * Forcibly unmount a file system detached from its failed pool.  umount2()
+ * fails with EBUSY rather than wait while another thread holds the lock on the
+ * vnode the file system is mounted on (vn_vfswlock()), and a lookup that
+ * crosses the mountpoint holds it for a moment.  Processes that keep looking
+ * up paths in a detached file system, each failing at once with EIO, can hold
+ * it nearly all the time, so keep trying for a while.
+ */
+#define	UNMOUNT_DETACHED_TRIES	500	/* 10 ms apart */
+
+static int
+unmount_detached(libzfs_handle_t *hdl, const char *mountpoint)
+{
+	for (int i = 1; umount2(mountpoint, MS_FORCE) != 0; i++) {
+		if (errno != EBUSY || i == UNMOUNT_DETACHED_TRIES) {
+			zfs_error_aux(hdl, strerror(errno));
+			return (zfs_error_fmt(hdl, EZFS_UMOUNTFAILED,
+			    dgettext(TEXT_DOMAIN, "cannot unmount '%s'"),
+			    mountpoint));
+		}
+		(void) usleep(10000);
+	}
+
+	return (0);
+}
+
+/*
+ * Once a failed pool has been exported, unmount the file systems that the
+ * kernel detached from it rather than leave them for the administrator (see
+ * zpool_disable_datasets()).  Their operations fail with EIO, and they are
+ * unmounted forcibly, nested file systems before their parents.  A pool of
+ * the same name may have been imported meanwhile: leave alone the file
+ * systems that work.  Returns the number left mounted, each of which is
+ * reported.  Unlike an export, this leaves the mountpoint directories in
+ * place: whether to remove one depends on the dataset's properties (see
+ * remove_mountpoint()), which can't be read once the pool has failed.
+ */
+int
+zpool_unmount_detached(libzfs_handle_t *hdl, const char *pool)
+{
+	struct mnttab entry;
+	size_t namelen = strlen(pool);
+	char **mountpoints = NULL;
+	int used = 0, alloc = 0, left = 0;
+
+	rewind(hdl->libzfs_mnttab);
+	while (getmntent(hdl->libzfs_mnttab, &entry) == 0) {
+		if (entry.mnt_fstype == NULL ||
+		    strcmp(entry.mnt_fstype, MNTTYPE_ZFS) != 0 ||
+		    entry.mnt_mountp == NULL ||
+		    strncmp(entry.mnt_special, pool, namelen) != 0 ||
+		    (entry.mnt_special[namelen] != '/' &&
+		    entry.mnt_special[namelen] != '\0'))
+			continue;
+
+		if (used == alloc) {
+			int n = (alloc == 0 ? 8 : alloc * 2);
+			void *ptr = zfs_realloc(hdl, mountpoints,
+			    alloc * sizeof (char *), n * sizeof (char *));
+			if (ptr == NULL) {
+				left++;
+				continue;
+			}
+			mountpoints = ptr;
+			alloc = n;
+		}
+		if ((mountpoints[used] = zfs_strdup(hdl,
+		    entry.mnt_mountp)) == NULL) {
+			left++;
+			continue;
+		}
+		used++;
+	}
+
+	qsort(mountpoints, used, sizeof (char *), mountpoint_compare);
+	for (int i = 0; i < used; i++) {
+		struct statvfs64 sv;
+
+		if (statvfs64(mountpoints[i], &sv) != 0 && errno == EIO &&
+		    unmount_detached(hdl, mountpoints[i]) != 0)
+			left++;
+		free(mountpoints[i]);
+	}
+	free(mountpoints);
+
+	return (left);
 }

@@ -752,6 +752,8 @@ extern int spa_checkpoint(const char *pool);
 extern int spa_checkpoint_discard(const char *pool);
 extern int spa_export(char *pool, nvlist_t **oldconfig, boolean_t force,
     boolean_t hardforce);
+extern int spa_export_by(char *pool, boolean_t force, boolean_t hardforce,
+    clock_t deadline);
 extern int spa_reset(char *pool);
 extern void spa_async_request(spa_t *spa, int flag);
 extern void spa_async_unrequest(spa_t *spa, int flag);
@@ -974,6 +976,8 @@ extern boolean_t spa_failed(spa_t *spa);
 extern void spa_fail(spa_t *spa);
 extern void spa_exit_arm(spa_t *spa);
 extern int spa_exit_arm_by_name(const char *name);
+extern boolean_t spa_failed_by_name(const char *name);
+extern clock_t spa_exit_deadline(void);
 extern void spa_exit_init(void);
 extern void spa_exit_fini(void);
 extern void spa_exit_unload_wait(spa_t *spa);

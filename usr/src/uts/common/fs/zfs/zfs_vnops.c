@@ -2718,12 +2718,11 @@ zfs_fsync(vnode_t *vp, int syncflag, cred_t *cr, caller_context_t *ct)
 	    (vp->v_type == VREG) && !(IS_SWAPVP(vp)))
 		(void) VOP_PUTPAGE(vp, (offset_t)0, (size_t)0, B_ASYNC, cr, ct);
 
-	if (zfsvfs->z_os->os_sync != ZFS_SYNC_DISABLED) {
-		ZFS_ENTER(zfsvfs);
-		ZFS_VERIFY_ZP(zp);
+	ZFS_ENTER(zfsvfs);
+	ZFS_VERIFY_ZP(zp);
+	if (zfsvfs->z_os->os_sync != ZFS_SYNC_DISABLED)
 		error = zil_commit(zfsvfs->z_log, zp->z_id);
-		ZFS_EXIT(zfsvfs);
-	}
+	ZFS_EXIT(zfsvfs);
 	return (error);
 }
 

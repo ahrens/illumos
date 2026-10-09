@@ -133,6 +133,17 @@ static uint32_t zvol_minors;
  *			preallocation. For dump devices, this means blocks
  *			have been allocated but not zeroed. For raw devices,
  *			blocks are allocated and either written or trimmed.
+ * ZVOL_FAILED -	The volume's pool failed while it was open, and
+ *			zvol_fail() let go of its objset.  I/O fails, opens
+ *			fail, and the minor goes away at the last close.
+ * ZVOL_EXTERNAL -	An external consumer (COMSTAR) holds pointers into
+ *			the open volume (zvol_get_volume_params()), so it
+ *			can't be failed.
+ * ZVOL_FAILING -	zvol_fail() is waiting for the volume's I/O and log
+ *			writes without zfsdev_state_lock; new I/O fails.
+ *			Set and cleared with both zfsdev_state_lock and
+ *			zv_state_lock held, so either one is enough to test
+ *			it.
  */
 enum zio_flags {
 	ZVOL_RDONLY		= 1 << 0,
@@ -144,6 +155,9 @@ enum zio_flags {
 	/* Used by both dump or raw zvols to indicate preallocation finished */
 	ZVOL_PREALLOCED		= 1 << 6,
 	ZVOL_RAW_HAS_TRIM	= 1 << 7,
+	ZVOL_FAILED		= 1 << 8,
+	ZVOL_EXTERNAL		= 1 << 9,
+	ZVOL_FAILING		= 1 << 10,
 };
 
 /*
@@ -183,6 +197,12 @@ typedef struct zvol_state {
 	kthread_t	*zv_zero_thread;
 	int		zv_zero_error;
 	uint64_t	zv_zero_off;
+	/*
+	 * Held as reader by the I/O paths that use the objset, dnode, ZIL
+	 * or block -> DVA mapping of an open volume, and as writer by
+	 * zvol_fail() while it takes them away.
+	 */
+	krwlock_t	zv_io_lock;
 } zvol_state_t;
 
 /*
@@ -309,13 +329,34 @@ zvol_minor_lookup(const char *name)
 
 	for (minor = 1; minor <= ZFSDEV_MAX_MINOR; minor++) {
 		zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
-		if (zv == NULL)
+		if (zv == NULL || (zv->zv_flags & ZVOL_FAILED))
 			continue;
 		if (strcmp(zv->zv_name, name) == 0)
 			return (zv);
 	}
 
 	return (NULL);
+}
+
+/*
+ * Start an I/O (or an ioctl) that uses the open volume's objset, dnode, ZIL
+ * or block -> DVA mapping.  It fails if zvol_fail() has taken them away.
+ */
+static int
+zvol_io_enter(zvol_state_t *zv)
+{
+	rw_enter(&zv->zv_io_lock, RW_READER);
+	if (zv->zv_flags & (ZVOL_FAILED | ZVOL_FAILING)) {
+		rw_exit(&zv->zv_io_lock);
+		return (SET_ERROR(EIO));
+	}
+	return (0);
+}
+
+static void
+zvol_io_exit(zvol_state_t *zv)
+{
+	rw_exit(&zv->zv_io_lock);
 }
 
 /* block -> DVA mapping being built by zvol_get_dvas() */
@@ -679,6 +720,7 @@ zvol_create_minor(const char *name)
 	rangelock_init(&zv->zv_rangelock, NULL, NULL);
 	mutex_init(&zv->zv_state_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&zv->zv_state_cv, NULL, CV_DEFAULT, NULL);
+	rw_init(&zv->zv_io_lock, NULL, RW_DEFAULT, NULL);
 
 	/* get and cache the blocksize */
 	error = dmu_object_info(os, ZVOL_OBJ, &doi);
@@ -717,7 +759,15 @@ zvol_remove_zv(zvol_state_t *zv)
 	minor_t minor = zv->zv_minor;
 
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
-	if (zv->zv_total_opens != 0)
+	/*
+	 * The zero thread closes its open without zfsdev_state_lock; once we
+	 * have had zv_state_lock, it is done with the volume.
+	 */
+	mutex_enter(&zv->zv_state_lock);
+	boolean_t busy = zv->zv_total_opens != 0 ||
+	    (zv->zv_flags & ZVOL_FAILING);
+	mutex_exit(&zv->zv_state_lock);
+	if (busy)
 		return (SET_ERROR(EBUSY));
 
 	/* zvol_last_close() should have cleaned these up already */
@@ -730,6 +780,7 @@ zvol_remove_zv(zvol_state_t *zv)
 	(void) snprintf(nmbuf, sizeof (nmbuf), "%u", minor);
 	ddi_remove_minor_node(zfs_dip, nmbuf);
 
+	rw_destroy(&zv->zv_io_lock);
 	cv_destroy(&zv->zv_state_cv);
 	mutex_destroy(&zv->zv_state_lock);
 	rangelock_fini(&zv->zv_rangelock);
@@ -1190,6 +1241,129 @@ zvol_remove_minors(const char *name)
 	mutex_exit(&zfsdev_state_lock);
 }
 
+/*
+ * Let go of an open volume whose pool has failed, so that it no longer holds
+ * the pool, which can then be exported: do what the last close would do.
+ * From then on, its I/O fails with EIO and its opens with ENXIO, and its
+ * minor goes away at the last close.
+ *
+ * First wait for its zero thread, for the I/O in progress, and for the log
+ * writes that reached a device before the pool failed (all of which fail at
+ * once otherwise; see zil_failed_wait()), because a device may never answer.
+ * Every zvol open, close and ioctl needs zfsdev_state_lock, so wait without
+ * it, and only until the deadline (see spa_exit_deadline()).  Meanwhile,
+ * ZVOL_FAILING keeps new I/O from starting (see zvol_io_enter()), the
+ * volume from being removed, its log from being closed, and COMSTAR from
+ * taking it (see zvol_get_volume_params()); if the last open goes away, we
+ * do the last close.
+ *
+ * Returns 0 if the volume was failed, EBUSY if it can't be (COMSTAR holds
+ * pointers into it, or it is the dump device), or if it is still busy at the
+ * deadline, and ENXIO if it was closed meanwhile.
+ */
+static int
+zvol_fail(zvol_state_t *zv, clock_t deadline)
+{
+	int error = 0;
+
+	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+
+	mutex_enter(&zv->zv_state_lock);
+	if (zv->zv_total_opens == 0) {
+		/* The zero thread closed the last open, without our lock. */
+		mutex_exit(&zv->zv_state_lock);
+		return (SET_ERROR(ENXIO));
+	}
+	if (zv->zv_flags & (ZVOL_EXTERNAL | ZVOL_DUMPIFIED)) {
+		/* See zvol_pinned_minors(). */
+		mutex_exit(&zv->zv_state_lock);
+		return (SET_ERROR(EBUSY));
+	}
+	zv->zv_flags |= ZVOL_FAILING;
+	if (zv->zv_zero_thread != NULL)
+		zv->zv_zero_exit_wanted = B_TRUE;
+	mutex_exit(&zfsdev_state_lock);
+
+	while (zv->zv_zero_thread != NULL && error == 0) {
+		if (cv_timedwait(&zv->zv_state_cv, &zv->zv_state_lock,
+		    deadline) == -1)
+			error = SET_ERROR(EBUSY);
+	}
+	zilog_t *zilog = zv->zv_zilog;
+	mutex_exit(&zv->zv_state_lock);
+
+	if (error == 0)
+		error = zil_failed_wait(zilog,
+		    MAX(deadline - ddi_get_lbolt(), 1));
+	/*
+	 * Once we have had zv_io_lock as writer, the I/O that started before
+	 * ZVOL_FAILING has finished, and later I/O fails at once.  Don't keep
+	 * it: zfsdev_state_lock comes first.
+	 */
+	while (error == 0 && !rw_tryenter(&zv->zv_io_lock, RW_WRITER)) {
+		if (ddi_get_lbolt() >= deadline)
+			error = SET_ERROR(EBUSY);
+		else
+			delay(MAX(hz / 100, 1));
+	}
+	if (error == 0)
+		rw_exit(&zv->zv_io_lock);
+
+	mutex_enter(&zfsdev_state_lock);
+	mutex_enter(&zv->zv_state_lock);
+	if (zv->zv_total_opens == 0) {
+		/* The last open went away meanwhile. */
+		zv->zv_flags &= ~ZVOL_FAILING;
+		zvol_last_close(zv);
+		error = SET_ERROR(ENXIO);
+	} else if (error == 0) {
+		/* I/O must never see neither flag. */
+		zv->zv_flags = (zv->zv_flags & ~ZVOL_FAILING) | ZVOL_FAILED;
+		zvol_last_close(zv);
+	} else {
+		zv->zv_flags &= ~ZVOL_FAILING;
+	}
+	mutex_exit(&zv->zv_state_lock);
+
+	return (error);
+}
+
+/*
+ * If the named pool has failed, fail (see zvol_fail()) its open volumes, and
+ * remove the minors of the others.  Returns the number failed.
+ */
+int
+zvol_fail_minors(const char *name, clock_t deadline)
+{
+	size_t len = strlen(name);
+	int failed = 0;
+
+	if (!spa_failed_by_name(name))
+		return (0);
+
+	mutex_enter(&zfsdev_state_lock);
+	for (minor_t minor = 1; minor <= ZFSDEV_MAX_MINOR; minor++) {
+		zvol_state_t *zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
+
+		if (zv == NULL || (zv->zv_flags & ZVOL_FAILING) ||
+		    strncmp(name, zv->zv_name, len) != 0 ||
+		    (zv->zv_name[len] != '/' && zv->zv_name[len] != '@'))
+			continue;
+		if (zv->zv_total_opens != 0 && !(zv->zv_flags & ZVOL_FAILED)) {
+			int error = zvol_fail(zv, deadline);
+			if (error == 0)
+				failed++;
+			if (error != ENXIO)
+				continue;
+		}
+		if (zv->zv_total_opens == 0)
+			(void) zvol_remove_zv(zv);
+	}
+	mutex_exit(&zfsdev_state_lock);
+
+	return (failed);
+}
+
 static int
 zvol_update_live_volsize(zvol_state_t *zv, uint64_t volsize)
 {
@@ -1294,6 +1468,12 @@ zvol_open_impl(zvol_state_t *zv, int flag, int otyp)
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 
 	mutex_enter(&zv->zv_state_lock);
+	/* A volume being failed may have its last close still to come. */
+	if ((zv->zv_flags & ZVOL_FAILED) ||
+	    ((zv->zv_flags & ZVOL_FAILING) && zv->zv_total_opens == 0)) {
+		mutex_exit(&zv->zv_state_lock);
+		return (SET_ERROR(ENXIO));
+	}
 	if (zv->zv_total_opens == 0)
 		err = zvol_first_open(zv, !(flag & FWRITE));
 	if (err) {
@@ -1373,7 +1553,13 @@ zvol_close_impl(zvol_state_t *zv, int otyp)
 	VERIFY3S(zv->zv_total_opens, >=, 0);
 
 	if (zv->zv_total_opens == 0) {
-		zvol_last_close(zv);
+		zv->zv_flags &= ~ZVOL_EXTERNAL;
+		/*
+		 * zvol_fail() already did this for a failed volume, and
+		 * does it for one that it is waiting on.
+		 */
+		if (!(zv->zv_flags & (ZVOL_FAILED | ZVOL_FAILING)))
+			zvol_last_close(zv);
 	}
 	mutex_exit(&zv->zv_state_lock);
 }
@@ -1404,7 +1590,8 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 	 * meantime (see zvol_remove_zv()).  If another open comes in, the wait
 	 * was merely unnecessary.
 	 */
-	if (zv->zv_total_opens == 1 && !(zv->zv_flags & ZVOL_RDONLY) &&
+	if (zv->zv_total_opens == 1 &&
+	    !(zv->zv_flags & (ZVOL_RDONLY | ZVOL_FAILED)) &&
 	    dsl_dataset_is_dirty(dmu_objset_ds(zv->zv_objset))) {
 		mutex_exit(&zfsdev_state_lock);
 		txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
@@ -1412,6 +1599,11 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 	}
 
 	zvol_close_impl(zv, otyp);
+
+	/* The last close of a failed volume removes it. */
+	if ((zv->zv_flags & ZVOL_FAILED) && zv->zv_total_opens == 0)
+		(void) zvol_remove_zv(zv);
+
 	mutex_exit(&zfsdev_state_lock);
 	return (error);
 }
@@ -1587,6 +1779,13 @@ zvol_dumpio(zvol_state_t *zv, caddr_t addr, uint64_t vol_offset, uint64_t size,
 
 	ASSERT(zv->zv_flags & ZVOL_PREALLOCED);
 
+	/*
+	 * Dump I/O goes straight to the vdevs, so it must stop at a failed
+	 * pool's fence itself (see zvol_rawio()).
+	 */
+	if (spa_failed(spa))
+		return (SET_ERROR(EIO));
+
 	/* Must be sector aligned, and not straddle a block boundary. */
 	if (P2PHASE(vol_offset, DEV_BSIZE) || P2PHASE(size, DEV_BSIZE) ||
 	    P2BOUNDARY(vol_offset, size, zv->zv_volblocksize)) {
@@ -1701,6 +1900,16 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 	uint64_t dva_offset = vol_offset % zv->zv_volblocksize;
 
 	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+
+	/*
+	 * Raw I/O goes straight to the vdevs, without a zio, so the fence
+	 * that keeps a failed pool's I/O from its disks (see
+	 * zio_vdev_io_fence()) doesn't see it.
+	 */
+	if (spa_failed(spa)) {
+		spa_config_exit(spa, SCL_STATE, FTAG);
+		return (SET_ERROR(EIO));
+	}
 
 	vdev_t *vd = vdev_lookup_top(spa, DVA_GET_VDEV(dva));
 	VERIFY3P(vd, !=, NULL);
@@ -1823,9 +2032,6 @@ zvol_strategy(buf_t *bp)
 	off = ldbtob(bp->b_blkno);
 	volsize = zv->zv_volsize;
 
-	os = zv->zv_objset;
-	ASSERT(os != NULL);
-
 	resid = bp->b_bcount;
 	if (resid > 0 && off >= volsize) {
 		bioerror(bp, EIO);
@@ -1833,8 +2039,19 @@ zvol_strategy(buf_t *bp)
 		return (0);
 	}
 
+	if ((error = zvol_io_enter(zv)) != 0) {
+		bioerror(bp, error);
+		biodone(bp);
+		return (0);
+	}
+
+	os = zv->zv_objset;
+	ASSERT(os != NULL);
+
 	if (zv->zv_flags & ZVOL_RAW) {
-		return (zvol_raw_strategy(zv, bp));
+		(void) zvol_raw_strategy(zv, bp);
+		zvol_io_exit(zv);
+		return (0);
 	}
 
 	is_dumpified = zv->zv_flags & ZVOL_DUMPIFIED;
@@ -1898,6 +2115,7 @@ zvol_strategy(buf_t *bp)
 		if (cerror != 0 && geterror(bp) == 0)
 			bioerror(bp, cerror);
 	}
+	zvol_io_exit(zv);
 	biodone(bp);
 
 	smt_end_unsafe();
@@ -1933,6 +2151,14 @@ zvol_dump(dev_t dev, caddr_t addr, daddr_t blkno, int nblocks)
 	zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
 	if (zv == NULL)
 		return (SET_ERROR(ENXIO));
+
+	/*
+	 * The volume's pool failed, and zvol_fail() let go of its objset and
+	 * block -> DVA mapping.  We're dumping after a panic, so we can't take
+	 * zv_io_lock (see zvol_io_enter()), but nothing changes now.
+	 */
+	if (zv->zv_flags & ZVOL_FAILED)
+		return (SET_ERROR(EIO));
 
 	if ((zv->zv_flags & ZVOL_DUMPIFIED) == 0)
 		return (SET_ERROR(EINVAL));
@@ -2008,6 +2234,9 @@ zvol_read(dev_t dev, uio_t *uio, cred_t *cr)
 		return (error);
 	}
 
+	if ((error = zvol_io_enter(zv)) != 0)
+		return (error);
+
 	smt_begin_unsafe();
 
 	locked_range_t *lr = rangelock_enter(&zv->zv_rangelock,
@@ -2031,6 +2260,7 @@ zvol_read(dev_t dev, uio_t *uio, cred_t *cr)
 
 	smt_end_unsafe();
 
+	zvol_io_exit(zv);
 	return (error);
 }
 
@@ -2088,6 +2318,9 @@ zvol_write(dev_t dev, uio_t *uio, cred_t *cr)
 		return (error);
 	}
 
+	if ((error = zvol_io_enter(zv)) != 0)
+		return (error);
+
 	smt_begin_unsafe();
 
 	commit = !(zv->zv_flags & ZVOL_WCE) ||
@@ -2127,6 +2360,7 @@ zvol_write(dev_t dev, uio_t *uio, cred_t *cr)
 
 	smt_end_unsafe();
 
+	zvol_io_exit(zv);
 	return (error);
 }
 
@@ -2204,8 +2438,17 @@ zvol_get_volume_params(minor_t minor, uint64_t *blksize,
 	zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
 	if (zv == NULL)
 		return (SET_ERROR(ENXIO));
-	if (zv->zv_flags & ZVOL_DUMPIFIED)
+	/*
+	 * Once COMSTAR has these pointers, zvol_fail() can't take them away;
+	 * zv_state_lock keeps it from starting meanwhile.
+	 */
+	mutex_enter(&zv->zv_state_lock);
+	if (zv->zv_flags & (ZVOL_DUMPIFIED | ZVOL_FAILED | ZVOL_FAILING)) {
+		mutex_exit(&zv->zv_state_lock);
 		return (SET_ERROR(ENXIO));
+	}
+	zv->zv_flags |= ZVOL_EXTERNAL;
+	mutex_exit(&zv->zv_state_lock);
 
 	ASSERT(blksize && max_xfer_len && minor_hdl &&
 	    objset_hdl && zil_hdl && rl_hdl && dnode_hdl);
@@ -2467,7 +2710,10 @@ out:
 
 		smt_begin_unsafe();
 
-		error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
+		if ((error = zvol_io_enter(zv)) == 0) {
+			error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
+			zvol_io_exit(zv);
+		}
 		if ((flag & FKIOCTL) && dkc != NULL && dkc->dkc_callback) {
 			(*dkc->dkc_callback)(dkc->dkc_cookie, error);
 			error = 0;
@@ -2500,7 +2746,10 @@ out:
 			zv->zv_flags &= ~ZVOL_WCE;
 			mutex_exit(&zfsdev_state_lock);
 			smt_begin_unsafe();
-			error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
+			if ((error = zvol_io_enter(zv)) == 0) {
+				error = zil_commit(zv->zv_zilog, ZVOL_OBJ);
+				zvol_io_exit(zv);
+			}
 			smt_end_unsafe();
 		}
 		return (error);
@@ -2516,6 +2765,10 @@ out:
 		break;
 
 	case DKIOCDUMPINIT:
+		if (zv->zv_flags & ZVOL_FAILED) {
+			error = SET_ERROR(EIO);
+			break;
+		}
 		lr = rangelock_enter(&zv->zv_rangelock, 0, zv->zv_volsize,
 		    RL_WRITER);
 		error = zvol_dumpify(zv);
@@ -2525,6 +2778,10 @@ out:
 	case DKIOCDUMPFINI:
 		if (!(zv->zv_flags & ZVOL_DUMPIFIED))
 			break;
+		if (zv->zv_flags & ZVOL_FAILED) {
+			error = SET_ERROR(EIO);
+			break;
+		}
 		lr = rangelock_enter(&zv->zv_rangelock, 0, zv->zv_volsize,
 		    RL_WRITER);
 		error = zvol_dump_fini(zv);
@@ -2556,6 +2813,12 @@ out:
 		}
 
 		mutex_exit(&zfsdev_state_lock);
+
+		if ((error = zvol_io_enter(zv)) != 0) {
+			if (!(flag & FKIOCTL))
+				dfl_free(dfl);
+			return (error);
+		}
 
 		smt_begin_unsafe();
 
@@ -2629,6 +2892,7 @@ out:
 
 		smt_end_unsafe();
 
+		zvol_io_exit(zv);
 		return (error);
 	}
 

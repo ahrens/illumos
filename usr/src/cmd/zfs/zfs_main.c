@@ -6720,8 +6720,30 @@ unshare_unmount_path(int op, char *path, int flags, boolean_t is_manual)
 	 * (major,minor) device pair.
 	 */
 	if (stat64(path, &statbuf) != 0) {
+		int err = errno;
+		struct mnttab search = { 0 };
+		struct mnttab mnt;
+
+		/*
+		 * A file system detached from its failed pool (see
+		 * zpool_disable_datasets()) fails every operation with EIO,
+		 * stat() included, and can't be opened by name once the pool
+		 * is gone.  Unmount it by its mountpoint.
+		 */
+		search.mnt_mountp = path;
+		search.mnt_fstype = MNTTYPE_ZFS;
+		rewind(mnttab_file);
+		if (err == EIO && op == OP_MOUNT &&
+		    getmntany(mnttab_file, &mnt, &search) == 0) {
+			if ((ret = umount2(path, flags)) != 0) {
+				(void) fprintf(stderr, gettext("cannot %s "
+				    "'%s': %s\n"), cmdname, path,
+				    strerror(errno));
+			}
+			return (ret != 0);
+		}
 		(void) fprintf(stderr, gettext("cannot %s '%s': %s\n"),
-		    cmdname, path, strerror(errno));
+		    cmdname, path, strerror(err));
 		return (1);
 	}
 	path_inode = statbuf.st_ino;

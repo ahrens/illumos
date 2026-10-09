@@ -1148,8 +1148,17 @@ zcp_eval(const char *poolname, const char *program, boolean_t sync,
 	if (sync) {
 		err = dsl_sync_task_sig(poolname, NULL, zcp_eval_sync,
 		    zcp_eval_sig, &runinfo, 0, ZFS_SPACE_CHECK_ZCP_EVAL);
-		if (err != 0)
+		if (err == EIO && spa_failed_by_name(poolname)) {
+			/* The program may have run, but nothing was kept. */
+			runinfo.zri_result = SET_ERROR(EIO);
+			lua_settop(state, 0);
+			(void) lua_pushfstring(state, "Pool failed: %s",
+			    poolname);
+			zcp_convert_return_values(state, runinfo.zri_outnvl,
+			    ZCP_RET_ERROR, &runinfo.zri_result);
+		} else if (err != 0) {
 			zcp_pool_error(&runinfo, poolname);
+		}
 	} else {
 		zcp_eval_open(&runinfo, poolname);
 	}

@@ -1523,6 +1523,8 @@ getzfsvfs(const char *dsname, zfsvfs_t **zfvp)
 	return (error);
 }
 
+static void zfsvfs_rele(zfsvfs_t *zfsvfs, void *tag);
+
 /*
  * Find a zfsvfs_t for a mounted filesystem, or create our own, in which
  * case its z_vfs will be NULL, and it will be opened as the owner.
@@ -1547,6 +1549,11 @@ zfsvfs_hold(const char *name, void *tag, zfsvfs_t **zfvp, boolean_t writer)
 			 */
 			rrm_exit(&(*zfvp)->z_teardown_lock, tag);
 			return (SET_ERROR(EBUSY));
+		}
+		if ((*zfvp)->z_os == NULL) {
+			/* Detached from its failed pool (zfsvfs_detach()). */
+			zfsvfs_rele(*zfvp, tag);
+			return (SET_ERROR(EIO));
 		}
 	}
 	return (error);
@@ -1707,7 +1714,25 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	boolean_t hardforce = (boolean_t)zc->zc_guid;
 
 	zfs_log_history(zc);
-	error = spa_export(zc->zc_name, NULL, force, hardforce);
+
+	/*
+	 * The open volumes and mounted file systems of a failed pool would
+	 * keep it from being exported, so fail the volumes (see zvol_fail())
+	 * and detach the file systems (see zfs_fail_mounts()) first.  If the
+	 * pool fails while we export it, they are still there, so try again
+	 * once.  Arming the pool first fails it now if it is suspended.  All
+	 * of this waits for the pool's users to let go of it until one
+	 * deadline.
+	 */
+	if (hardforce)
+		(void) spa_exit_arm_by_name(zc->zc_name);
+	clock_t deadline = spa_exit_deadline();
+	(void) zfs_fail_mounts(zc->zc_name, deadline);
+	(void) zvol_fail_minors(zc->zc_name, deadline);
+	error = spa_export_by(zc->zc_name, force, hardforce, deadline);
+	if (error == EBUSY && zfs_fail_mounts(zc->zc_name, deadline) +
+	    zvol_fail_minors(zc->zc_name, deadline) != 0)
+		error = spa_export_by(zc->zc_name, force, hardforce, deadline);
 	if (error == 0)
 		zvol_remove_minors(zc->zc_name);
 	return (error);
@@ -4254,11 +4279,13 @@ zfs_ioc_rollback(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 	}
 
 	if (getzfsvfs(fsname, &zfsvfs) == 0) {
-		dsl_dataset_t *ds;
-
-		ds = dmu_objset_ds(zfsvfs->z_os);
+		/*
+		 * Read z_os only once the file system is suspended: it may
+		 * have been detached from a failed pool (zfsvfs_detach()).
+		 */
 		error = zfs_suspend_fs(zfsvfs);
 		if (error == 0) {
+			dsl_dataset_t *ds = dmu_objset_ds(zfsvfs->z_os);
 			int resume_err;
 
 			error = dsl_dataset_rollback(fsname, target, zfsvfs,
@@ -4959,11 +4986,13 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, char *origin, nvlist_t *recvprops,
 
 		if (getzfsvfs(tofs, &zfsvfs) == 0) {
 			/* online recv */
-			dsl_dataset_t *ds;
+			dsl_dataset_t *ds = NULL;
 			int end_err;
 
-			ds = dmu_objset_ds(zfsvfs->z_os);
+			/* See zfs_ioc_rollback(). */
 			error = zfs_suspend_fs(zfsvfs);
+			if (error == 0)
+				ds = dmu_objset_ds(zfsvfs->z_os);
 			/*
 			 * If the suspend fails, then the recv_end will
 			 * likely also fail, and clean up after itself.
@@ -5709,41 +5738,62 @@ zfs_ioc_userspace_upgrade(zfs_cmd_t *zc)
 	zfsvfs_t *zfsvfs;
 
 	if (getzfsvfs(zc->zc_name, &zfsvfs) == 0) {
-		if (!dmu_objset_userused_enabled(zfsvfs->z_os)) {
+		/*
+		 * Use z_os only with z_teardown_lock held: the file system
+		 * may have been detached from a failed pool (zfsvfs_detach()).
+		 */
+		boolean_t enabled = B_FALSE;
+
+		rrm_enter_read(&zfsvfs->z_teardown_lock, FTAG);
+		if (zfsvfs->z_os == NULL)
+			error = SET_ERROR(EIO);
+		else
+			enabled = dmu_objset_userused_enabled(zfsvfs->z_os);
+		rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+		if (error == 0 && !enabled) {
 			/*
 			 * If userused is not enabled, it may be because the
 			 * objset needs to be closed & reopened (to grow the
 			 * objset_phys_t).  Suspend/resume the fs will do that.
 			 */
-			dsl_dataset_t *ds, *newds;
-
-			ds = dmu_objset_ds(zfsvfs->z_os);
 			error = zfs_suspend_fs(zfsvfs);
 			if (error == 0) {
+				dsl_dataset_t *ds, *newds;
+
+				ds = dmu_objset_ds(zfsvfs->z_os);
 				dmu_objset_refresh_ownership(ds, &newds,
 				    B_TRUE, zfsvfs);
 				error = zfs_resume_fs(zfsvfs, newds);
 			}
 		}
 		if (error == 0) {
-			mutex_enter(&zfsvfs->z_os->os_upgrade_lock);
-			if (zfsvfs->z_os->os_upgrade_id == 0) {
-				/* clear potential error code and retry */
-				zfsvfs->z_os->os_upgrade_status = 0;
-				mutex_exit(&zfsvfs->z_os->os_upgrade_lock);
+			objset_t *os;
 
-				dsl_pool_config_enter(
-				    dmu_objset_pool(zfsvfs->z_os), FTAG);
-				dmu_objset_userspace_upgrade(zfsvfs->z_os);
-				dsl_pool_config_exit(
-				    dmu_objset_pool(zfsvfs->z_os), FTAG);
+			rrm_enter_read(&zfsvfs->z_teardown_lock, FTAG);
+			os = zfsvfs->z_os;
+			if (os == NULL) {
+				error = SET_ERROR(EIO);
 			} else {
-				mutex_exit(&zfsvfs->z_os->os_upgrade_lock);
-			}
+				mutex_enter(&os->os_upgrade_lock);
+				if (os->os_upgrade_id == 0) {
+					/* clear any old error and retry */
+					os->os_upgrade_status = 0;
+					mutex_exit(&os->os_upgrade_lock);
 
-			taskq_wait_id(zfsvfs->z_os->os_spa->spa_upgrade_taskq,
-			    zfsvfs->z_os->os_upgrade_id);
-			error = zfsvfs->z_os->os_upgrade_status;
+					dsl_pool_config_enter(
+					    dmu_objset_pool(os), FTAG);
+					dmu_objset_userspace_upgrade(os);
+					dsl_pool_config_exit(
+					    dmu_objset_pool(os), FTAG);
+				} else {
+					mutex_exit(&os->os_upgrade_lock);
+				}
+
+				taskq_wait_id(os->os_spa->spa_upgrade_taskq,
+				    os->os_upgrade_id);
+				error = os->os_upgrade_status;
+			}
+			rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
 		}
 		VFS_RELE(zfsvfs->z_vfs);
 	} else {

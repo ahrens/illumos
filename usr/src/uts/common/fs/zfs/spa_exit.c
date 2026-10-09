@@ -97,10 +97,15 @@
  * since spa_lookup(), and every command that looks a pool up, waits for that.
  * Open volumes would keep the pool busy, so zfs_ioc_pool_export() fails them
  * first (zvol_fail_minors()): their I/O fails with EIO, their opens with
- * ENXIO, and their minors go away at the last close.  The intent logs are
- * closed without committing anything (zil_failed_close()).  spa_unload()
- * waits for the arming threads (spa_exit_unload_wait()), and spa_activate()
- * starts the next import of the pool in SPA_EXIT_NONE.
+ * ENXIO, and their minors go away at the last close.  So would mounted file
+ * systems, so it detaches them (zfs_fail_mounts()): they release their
+ * datasets and stay mounted, and their operations fail with EIO.  "zpool
+ * export" unmounts them once the pool is gone.  Unmounting them first can't
+ * be relied on: it races with the mounts and receives that the failure woke
+ * up, and closing their logs waits for writes that may never finish.  The
+ * intent logs are closed without committing anything (zil_failed_close()).
+ * spa_unload() waits for the arming threads (spa_exit_unload_wait()), and
+ * spa_activate() starts the next import of the pool in SPA_EXIT_NONE.
  */
 
 #include <sys/zfs_context.h>
@@ -234,44 +239,82 @@ spa_exit_unload_wait(spa_t *spa)
 }
 
 /*
+ * Find the named pool (or the pool of the named dataset) in
+ * spa_namespace_avl, with spa_namespace_avl_lock held rather than
+ * spa_namespace_lock.  Unlike spa_lookup(), this does not wait for an import
+ * or export in progress.
+ */
+static spa_t *
+spa_exit_find(const char *name)
+{
+	/*
+	 * A spa_t is too big for the stack; spa_namespace_avl_lock guards it.
+	 */
+	static spa_t search;
+
+	ASSERT(MUTEX_HELD(&spa_namespace_avl_lock));
+
+	(void) strlcpy(search.spa_name, name, sizeof (search.spa_name));
+	search.spa_name[strcspn(search.spa_name, "/@#")] = '\0';
+	return (avl_find(&spa_namespace_avl, &search, NULL));
+}
+
+/*
  * Arm the named pool for forced exit (see spa_exit_arm()) without taking
  * spa_namespace_lock, which may be held indefinitely by a thread sleeping on
- * that very pool.  spa_namespace_avl_lock keeps the tree intact while we look,
- * and spa_exit_hold() keeps the pool while we arm it.  Unlike spa_lookup(),
- * this does not wait for an import or export in progress.  A pool that has
- * nothing to arm (see spa_exit_hold()) is exported as usual, so that isn't an
- * error.
+ * that very pool.  spa_exit_hold() keeps the pool while we arm it.  A pool
+ * that has nothing to arm (see spa_exit_hold()) is exported as usual, so that
+ * isn't an error.
  */
 int
 spa_exit_arm_by_name(const char *name)
 {
-	size_t len = strcspn(name, "/@#");
-	int error = SET_ERROR(ENOENT);
-	spa_t *spa;
-
-	/* A spa_t is too big for the stack, so walk the tree. */
 	mutex_enter(&spa_namespace_avl_lock);
-	for (spa = avl_first(&spa_namespace_avl); spa != NULL;
-	    spa = AVL_NEXT(&spa_namespace_avl, spa)) {
-		if (strncmp(spa->spa_name, name, len) == 0 &&
-		    spa->spa_name[len] == '\0')
-			break;
+	spa_t *spa = spa_exit_find(name);
+	if (spa == NULL) {
+		mutex_exit(&spa_namespace_avl_lock);
+		return (SET_ERROR(ENOENT));
 	}
-	if (spa != NULL) {
-		error = 0;
-		if (!spa_exit_hold(spa))
-			spa = NULL;
-	}
+	boolean_t held = spa_exit_hold(spa);
 	mutex_exit(&spa_namespace_avl_lock);
 
-	if (spa != NULL) {
+	if (held) {
 		spa_exit_arm(spa);
 		mutex_enter(&spa_namespace_avl_lock);
 		spa_exit_rele(spa);
 		mutex_exit(&spa_namespace_avl_lock);
 	}
 
-	return (error);
+	return (0);
+}
+
+/*
+ * The export of a failed pool waits for its file systems, volumes and other
+ * users to let go of it (see zfs_ioc_pool_export()) until this deadline, in
+ * lbolt ticks: TXG_SIZE * zfs_txg_timeout seconds from now, as long as the
+ * pool could take to sync what it had in flight.
+ */
+clock_t
+spa_exit_deadline(void)
+{
+	extern int zfs_txg_timeout;
+
+	return (ddi_get_lbolt() + TXG_SIZE * zfs_txg_timeout * hz);
+}
+
+/*
+ * Has the named pool failed (see spa_failed())?  Like
+ * spa_exit_arm_by_name(), this doesn't take spa_namespace_lock.
+ */
+boolean_t
+spa_failed_by_name(const char *name)
+{
+	mutex_enter(&spa_namespace_avl_lock);
+	spa_t *spa = spa_exit_find(name);
+	boolean_t failed = (spa != NULL && spa_failed(spa));
+	mutex_exit(&spa_namespace_avl_lock);
+
+	return (failed);
 }
 
 /*

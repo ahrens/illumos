@@ -161,7 +161,8 @@ static void spa_sync_props(void *arg, dmu_tx_t *tx);
 static boolean_t spa_has_active_shared_spare(spa_t *spa);
 static int spa_load_impl(spa_t *spa, spa_import_type_t type, char **ereport);
 static void spa_vdev_resilver_done(spa_t *spa);
-static int spa_export_failed_wait(spa_t *spa);
+static int spa_export_failed_wait(spa_t *spa, int new_state,
+    clock_t deadline);
 
 uint_t		zio_taskq_batch_pct = 75;	/* 1 thread per cpu in pset */
 id_t		zio_taskq_psrset_bind = PS_NONE;
@@ -6127,7 +6128,7 @@ int spa_export_skip_update = 0;
 
 static int
 spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
-    boolean_t force, boolean_t hardforce)
+    boolean_t force, boolean_t hardforce, clock_t deadline)
 {
 	int error = 0;
 	spa_t *spa;
@@ -6231,7 +6232,7 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	 * we do.  spa_is_exporting keeps other exports out meanwhile.
 	 */
 	if (failed) {
-		error = spa_export_failed_wait(spa);
+		error = spa_export_failed_wait(spa, new_state, deadline);
 		if (error != 0)
 			goto fail;
 	}
@@ -6389,23 +6390,22 @@ fail:
 }
 
 /*
- * Wait for the references on a failed pool to go away, for up to
- * TXG_SIZE * zfs_txg_timeout seconds.  Its file systems have been unmounted,
- * and threads that were waiting on it have been woken up and are failing out.
- * Fault injection handlers, which also keep a pool from being exported, are
- * waited for too.  Called and returns with spa_namespace_lock held, which is
- * dropped while we wait.  Returns EBUSY if references remain, or EINTR.
+ * Wait for the references on a failed pool to go away, until the deadline
+ * (see spa_exit_deadline()).  Its file systems have been unmounted
+ * or detached (zfs_fail_mounts()), and threads that were waiting on it have
+ * been woken up and are failing out.
+ * Fault injection handlers, which also keep a pool from being exported, but
+ * not reset, are waited for too.  Called and returns with spa_namespace_lock
+ * held, which is dropped while we wait.  Returns EBUSY if references remain.
  */
 static int
-spa_export_failed_wait(spa_t *spa)
+spa_export_failed_wait(spa_t *spa, int new_state, clock_t deadline)
 {
-	extern int zfs_txg_timeout;
-	clock_t deadline = ddi_get_lbolt() + TXG_SIZE * zfs_txg_timeout * hz;
-
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
 	ASSERT(spa_failed(spa));
 
-	while (!spa_refcount_zero(spa) || spa->spa_inject_ref != 0) {
+	while (!spa_refcount_zero(spa) || (spa->spa_inject_ref != 0 &&
+	    new_state != POOL_STATE_UNINITIALIZED)) {
 		clock_t now = ddi_get_lbolt();
 
 		if (now >= deadline) {
@@ -6417,9 +6417,8 @@ spa_export_failed_wait(spa_t *spa)
 			return (SET_ERROR(EBUSY));
 		}
 		/* Holders don't signal us when they let go, so poll. */
-		if (cv_timedwait_sig(&spa_namespace_cv, &spa_namespace_lock,
-		    MIN(deadline, now + MAX(hz / 10, 1))) == 0)
-			return (SET_ERROR(EINTR));
+		(void) cv_timedwait(&spa_namespace_cv, &spa_namespace_lock,
+		    MIN(deadline, now + MAX(hz / 10, 1)));
 	}
 	return (0);
 }
@@ -6431,7 +6430,7 @@ int
 spa_destroy(char *pool)
 {
 	return (spa_export_common(pool, POOL_STATE_DESTROYED, NULL,
-	    B_FALSE, B_FALSE));
+	    B_FALSE, B_FALSE, spa_exit_deadline()));
 }
 
 /*
@@ -6442,7 +6441,19 @@ spa_export(char *pool, nvlist_t **oldconfig, boolean_t force,
     boolean_t hardforce)
 {
 	return (spa_export_common(pool, POOL_STATE_EXPORTED, oldconfig,
-	    force, hardforce));
+	    force, hardforce, spa_exit_deadline()));
+}
+
+/*
+ * Export a storage pool.  If it has failed, wait for its users to let go of
+ * it only until the deadline (see spa_exit_deadline()).
+ */
+int
+spa_export_by(char *pool, boolean_t force, boolean_t hardforce,
+    clock_t deadline)
+{
+	return (spa_export_common(pool, POOL_STATE_EXPORTED, NULL,
+	    force, hardforce, deadline));
 }
 
 /*
@@ -6453,7 +6464,7 @@ int
 spa_reset(char *pool)
 {
 	return (spa_export_common(pool, POOL_STATE_UNINITIALIZED, NULL,
-	    B_FALSE, B_FALSE));
+	    B_FALSE, B_FALSE, spa_exit_deadline()));
 }
 
 /*
@@ -7737,7 +7748,7 @@ spa_vdev_split_mirror(spa_t *spa, char *newname, nvlist_t *config,
 	/* if we're not going to mount the filesystems in userland, export */
 	if (exp)
 		error = spa_export_common(newname, POOL_STATE_EXPORTED, NULL,
-		    B_FALSE, B_FALSE);
+		    B_FALSE, B_FALSE, spa_exit_deadline());
 
 	return (error);
 
