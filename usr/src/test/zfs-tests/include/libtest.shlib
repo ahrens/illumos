@@ -30,6 +30,7 @@
 # Copyright (c) 2025, Klara, Inc.
 # Copyright 2024 MNX Cloud, Inc.
 # Copyright 2026 Gordon W. Ross
+# Copyright 2026 Oxide Computer Company
 #
 
 UNAME=$(uname)
@@ -1216,6 +1217,25 @@ function create_pool #pool devs_list
 	fi
 
 	return 0
+}
+
+#
+# Export a pool without updating its labels or the cache file, leaving it on
+# disk as though the system had lost power: it still looks active to a later
+# import.
+#
+# $1 - pool name
+#
+function export_pool_skip_update #pool
+{
+	typeset pool=$1
+	typeset -i rc
+
+	set_tunable32 spa_export_skip_update 1 || return 1
+	zpool export $pool
+	rc=$?
+	set_tunable32 spa_export_skip_update 0
+	return $rc
 }
 
 # Return 0 if destroy successfully or the pool exists; $? otherwise

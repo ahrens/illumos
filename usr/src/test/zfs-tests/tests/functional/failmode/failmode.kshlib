@@ -33,9 +33,17 @@ function failmode_create_pool # failmode
 	log_must zfs create -o recordsize=128k $TESTPOOL/$TESTFS
 }
 
+#
+# Is the pool suspended?  This asks the kernel rather than "zpool status",
+# which needs spa_namespace_lock, and a command sleeping on the suspended pool
+# may hold that.
+#
 function pool_is_suspended # pool
 {
-	zpool status $1 | grep -q -E "ZFS-8000-(HC|JQ)"
+	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_suspended'
+	typeset susp=$(print -r -- "::walk spa | $fmt" | mdb -k |
+	    nawk -v pool=$1 '$1 == pool { print $2 }')
+	[[ -n $susp && $susp != 0 ]]
 }
 
 function failmode_suspend_pool
@@ -92,6 +100,26 @@ function failmode_wait_failed # pool
 }
 
 #
+# Wait for a pool whose writes now fail to stop: a death pool fails, any
+# other suspends.
+#
+function failmode_wait_stopped # pool failmode
+{
+	if [[ $2 == death ]]; then
+		failmode_wait_failed $1
+		return
+	fi
+	log_note "waiting for $1 to suspend"
+	typeset -i tries=30
+	until pool_is_suspended $1; do
+		if ((tries-- == 0)); then
+			log_fail "$1 didn't suspend"
+		fi
+		sleep 1
+	done
+}
+
+#
 # Checksum of a vdev file, to tell whether anything was written to it.
 #
 function vdev_digest # file
@@ -134,7 +162,10 @@ function failmode_resume_pool
 function failmode_cleanup
 {
 	zinject -c all >/dev/null 2>&1
-	if poolexists $TESTPOOL; then
+	if poolexists $TESTPOOL && pool_has_failed $TESTPOOL; then
+		# A failed pool can't be destroyed; exporting removes it.
+		log_must zpool export -f $TESTPOOL
+	elif poolexists $TESTPOOL; then
 		# zpool status can miss a suspension; clearing is harmless.
 		zpool clear $TESTPOOL >/dev/null 2>&1
 		destroy_pool $TESTPOOL
