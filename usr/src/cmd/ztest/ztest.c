@@ -179,6 +179,7 @@ typedef struct ztest_shared_opts {
 	int zo_mmp_test;
 	int zo_special_vdevs;
 	int zo_no_force_exit;
+	uint64_t zo_force_exit_live;
 } ztest_shared_opts_t;
 
 static const ztest_shared_opts_t ztest_opts_defaults = {
@@ -203,6 +204,7 @@ static const ztest_shared_opts_t ztest_opts_defaults = {
 	.zo_maxloops = 50,		/* max loops during spa_freeze() */
 	.zo_metaslab_force_ganging = 32 << 10,
 	.zo_special_vdevs = ZTEST_VDEV_CLASS_RND,
+	.zo_force_exit_live = 50,	/* 50% of forced exits */
 };
 
 extern uint64_t metaslab_force_ganging;
@@ -494,14 +496,17 @@ static boolean_t ztest_exiting;
 
 /*
  * ztest_force_exit() parks the other test threads between tests while it
- * fails the pool, exports it and imports it again.  ztest_fe_lock protects
+ * exports the pool and imports it again, and, unless they are to keep going
+ * while the pool fails, while it fails the pool.  ztest_fe_lock protects
  * the parking state.  ztest_spa_lock is held as writer while ztest_spa is
  * replaced, and as reader by the background threads that use it.
  * ztest_run() holds the pool with ZTEST_SPA_TAG.
  */
 static kmutex_t ztest_fe_lock;
 static kcondvar_t ztest_fe_cv;
-static boolean_t ztest_fe_pending;
+static boolean_t ztest_fe_busy;		/* ztest_force_exit() is running */
+static volatile boolean_t ztest_fe_faulting;	/* its disks are failing */
+static boolean_t ztest_fe_pending;	/* test threads are to park */
 static boolean_t ztest_fe_ready;	/* every dataset is open */
 static int ztest_fe_parked;
 static int ztest_fe_running;
@@ -652,6 +657,8 @@ usage(boolean_t requested)
 	    "\t[-V] verbose (use multiple times for ever more blather)\n"
 	    "\t[-E] use existing pool instead of creating new one\n"
 	    "\t[-x] don't fail, export and import the pool (forced exit)\n"
+	    "\t[-X live_percentage (default: %llu%%)] forced exits that happen\n"
+	    "\t    while the other tests are running\n"
 	    "\t[-T time (default: %llu sec)] total run time\n"
 	    "\t[-F freezeloops (default: %llu)] max loops in spa_freeze()\n"
 	    "\t[-P passtime (default: %llu sec)] time per pass\n"
@@ -675,6 +682,7 @@ usage(boolean_t requested)
 	    (u_longlong_t)zo->zo_killrate,		/* -k */
 	    zo->zo_pool,				/* -p */
 	    zo->zo_dir,					/* -f */
+	    (u_longlong_t)zo->zo_force_exit_live,	/* -X */
 	    (u_longlong_t)zo->zo_time,			/* -T */
 	    (u_longlong_t)zo->zo_maxloops,		/* -F */
 	    (u_longlong_t)zo->zo_passtime);
@@ -734,7 +742,7 @@ process_options(int argc, char **argv)
 	bcopy(&ztest_opts_defaults, zo, sizeof (*zo));
 
 	while ((opt = getopt(argc, argv,
-	    "v:s:a:m:r:R:d:t:g:i:k:p:f:MVExT:P:hF:B:C:o:")) != EOF) {
+	    "v:s:a:m:r:R:d:t:g:i:k:p:f:MVExX:T:P:hF:B:C:o:")) != EOF) {
 		value = 0;
 		switch (opt) {
 		case 'v':
@@ -748,6 +756,7 @@ process_options(int argc, char **argv)
 		case 'g':
 		case 'i':
 		case 'k':
+		case 'X':
 		case 'T':
 		case 'P':
 		case 'F':
@@ -814,6 +823,9 @@ process_options(int argc, char **argv)
 			break;
 		case 'x':
 			zo->zo_no_force_exit = 1;
+			break;
+		case 'X':
+			zo->zo_force_exit_live = MIN(value, 100);
 			break;
 		case 'T':
 			zo->zo_time = value;
@@ -1196,6 +1208,35 @@ ztest_random_dsl_prop(zfs_prop_t prop)
 	return (value);
 }
 
+/*
+ * Once ztest_force_exit() makes the pool's disks fail, operations on the pool
+ * fail (reads of faulted vdevs even before the pool itself has failed), and
+ * the tests that were running give up.  Is "error" such a failure?
+ */
+static boolean_t
+ztest_failed(int error)
+{
+	return (error != 0 && (ztest_fe_faulting ||
+	    (ztest_spa != NULL && spa_failed(ztest_spa))));
+}
+
+/*
+ * Assign a loaned arc buf to a dbuf.  On a failed pool the assignment can
+ * fail (the dbuf's indirect block can't be read), and then the buf is still
+ * ours to return.
+ */
+static void
+ztest_assign_arcbuf(dmu_buf_t *db, uint64_t offset, arc_buf_t *abuf,
+    dmu_tx_t *tx)
+{
+	int error = dmu_assign_arcbuf_by_dbuf(db, offset, abuf, tx);
+
+	if (ztest_failed(error))
+		dmu_return_arcbuf(abuf);
+	else
+		VERIFY0(error);
+}
+
 static int
 ztest_dsl_prop_set_uint64(char *osname, zfs_prop_t prop, uint64_t value,
     boolean_t inherit)
@@ -1213,9 +1254,14 @@ ztest_dsl_prop_set_uint64(char *osname, zfs_prop_t prop, uint64_t value,
 		ztest_record_enospc(FTAG);
 		return (error);
 	}
+	if (ztest_failed(error))
+		return (error);
 	ASSERT0(error);
 
-	VERIFY0(dsl_prop_get_integer(osname, propname, &curval, setpoint));
+	error = dsl_prop_get_integer(osname, propname, &curval, setpoint);
+	if (ztest_failed(error))
+		return (error);
+	ASSERT0(error);
 
 	if (ztest_opts.zo_verbose >= 6) {
 		VERIFY(zfs_prop_index_to_string(prop, curval, &valname) == 0);
@@ -1244,6 +1290,8 @@ ztest_spa_prop_set_uint64(zpool_prop_t prop, uint64_t value)
 		ztest_record_enospc(FTAG);
 		return (error);
 	}
+	if (ztest_failed(error))
+		return (error);
 	ASSERT0(error);
 
 	return (error);
@@ -1436,6 +1484,8 @@ ztest_tx_assign(dmu_tx_t *tx, uint64_t txg_how, const char *tag)
 		if (error == ERESTART) {
 			ASSERT(txg_how == DMU_TX_NOWAIT);
 			dmu_tx_wait(tx);
+		} else if (ztest_failed(error)) {
+			/* EIO, or the error of a read for a hold */
 		} else {
 			ASSERT3U(error, ==, ENOSPC);
 			ztest_record_enospc(tag);
@@ -1741,11 +1791,17 @@ ztest_replay_create(void *arg1, void *arg2, boolean_t byteswap)
 
 	ASSERT(lr->lr_foid != 0);
 
-	if (lr->lrz_type != DMU_OT_ZAP_OTHER)
-		VERIFY3U(0, ==, dmu_object_set_blocksize(os, lr->lr_foid,
-		    lr->lrz_blocksize, lr->lrz_ibshift, tx));
-
-	VERIFY3U(0, ==, dmu_bonus_hold(os, lr->lr_foid, FTAG, &db));
+	if (lr->lrz_type != DMU_OT_ZAP_OTHER) {
+		error = dmu_object_set_blocksize(os, lr->lr_foid,
+		    lr->lrz_blocksize, lr->lrz_ibshift, tx);
+	}
+	if (error == 0)
+		error = dmu_bonus_hold(os, lr->lr_foid, FTAG, &db);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		dmu_tx_commit(tx);
+		return (error);
+	}
 	bbt = ztest_bt_bonus(db);
 	dmu_buf_will_dirty(db, tx);
 	ztest_bt_generate(bbt, os, lr->lr_foid, lr->lrz_dnodesize, -1ULL,
@@ -1753,8 +1809,13 @@ ztest_replay_create(void *arg1, void *arg2, boolean_t byteswap)
 	ztest_fill_unused_bonus(db, bbt, lr->lr_foid, os, lr->lr_gen);
 	dmu_buf_rele(db, FTAG);
 
-	VERIFY3U(0, ==, zap_add(os, lr->lr_doid, name, sizeof (uint64_t), 1,
-	    &lr->lr_foid, tx));
+	error = zap_add(os, lr->lr_doid, name, sizeof (uint64_t), 1,
+	    &lr->lr_foid, tx);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		dmu_tx_commit(tx);
+		return (error);
+	}
 
 	(void) ztest_log_create(zd, tx, lr);
 
@@ -1773,6 +1834,7 @@ ztest_replay_remove(void *arg1, void *arg2, boolean_t byteswap)
 	dmu_object_info_t doi;
 	dmu_tx_t *tx;
 	uint64_t object, txg;
+	int error;
 
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
@@ -1780,13 +1842,21 @@ ztest_replay_remove(void *arg1, void *arg2, boolean_t byteswap)
 	ASSERT(lr->lr_doid == ZTEST_DIROBJ);
 	ASSERT(name[0] != '\0');
 
-	VERIFY3U(0, ==,
-	    zap_lookup(os, lr->lr_doid, name, sizeof (object), 1, &object));
+	error = zap_lookup(os, lr->lr_doid, name, sizeof (object), 1, &object);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		return (error);
+	}
 	ASSERT(object != 0);
 
 	ztest_object_lock(zd, object, RL_WRITER);
 
-	VERIFY3U(0, ==, dmu_object_info(os, object, &doi));
+	error = dmu_object_info(os, object, &doi);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		ztest_object_unlock(zd, object);
+		return (error);
+	}
 
 	tx = dmu_tx_create(os);
 
@@ -1799,13 +1869,18 @@ ztest_replay_remove(void *arg1, void *arg2, boolean_t byteswap)
 		return (ENOSPC);
 	}
 
-	if (doi.doi_type == DMU_OT_ZAP_OTHER) {
-		VERIFY3U(0, ==, zap_destroy(os, object, tx));
-	} else {
-		VERIFY3U(0, ==, dmu_object_free(os, object, tx));
+	if (doi.doi_type == DMU_OT_ZAP_OTHER)
+		error = zap_destroy(os, object, tx);
+	else
+		error = dmu_object_free(os, object, tx);
+	if (error == 0)
+		error = zap_remove(os, lr->lr_doid, name, tx);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		dmu_tx_commit(tx);
+		ztest_object_unlock(zd, object);
+		return (error);
 	}
-
-	VERIFY3U(0, ==, zap_remove(os, lr->lr_doid, name, tx));
 
 	(void) ztest_log_remove(zd, tx, lr, object);
 
@@ -1832,6 +1907,7 @@ ztest_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 	dmu_buf_t *db;
 	arc_buf_t *abuf = NULL;
 	rl_t *rl;
+	int error;
 
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
@@ -1857,7 +1933,13 @@ ztest_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 	ztest_object_lock(zd, lr->lr_foid, RL_READER);
 	rl = ztest_range_lock(zd, lr->lr_foid, offset, length, RL_WRITER);
 
-	VERIFY3U(0, ==, dmu_bonus_hold(os, lr->lr_foid, FTAG, &db));
+	error = dmu_bonus_hold(os, lr->lr_foid, FTAG, &db);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		ztest_range_unlock(rl);
+		ztest_object_unlock(zd, lr->lr_foid);
+		return (error);
+	}
 
 	dmu_object_info_from_db(db, &doi);
 
@@ -1897,8 +1979,18 @@ ztest_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 			    DMU_READ_PREFETCH : DMU_READ_NO_PREFETCH;
 			ztest_block_tag_t rbt;
 
-			VERIFY(dmu_read(os, lr->lr_foid, offset,
-			    sizeof (rbt), &rbt, prefetch) == 0);
+			error = dmu_read(os, lr->lr_foid, offset,
+			    sizeof (rbt), &rbt, prefetch);
+			if (error != 0) {
+				VERIFY(ztest_failed(error));
+				if (abuf != NULL)
+					dmu_return_arcbuf(abuf);
+				dmu_buf_rele(db, FTAG);
+				dmu_tx_commit(tx);
+				ztest_range_unlock(rl);
+				ztest_object_unlock(zd, lr->lr_foid);
+				return (error);
+			}
 			if (rbt.bt_magic == BT_MAGIC) {
 				ztest_bt_verify(&rbt, os, lr->lr_foid, 0,
 				    offset, gen, txg, crtxg);
@@ -1929,7 +2021,7 @@ ztest_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 		dmu_write(os, lr->lr_foid, offset, length, data, tx);
 	} else {
 		bcopy(data, abuf->b_data, length);
-		dmu_assign_arcbuf_by_dbuf(db, offset, abuf, tx);
+		ztest_assign_arcbuf(db, offset, abuf, tx);
 	}
 
 	(void) ztest_log_write(zd, tx, lr);
@@ -1953,6 +2045,7 @@ ztest_replay_truncate(void *arg1, void *arg2, boolean_t byteswap)
 	dmu_tx_t *tx;
 	uint64_t txg;
 	rl_t *rl;
+	int error;
 
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
@@ -1972,8 +2065,15 @@ ztest_replay_truncate(void *arg1, void *arg2, boolean_t byteswap)
 		return (ENOSPC);
 	}
 
-	VERIFY(dmu_free_range(os, lr->lr_foid, lr->lr_offset,
-	    lr->lr_length, tx) == 0);
+	error = dmu_free_range(os, lr->lr_foid, lr->lr_offset,
+	    lr->lr_length, tx);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		dmu_tx_commit(tx);
+		ztest_range_unlock(rl);
+		ztest_object_unlock(zd, lr->lr_foid);
+		return (error);
+	}
 
 	(void) ztest_log_truncate(zd, tx, lr);
 
@@ -1995,13 +2095,19 @@ ztest_replay_setattr(void *arg1, void *arg2, boolean_t byteswap)
 	dmu_buf_t *db;
 	ztest_block_tag_t *bbt;
 	uint64_t txg, lrtxg, crtxg, dnodesize;
+	int error;
 
 	if (byteswap)
 		byteswap_uint64_array(lr, sizeof (*lr));
 
 	ztest_object_lock(zd, lr->lr_foid, RL_WRITER);
 
-	VERIFY3U(0, ==, dmu_bonus_hold(os, lr->lr_foid, FTAG, &db));
+	error = dmu_bonus_hold(os, lr->lr_foid, FTAG, &db);
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		ztest_object_unlock(zd, lr->lr_foid);
+		return (error);
+	}
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_bonus(tx, lr->lr_foid);
@@ -2153,7 +2259,7 @@ ztest_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb,
 
 		error = dmu_read(os, object, offset, size, buf,
 		    DMU_READ_NO_PREFETCH);
-		ASSERT(error == 0);
+		ASSERT(error == 0 || ztest_failed(error));
 	} else {
 		size = doi.doi_data_block_size;
 		if (ISP2(size)) {
@@ -2228,7 +2334,12 @@ ztest_lookup(ztest_ds_t *zd, ztest_od_t *od, int count)
 		od->od_object = 0;
 		error = zap_lookup(zd->zd_os, od->od_dir, od->od_name,
 		    sizeof (uint64_t), 1, &od->od_object);
-		if (error) {
+		if (ztest_failed(error)) {
+			/* The pool has failed: give up on the rest. */
+			for (; i < count; i++, od++)
+				od->od_object = 0;
+			return (count);
+		} else if (error) {
 			ASSERT(error == ENOENT);
 			ASSERT(od->od_object == 0);
 			missing++;
@@ -2241,8 +2352,15 @@ ztest_lookup(ztest_ds_t *zd, ztest_od_t *od, int count)
 			ASSERT(missing == 0);	/* there should be no gaps */
 
 			ztest_object_lock(zd, od->od_object, RL_READER);
-			VERIFY3U(0, ==, dmu_bonus_hold(zd->zd_os,
-			    od->od_object, FTAG, &db));
+			error = dmu_bonus_hold(zd->zd_os, od->od_object, FTAG,
+			    &db);
+			if (error != 0) {
+				VERIFY(ztest_failed(error));
+				ztest_object_unlock(zd, od->od_object);
+				for (; i < count; i++, od++)
+					od->od_object = 0;
+				return (count);
+			}
 			dmu_object_info_from_db(db, &doi);
 			bbt = ztest_bt_bonus(db);
 			ASSERT3U(bbt->bt_magic, ==, BT_MAGIC);
@@ -2328,7 +2446,7 @@ ztest_remove(ztest_ds_t *zd, ztest_od_t *od, int count)
 		lr->lr_doid = od->od_dir;
 
 		if ((error = ztest_replay_remove(zd, lr, B_FALSE)) != 0) {
-			ASSERT3U(error, ==, ENOSPC);
+			ASSERT(error == ENOSPC || ztest_failed(error));
 			missing++;
 		} else {
 			od->od_object = 0;
@@ -2442,7 +2560,11 @@ ztest_io(ztest_ds_t *zd, uint64_t object, uint64_t offset)
 	uint64_t blocksize;
 	void *data;
 
-	VERIFY(dmu_object_info(zd->zd_os, object, &doi) == 0);
+	err = dmu_object_info(zd->zd_os, object, &doi);
+	if (err != 0) {
+		VERIFY(ztest_failed(err));
+		return;
+	}
 	blocksize = doi.doi_data_block_size;
 	data = umem_alloc(blocksize, UMEM_NOFAIL);
 
@@ -2495,16 +2617,20 @@ ztest_io(ztest_ds_t *zd, uint64_t object, uint64_t offset)
 		err = ztest_dsl_prop_set_uint64(zd->zd_name,
 		    ZFS_PROP_CHECKSUM, spa_dedup_checksum(ztest_spa),
 		    B_FALSE);
-		VERIFY(err == 0 || err == ENOSPC);
+		VERIFY(err == 0 || err == ENOSPC || ztest_failed(err));
 		err = ztest_dsl_prop_set_uint64(zd->zd_name,
 		    ZFS_PROP_COMPRESSION,
 		    ztest_random_dsl_prop(ZFS_PROP_COMPRESSION),
 		    B_FALSE);
-		VERIFY(err == 0 || err == ENOSPC);
+		VERIFY(err == 0 || err == ENOSPC || ztest_failed(err));
 		rw_exit(&ztest_name_lock);
 
-		VERIFY0(dmu_read(zd->zd_os, object, offset, blocksize, data,
-		    DMU_READ_NO_PREFETCH));
+		err = dmu_read(zd->zd_os, object, offset, blocksize, data,
+		    DMU_READ_NO_PREFETCH);
+		if (err != 0) {
+			VERIFY(ztest_failed(err));
+			break;
+		}
 
 		(void) ztest_write(zd, object, offset, blocksize, data);
 		break;
@@ -2567,10 +2693,16 @@ void
 ztest_zil_commit(ztest_ds_t *zd, uint64_t id)
 {
 	zilog_t *zilog = zd->zd_zilog;
+	int error;
 
 	rw_enter(&zd->zd_zilog_lock, RW_READER);
 
-	VERIFY0(zil_commit(zilog, ztest_random(ZTEST_OBJECTS)));
+	error = zil_commit(zilog, ztest_random(ZTEST_OBJECTS));
+	if (error != 0) {
+		VERIFY(ztest_failed(error));
+		rw_exit(&zd->zd_zilog_lock);
+		return;
+	}
 
 	/*
 	 * Remember the committed values in zd, which is in parent/child
@@ -2682,7 +2814,7 @@ ztest_spa_create_destroy(ztest_ds_t *zd, uint64_t id)
 	 */
 	int error = spa_destroy(zo->zo_pool);
 	if (error != EBUSY && error != EAGAIN &&
-	    error != ZFS_ERR_EXPORT_IN_PROGRESS) {
+	    error != ZFS_ERR_EXPORT_IN_PROGRESS && !ztest_failed(error)) {
 		fatal(0, "spa_destroy(%s) returned unexpected value %d",
 		    spa->spa_name, error);
 	}
@@ -2823,6 +2955,9 @@ ztest_spa_checkpoint(spa_t *spa)
 
 	int error = spa_checkpoint(spa->spa_name);
 
+	if (ztest_failed(error))
+		return;
+
 	switch (error) {
 	case 0:
 	case ZFS_ERR_DEVRM_IN_PROGRESS:
@@ -2833,6 +2968,8 @@ ztest_spa_checkpoint(spa_t *spa)
 		ztest_record_enospc(FTAG);
 		break;
 	default:
+		if (ztest_failed(error))
+			break;
 		fatal(0, "spa_checkpoint(%s) = %d", spa->spa_name, error);
 	}
 }
@@ -2844,12 +2981,17 @@ ztest_spa_discard_checkpoint(spa_t *spa)
 
 	int error = spa_checkpoint_discard(spa->spa_name);
 
+	if (ztest_failed(error))
+		return;
+
 	switch (error) {
 	case 0:
 	case ZFS_ERR_DISCARDING_CHECKPOINT:
 	case ZFS_ERR_NO_CHECKPOINT:
 		break;
 	default:
+		if (ztest_failed(error))
+			break;
 		fatal(0, "spa_discard_checkpoint(%s) = %d",
 		    spa->spa_name, error);
 	}
@@ -2956,6 +3098,8 @@ ztest_vdev_add_remove(ztest_ds_t *zd, uint64_t id)
 		case ZFS_ERR_DISCARDING_CHECKPOINT:
 			break;
 		default:
+			if (ztest_failed(error))
+				break;
 			fatal(0, "spa_vdev_remove() = %d", error);
 		}
 	} else {
@@ -2978,6 +3122,8 @@ ztest_vdev_add_remove(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc("spa_vdev_add");
 			break;
 		default:
+			if (ztest_failed(error))
+				break;
 			fatal(0, "spa_vdev_add() = %d", error);
 		}
 	}
@@ -3034,7 +3180,7 @@ ztest_vdev_class_add(ztest_ds_t *zd, uint64_t id)
 
 	if (error == ENOSPC)
 		ztest_record_enospc("spa_vdev_add");
-	else if (error != 0)
+	else if (error != 0 && !ztest_failed(error))
 		fatal(0, "spa_vdev_add() = %d", error);
 
 	/*
@@ -3133,6 +3279,8 @@ ztest_vdev_aux_add_remove(ztest_ds_t *zd, uint64_t id)
 		case 0:
 			break;
 		default:
+			if (ztest_failed(error))
+				break;
 			fatal(0, "spa_vdev_add(%p) = %d", nvroot, error);
 		}
 		nvlist_free(nvroot);
@@ -3154,6 +3302,8 @@ ztest_vdev_aux_add_remove(ztest_ds_t *zd, uint64_t id)
 		case ZFS_ERR_DISCARDING_CHECKPOINT:
 			break;
 		default:
+			if (ztest_failed(error))
+				break;
 			fatal(0, "spa_vdev_remove(%llu) = %d", guid, error);
 		}
 	}
@@ -3503,7 +3653,7 @@ ztest_vdev_attach_detach(ztest_ds_t *zd, uint64_t id)
 		expected_error = error;
 
 	if (error == ZFS_ERR_CHECKPOINT_EXISTS ||
-	    error == ZFS_ERR_DISCARDING_CHECKPOINT)
+	    error == ZFS_ERR_DISCARDING_CHECKPOINT || ztest_failed(error))
 		expected_error = error;
 
 	/* XXX workaround 6690467 */
@@ -3546,7 +3696,9 @@ ztest_device_removal(ztest_ds_t *zd, uint64_t id)
 		ztest_device_removal_active = B_TRUE;
 		mutex_exit(&ztest_vdev_lock);
 
-		while (spa->spa_removing_phys.sr_state == DSS_SCANNING)
+		/* A failed pool stops the removal. */
+		while (spa->spa_removing_phys.sr_state == DSS_SCANNING &&
+		    !spa_failed(spa))
 			txg_wait_synced(spa_get_dsl(spa), 0);
 	} else {
 		mutex_exit(&ztest_vdev_lock);
@@ -3561,7 +3713,8 @@ ztest_device_removal(ztest_ds_t *zd, uint64_t id)
 	 */
 	error = spa_scan(spa, POOL_SCAN_SCRUB);
 	if (error == 0) {
-		while (dsl_scan_scrubbing(spa_get_dsl(spa)))
+		while (dsl_scan_scrubbing(spa_get_dsl(spa)) &&
+		    !spa_failed(spa))
 			txg_wait_synced(spa_get_dsl(spa), 0);
 	}
 
@@ -3792,6 +3945,14 @@ ztest_vdev_LUN_growth(ztest_ds_t *zd, uint64_t id)
 	new_ms_count = tvd->vdev_ms_count;
 	new_class_space = metaslab_class_get_space(mc);
 
+	/* A pool that failed may not have grown. */
+	if (spa_failed(spa)) {
+		spa_config_exit(spa, SCL_STATE, spa);
+		mutex_exit(&ztest_vdev_lock);
+		mutex_exit(&ztest_checkpoint_lock);
+		return;
+	}
+
 	if (tvd->vdev_mg != mg || mg->mg_class != mc) {
 		if (ztest_opts.zo_verbose >= 5) {
 			(void) printf("Could not verify LUN expansion due to "
@@ -3928,9 +4089,16 @@ ztest_objset_destroy_cb(const char *name, void *arg)
 	/*
 	 * Verify that the dataset contains a directory object.
 	 */
-	VERIFY0(ztest_dmu_objset_own(name, DMU_OST_OTHER, B_TRUE,
-	    B_TRUE, FTAG, &os));
+	error = ztest_dmu_objset_own(name, DMU_OST_OTHER, B_TRUE,
+	    B_TRUE, FTAG, &os);
+	if (ztest_failed(error))
+		return (0);
+	VERIFY0(error);
 	error = dmu_object_info(os, ZTEST_DIROBJ, &doi);
+	if (ztest_failed(error)) {
+		dmu_objset_disown(os, B_TRUE, FTAG);
+		return (0);
+	}
 	if (error != ENOENT) {
 		/* We could have crashed in the middle of destroying it */
 		ASSERT0(error);
@@ -3943,11 +4111,13 @@ ztest_objset_destroy_cb(const char *name, void *arg)
 	 * Destroy the dataset.
 	 */
 	if (strchr(name, '@') != NULL) {
-		VERIFY0(dsl_destroy_snapshot(name, B_TRUE));
+		error = dsl_destroy_snapshot(name, B_TRUE);
+		if (!ztest_failed(error))
+			VERIFY0(error);
 	} else {
 		error = dsl_destroy_head(name);
 		/* There could be a hold on this dataset */
-		if (error != EBUSY)
+		if (error != EBUSY && !ztest_failed(error))
 			ASSERT0(error);
 	}
 	return (0);
@@ -3966,6 +4136,8 @@ ztest_snapshot_create(char *osname, uint64_t id)
 		ztest_record_enospc(FTAG);
 		return (B_FALSE);
 	}
+	if (ztest_failed(error))
+		return (B_FALSE);
 	if (error != 0 && error != EEXIST) {
 		fatal(0, "ztest_snapshot_create(%s@%s) = %d", osname,
 		    snapname, error);
@@ -3983,7 +4155,7 @@ ztest_snapshot_destroy(char *osname, uint64_t id)
 	    (u_longlong_t)id);
 
 	error = dsl_destroy_snapshot(snapname, B_FALSE);
-	if (error != 0 && error != ENOENT)
+	if (error != 0 && error != ENOENT && !ztest_failed(error))
 		fatal(0, "ztest_snapshot_destroy(%s) = %d", snapname, error);
 	return (B_TRUE);
 }
@@ -4028,9 +4200,17 @@ ztest_dmu_objset_create_destroy(ztest_ds_t *zd, uint64_t id)
 
 	/*
 	 * Verify that the destroyed dataset is no longer in the namespace.
+	 * (If the pool is failing, it may not have been destroyed.)
 	 */
-	VERIFY3U(ENOENT, ==, ztest_dmu_objset_own(name, DMU_OST_OTHER, B_TRUE,
-	    B_TRUE, FTAG, &os));
+	error = ztest_dmu_objset_own(name, DMU_OST_OTHER, B_TRUE, B_TRUE,
+	    FTAG, &os);
+	if (error != ENOENT && (ztest_fe_faulting || spa_failed(ztest_spa))) {
+		if (error == 0)
+			dmu_objset_disown(os, B_TRUE, FTAG);
+		rw_exit(&ztest_name_lock);
+		return;
+	}
+	VERIFY3U(ENOENT, ==, error);
 
 	/*
 	 * Verify that we can create a new dataset.
@@ -4042,11 +4222,20 @@ ztest_dmu_objset_create_destroy(ztest_ds_t *zd, uint64_t id)
 			rw_exit(&ztest_name_lock);
 			return;
 		}
+		if (ztest_failed(error)) {
+			rw_exit(&ztest_name_lock);
+			return;
+		}
 		fatal(0, "dmu_objset_create(%s) = %d", name, error);
 	}
 
-	VERIFY0(ztest_dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
-	    FTAG, &os));
+	error = ztest_dmu_objset_own(name, DMU_OST_OTHER, B_FALSE, B_TRUE,
+	    FTAG, &os);
+	if (ztest_failed(error)) {
+		rw_exit(&ztest_name_lock);
+		return;
+	}
+	VERIFY0(error);
 
 	ztest_zd_init(&zdtmp, NULL, os);
 
@@ -4069,14 +4258,18 @@ ztest_dmu_objset_create_destroy(ztest_ds_t *zd, uint64_t id)
 	/*
 	 * Verify that we cannot create an existing dataset.
 	 */
-	VERIFY3U(EEXIST, ==,
-	    dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL));
+	error = dmu_objset_create(name, DMU_OST_OTHER, 0, NULL, NULL, NULL);
+	if (!ztest_failed(error))
+		VERIFY3U(EEXIST, ==, error);
 
 	/*
 	 * Verify that we can hold an objset that is also owned.
 	 */
-	VERIFY3U(0, ==, dmu_objset_hold(name, FTAG, &os2));
-	dmu_objset_rele(os2, FTAG);
+	error = dmu_objset_hold(name, FTAG, &os2);
+	if (!ztest_failed(error)) {
+		VERIFY0(error);
+		dmu_objset_rele(os2, FTAG);
+	}
 
 	/*
 	 * Verify that we cannot own an objset that is already owned.
@@ -4128,19 +4321,19 @@ ztest_dsl_dataset_cleanup(char *osname, uint64_t id)
 	    "%s@s3_%llu", clone1name, id);
 
 	error = dsl_destroy_head(clone2name);
-	if (error && error != ENOENT)
+	if (error && error != ENOENT && !ztest_failed(error))
 		fatal(0, "dsl_destroy_head(%s) = %d", clone2name, error);
 	error = dsl_destroy_snapshot(snap3name, B_FALSE);
-	if (error && error != ENOENT)
+	if (error && error != ENOENT && !ztest_failed(error))
 		fatal(0, "dsl_destroy_snapshot(%s) = %d", snap3name, error);
 	error = dsl_destroy_snapshot(snap2name, B_FALSE);
-	if (error && error != ENOENT)
+	if (error && error != ENOENT && !ztest_failed(error))
 		fatal(0, "dsl_destroy_snapshot(%s) = %d", snap2name, error);
 	error = dsl_destroy_head(clone1name);
-	if (error && error != ENOENT)
+	if (error && error != ENOENT && !ztest_failed(error))
 		fatal(0, "dsl_destroy_head(%s) = %d", clone1name, error);
 	error = dsl_destroy_snapshot(snap1name, B_FALSE);
-	if (error && error != ENOENT)
+	if (error && error != ENOENT && !ztest_failed(error))
 		fatal(0, "dsl_destroy_snapshot(%s) = %d", snap1name, error);
 }
 
@@ -4180,6 +4373,8 @@ ztest_dsl_dataset_promote_busy(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc(FTAG);
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_take_snapshot(%s) = %d", snap1name, error);
 	}
 
@@ -4189,6 +4384,8 @@ ztest_dsl_dataset_promote_busy(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc(FTAG);
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_objset_create(%s) = %d", clone1name, error);
 	}
 
@@ -4198,6 +4395,8 @@ ztest_dsl_dataset_promote_busy(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc(FTAG);
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_open_snapshot(%s) = %d", snap2name, error);
 	}
 
@@ -4207,6 +4406,8 @@ ztest_dsl_dataset_promote_busy(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc(FTAG);
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_open_snapshot(%s) = %d", snap3name, error);
 	}
 
@@ -4216,17 +4417,23 @@ ztest_dsl_dataset_promote_busy(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc(FTAG);
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_objset_create(%s) = %d", clone2name, error);
 	}
 
 	error = ztest_dmu_objset_own(snap2name, DMU_OST_ANY, B_TRUE, B_TRUE,
 	    FTAG, &os);
-	if (error)
+	if (error) {
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_objset_own(%s) = %d", snap2name, error);
+	}
 	error = dsl_dataset_promote(clone2name, NULL);
-	if (error == ENOSPC) {
+	if (error == ENOSPC || ztest_failed(error)) {
 		dmu_objset_disown(os, B_TRUE, FTAG);
-		ztest_record_enospc(FTAG);
+		if (error == ENOSPC)
+			ztest_record_enospc(FTAG);
 		goto out;
 	}
 	if (error != EBUSY)
@@ -4382,9 +4589,15 @@ ztest_dmu_read_write(ztest_ds_t *zd, uint64_t id)
 	 */
 	error = dmu_read(os, packobj, packoff, packsize, packbuf,
 	    DMU_READ_PREFETCH);
-	ASSERT0(error);
-	error = dmu_read(os, bigobj, bigoff, bigsize, bigbuf,
-	    DMU_READ_PREFETCH);
+	if (error == 0) {
+		error = dmu_read(os, bigobj, bigoff, bigsize, bigbuf,
+		    DMU_READ_PREFETCH);
+	}
+	if (ztest_failed(error)) {
+		umem_free(packbuf, packsize);
+		umem_free(bigbuf, bigsize);
+		return;
+	}
 	ASSERT0(error);
 
 	/*
@@ -4479,7 +4692,9 @@ ztest_dmu_read_write(ztest_ds_t *zd, uint64_t id)
 			    (u_longlong_t)bigsize,
 			    (u_longlong_t)txg);
 		}
-		VERIFY(0 == dmu_free_range(os, bigobj, bigoff, bigsize, tx));
+		error = dmu_free_range(os, bigobj, bigoff, bigsize, tx);
+		if (!ztest_failed(error))
+			VERIFY0(error);
 	} else {
 		if (ztest_opts.zo_verbose >= 7) {
 			(void) printf("writing offset %llx size %llx"
@@ -4500,13 +4715,17 @@ ztest_dmu_read_write(ztest_ds_t *zd, uint64_t id)
 		void *packcheck = umem_alloc(packsize, UMEM_NOFAIL);
 		void *bigcheck = umem_alloc(bigsize, UMEM_NOFAIL);
 
-		VERIFY(0 == dmu_read(os, packobj, packoff,
-		    packsize, packcheck, DMU_READ_PREFETCH));
-		VERIFY(0 == dmu_read(os, bigobj, bigoff,
-		    bigsize, bigcheck, DMU_READ_PREFETCH));
-
-		ASSERT(bcmp(packbuf, packcheck, packsize) == 0);
-		ASSERT(bcmp(bigbuf, bigcheck, bigsize) == 0);
+		error = dmu_read(os, packobj, packoff,
+		    packsize, packcheck, DMU_READ_PREFETCH);
+		if (error == 0) {
+			error = dmu_read(os, bigobj, bigoff,
+			    bigsize, bigcheck, DMU_READ_PREFETCH);
+		}
+		if (!ztest_failed(error)) {
+			VERIFY0(error);
+			ASSERT(bcmp(packbuf, packcheck, packsize) == 0);
+			ASSERT(bcmp(bigbuf, bigcheck, bigsize) == 0);
+		}
 
 		umem_free(packcheck, packsize);
 		umem_free(bigcheck, bigsize);
@@ -4618,7 +4837,10 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 	chunksize = blocksize;
 	ASSERT(chunksize == od[1].od_gen);
 
-	VERIFY(dmu_object_info(os, bigobj, &doi) == 0);
+	error = dmu_object_info(os, bigobj, &doi);
+	if (ztest_failed(error))
+		return;
+	VERIFY0(error);
 	VERIFY(ISP2(doi.doi_data_block_size));
 	VERIFY(chunksize == doi.doi_data_block_size);
 	VERIFY(chunksize >= 2 * sizeof (bufwad_t));
@@ -4635,10 +4857,13 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 	bigoff = n * chunksize;
 	bigsize = s * chunksize;
 
+	error = dmu_bonus_hold(os, bigobj, FTAG, &bonus_db);
+	if (ztest_failed(error))
+		return;
+	VERIFY0(error);
+
 	packbuf = umem_zalloc(packsize, UMEM_NOFAIL);
 	bigbuf = umem_zalloc(bigsize, UMEM_NOFAIL);
-
-	VERIFY3U(0, ==, dmu_bonus_hold(os, bigobj, FTAG, &bonus_db));
 
 	bigbuf_arcbufs = umem_zalloc(2 * s * sizeof (arc_buf_t *), UMEM_NOFAIL);
 
@@ -4709,9 +4934,16 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 		if (i != 0 || ztest_random(2) != 0) {
 			error = dmu_read(os, packobj, packoff,
 			    packsize, packbuf, DMU_READ_PREFETCH);
-			ASSERT0(error);
-			error = dmu_read(os, bigobj, bigoff, bigsize,
-			    bigbuf, DMU_READ_PREFETCH);
+			if (error == 0) {
+				error = dmu_read(os, bigobj, bigoff, bigsize,
+				    bigbuf, DMU_READ_PREFETCH);
+			}
+			if (ztest_failed(error)) {
+				/* As if we hadn't read them. */
+				bzero(packbuf, packsize);
+				bzero(bigbuf, bigsize);
+				error = 0;
+			}
 			ASSERT0(error);
 		}
 		compare_and_update_pbbufs(s, packbuf, bigbuf, bigsize,
@@ -4744,23 +4976,27 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 				    chunksize / 2);
 			}
 
+			dbt = NULL;
 			if (i == 1) {
-				VERIFY(dmu_buf_hold(os, bigobj, off,
-				    FTAG, &dbt, DMU_READ_NO_PREFETCH) == 0);
+				error = dmu_buf_hold(os, bigobj, off,
+				    FTAG, &dbt, DMU_READ_NO_PREFETCH);
+				if (ztest_failed(error))
+					dbt = NULL;
+				else
+					VERIFY0(error);
 			}
 			if (i != 5 || chunksize < (SPA_MINBLOCKSIZE * 2)) {
-				VERIFY0(dmu_assign_arcbuf_by_dbuf(bonus_db,
-				    off, bigbuf_arcbufs[j], tx));
+				ztest_assign_arcbuf(bonus_db, off,
+				    bigbuf_arcbufs[j], tx);
 			} else {
-				VERIFY0(dmu_assign_arcbuf_by_dbuf(bonus_db,
-				    off, bigbuf_arcbufs[2 * j], tx));
-				VERIFY0(dmu_assign_arcbuf_by_dbuf(bonus_db,
+				ztest_assign_arcbuf(bonus_db, off,
+				    bigbuf_arcbufs[2 * j], tx);
+				ztest_assign_arcbuf(bonus_db,
 				    off + chunksize / 2,
-				    bigbuf_arcbufs[2 * j + 1], tx));
+				    bigbuf_arcbufs[2 * j + 1], tx);
 			}
-			if (i == 1) {
+			if (dbt != NULL)
 				dmu_buf_rele(dbt, FTAG);
-			}
 		}
 		dmu_tx_commit(tx);
 
@@ -4771,13 +5007,17 @@ ztest_dmu_read_write_zcopy(ztest_ds_t *zd, uint64_t id)
 			void *packcheck = umem_alloc(packsize, UMEM_NOFAIL);
 			void *bigcheck = umem_alloc(bigsize, UMEM_NOFAIL);
 
-			VERIFY(0 == dmu_read(os, packobj, packoff,
-			    packsize, packcheck, DMU_READ_PREFETCH));
-			VERIFY(0 == dmu_read(os, bigobj, bigoff,
-			    bigsize, bigcheck, DMU_READ_PREFETCH));
-
-			ASSERT(bcmp(packbuf, packcheck, packsize) == 0);
-			ASSERT(bcmp(bigbuf, bigcheck, bigsize) == 0);
+			error = dmu_read(os, packobj, packoff,
+			    packsize, packcheck, DMU_READ_PREFETCH);
+			if (error == 0) {
+				error = dmu_read(os, bigobj, bigoff,
+				    bigsize, bigcheck, DMU_READ_PREFETCH);
+			}
+			if (!ztest_failed(error)) {
+				VERIFY0(error);
+				ASSERT(bcmp(packbuf, packcheck, packsize) == 0);
+				ASSERT(bcmp(bigbuf, bigcheck, bigsize) == 0);
+			}
 
 			umem_free(packcheck, packsize);
 			umem_free(bigcheck, bigsize);
@@ -4893,19 +5133,36 @@ ztest_zap(ztest_ds_t *zd, uint64_t id)
 		return;
 	for (i = 0; i < 2; i++) {
 		value[i] = i;
-		VERIFY3U(0, ==, zap_add(os, object, hc[i], sizeof (uint64_t),
-		    1, &value[i], tx));
+		error = zap_add(os, object, hc[i], sizeof (uint64_t),
+		    1, &value[i], tx);
+		if (ztest_failed(error))
+			goto failed;
+		VERIFY0(error);
 	}
 	for (i = 0; i < 2; i++) {
-		VERIFY3U(EEXIST, ==, zap_add(os, object, hc[i],
-		    sizeof (uint64_t), 1, &value[i], tx));
-		VERIFY3U(0, ==,
-		    zap_length(os, object, hc[i], &zl_intsize, &zl_ints));
+		error = zap_add(os, object, hc[i], sizeof (uint64_t), 1,
+		    &value[i], tx);
+		/*
+		 * EEXIST is what we expect, not a sign that the pool failed,
+		 * even if ztest_failed() would say it is.  If we took it for
+		 * one, we would commit the entries we just added, and the
+		 * pool can sync them before its disks start failing.
+		 */
+		if (error != EEXIST && ztest_failed(error))
+			goto failed;
+		VERIFY3U(EEXIST, ==, error);
+		error = zap_length(os, object, hc[i], &zl_intsize, &zl_ints);
+		if (ztest_failed(error))
+			goto failed;
+		VERIFY0(error);
 		ASSERT3U(zl_intsize, ==, sizeof (uint64_t));
 		ASSERT3U(zl_ints, ==, 1);
 	}
 	for (i = 0; i < 2; i++) {
-		VERIFY3U(0, ==, zap_remove(os, object, hc[i], tx));
+		error = zap_remove(os, object, hc[i], tx);
+		if (ztest_failed(error))
+			goto failed;
+		VERIFY0(error);
 	}
 	dmu_tx_commit(tx);
 
@@ -4928,21 +5185,30 @@ ztest_zap(ztest_ds_t *zd, uint64_t id)
 		ASSERT3U(zl_intsize, ==, sizeof (uint64_t));
 		ASSERT3U(zl_ints, ==, 1);
 
-		VERIFY(zap_lookup(os, object, txgname, zl_intsize,
-		    zl_ints, &last_txg) == 0);
-
-		VERIFY(zap_length(os, object, propname, &zl_intsize,
-		    &zl_ints) == 0);
+		error = zap_lookup(os, object, txgname, zl_intsize,
+		    zl_ints, &last_txg);
+		if (error == 0) {
+			error = zap_length(os, object, propname, &zl_intsize,
+			    &zl_ints);
+		}
+		if (ztest_failed(error))
+			return;
+		VERIFY0(error);
 
 		ASSERT3U(zl_intsize, ==, sizeof (uint64_t));
 		ASSERT3U(zl_ints, ==, ints);
 
-		VERIFY(zap_lookup(os, object, propname, zl_intsize,
-		    zl_ints, value) == 0);
+		error = zap_lookup(os, object, propname, zl_intsize,
+		    zl_ints, value);
+		if (ztest_failed(error))
+			return;
+		VERIFY0(error);
 
 		for (i = 0; i < ints; i++) {
 			ASSERT3U(value[i], ==, last_txg + object + i);
 		}
+	} else if (ztest_failed(error)) {
+		return;
 	} else {
 		ASSERT3U(error, ==, ENOENT);
 	}
@@ -4966,10 +5232,15 @@ ztest_zap(ztest_ds_t *zd, uint64_t id)
 	for (i = 0; i < ints; i++)
 		value[i] = txg + object + i;
 
-	VERIFY3U(0, ==, zap_update(os, object, txgname, sizeof (uint64_t),
-	    1, &txg, tx));
-	VERIFY3U(0, ==, zap_update(os, object, propname, sizeof (uint64_t),
-	    ints, value, tx));
+	error = zap_update(os, object, txgname, sizeof (uint64_t), 1, &txg,
+	    tx);
+	if (error == 0) {
+		error = zap_update(os, object, propname, sizeof (uint64_t),
+		    ints, value, tx);
+	}
+	if (ztest_failed(error))
+		goto failed;
+	VERIFY0(error);
 
 	dmu_tx_commit(tx);
 
@@ -4982,7 +5253,7 @@ ztest_zap(ztest_ds_t *zd, uint64_t id)
 
 	error = zap_length(os, object, txgname, &zl_intsize, &zl_ints);
 
-	if (error == ENOENT)
+	if (error == ENOENT || ztest_failed(error))
 		return;
 
 	ASSERT0(error);
@@ -4992,8 +5263,17 @@ ztest_zap(ztest_ds_t *zd, uint64_t id)
 	txg = ztest_tx_assign(tx, DMU_TX_MIGHTWAIT, FTAG);
 	if (txg == 0)
 		return;
-	VERIFY3U(0, ==, zap_remove(os, object, txgname, tx));
-	VERIFY3U(0, ==, zap_remove(os, object, propname, tx));
+	error = zap_remove(os, object, txgname, tx);
+	if (error == 0)
+		error = zap_remove(os, object, propname, tx);
+	if (ztest_failed(error))
+		goto failed;
+	VERIFY0(error);
+	dmu_tx_commit(tx);
+	return;
+
+failed:
+	/* The pool failed while we had a tx. */
 	dmu_tx_commit(tx);
 }
 
@@ -5035,7 +5315,7 @@ ztest_fzap(ztest_ds_t *zd, uint64_t id)
 			return;
 		error = zap_add(os, object, name, sizeof (uint64_t), 1,
 		    &value, tx);
-		ASSERT(error == 0 || error == EEXIST);
+		ASSERT(error == 0 || error == EEXIST || ztest_failed(error));
 		dmu_tx_commit(tx);
 	}
 }
@@ -5086,7 +5366,10 @@ ztest_zap_parallel(ztest_ds_t *zd, uint64_t id)
 	}
 
 	count = -1ULL;
-	VERIFY0(zap_count(os, object, &count));
+	error = zap_count(os, object, &count);
+	if (ztest_failed(error))
+		return;
+	VERIFY0(error);
 	ASSERT(count != -1ULL);
 
 	/*
@@ -5115,7 +5398,7 @@ ztest_zap_parallel(ztest_ds_t *zd, uint64_t id)
 			ASSERT3U(wsize, ==, zl_wsize);
 			ASSERT3U(wc, ==, zl_wc);
 		} else {
-			ASSERT3U(error, ==, ENOENT);
+			ASSERT(error == ENOENT || ztest_failed(error));
 		}
 		break;
 
@@ -5127,22 +5410,23 @@ ztest_zap_parallel(ztest_ds_t *zd, uint64_t id)
 				fatal(0, "name '%s' != val '%s' len %d",
 				    name, data, namelen);
 		} else {
-			ASSERT3U(error, ==, ENOENT);
+			ASSERT(error == ENOENT || ztest_failed(error));
 		}
 		break;
 
 	case 2:
 		error = zap_add(os, object, name, wsize, wc, data, tx);
-		ASSERT(error == 0 || error == EEXIST);
+		ASSERT(error == 0 || error == EEXIST || ztest_failed(error));
 		break;
 
 	case 3:
-		VERIFY(zap_update(os, object, name, wsize, wc, data, tx) == 0);
+		error = zap_update(os, object, name, wsize, wc, data, tx);
+		VERIFY(error == 0 || ztest_failed(error));
 		break;
 
 	case 4:
 		error = zap_remove(os, object, name, tx);
-		ASSERT(error == 0 || error == ENOENT);
+		ASSERT(error == 0 || error == ENOENT || ztest_failed(error));
 		break;
 	}
 
@@ -5170,8 +5454,19 @@ ztest_commit_callback(void *arg, int error)
 	uint64_t synced_txg;
 
 	VERIFY(data != NULL);
-	VERIFY3S(data->zcd_expected_err, ==, error);
 	VERIFY(!data->zcd_called);
+
+	/*
+	 * A failed pool cancels the callbacks of the txgs that it never
+	 * synced (see ztest_force_exit()).
+	 */
+	if (error == ECANCELED && data->zcd_expected_err == 0 &&
+	    spa_failed(data->zcd_spa)) {
+		data->zcd_called = B_TRUE;
+		goto remove;
+	}
+
+	VERIFY3S(data->zcd_expected_err, ==, error);
 
 	synced_txg = spa_last_synced_txg(data->zcd_spa);
 	if (data->zcd_txg > synced_txg)
@@ -5193,6 +5488,7 @@ ztest_commit_callback(void *arg, int error)
 		return;
 	}
 
+remove:
 	/* Was this callback added to the global callback list? */
 	if (!data->zcd_added)
 		goto out;
@@ -5295,8 +5591,14 @@ ztest_dmu_commit_callbacks(ztest_ds_t *zd, uint64_t id)
 	/*
 	 * Read existing data to make sure there isn't a future leak.
 	 */
-	VERIFY(0 == dmu_read(os, od[0].od_object, 0, sizeof (uint64_t),
-	    &old_txg, DMU_READ_PREFETCH));
+	error = dmu_read(os, od[0].od_object, 0, sizeof (uint64_t),
+	    &old_txg, DMU_READ_PREFETCH);
+	if (ztest_failed(error)) {
+		/* The callbacks will be cancelled. */
+		dmu_tx_commit(tx);
+		return;
+	}
+	VERIFY0(error);
 
 	if (old_txg > txg)
 		fatal(0, "future leak: got %" PRIu64 ", open txg is %" PRIu64,
@@ -5418,7 +5720,7 @@ ztest_remap_blocks(ztest_ds_t *zd, uint64_t id)
 	rw_enter(&ztest_name_lock, RW_READER);
 
 	int error = dmu_objset_remap_indirects(zd->zd_name);
-	if (error == ENOSPC)
+	if (error == ENOSPC || ztest_failed(error))
 		error = 0;
 	ASSERT0(error);
 
@@ -5438,10 +5740,12 @@ ztest_spa_prop_get_set(ztest_ds_t *zd, uint64_t id)
 
 	(void) ztest_spa_prop_set_uint64(ZPOOL_PROP_AUTOTRIM, ztest_random(2));
 
-	VERIFY0(spa_prop_get(ztest_spa, &props));
-
-	if (ztest_opts.zo_verbose >= 6)
-		dump_nvlist(props, 4);
+	int error = spa_prop_get(ztest_spa, &props);
+	if (!ztest_failed(error)) {
+		VERIFY0(error);
+		if (ztest_opts.zo_verbose >= 6)
+			dump_nvlist(props, 4);
+	}
 
 	nvlist_free(props);
 
@@ -5639,12 +5943,18 @@ ztest_dmu_snapshot_hold(ztest_ds_t *zd, uint64_t id)
 	 * Clean up from any previous run.
 	 */
 	error = dsl_destroy_head(clonename);
+	if (ztest_failed(error))
+		goto out;
 	if (error != ENOENT)
 		ASSERT0(error);
 	error = user_release_one(fullname, tag);
+	if (ztest_failed(error))
+		goto out;
 	if (error != ESRCH && error != ENOENT)
 		ASSERT0(error);
 	error = dsl_destroy_snapshot(fullname, B_FALSE);
+	if (ztest_failed(error))
+		goto out;
 	if (error != ENOENT)
 		ASSERT0(error);
 
@@ -5658,6 +5968,8 @@ ztest_dmu_snapshot_hold(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc("dmu_objset_snapshot");
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_objset_snapshot(%s) = %d", fullname, error);
 	}
 
@@ -5667,20 +5979,30 @@ ztest_dmu_snapshot_hold(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc("dmu_objset_clone");
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_objset_clone(%s) = %d", clonename, error);
 	}
 
 	error = dsl_destroy_snapshot(fullname, B_TRUE);
+	if (ztest_failed(error))
+		goto out;
 	if (error) {
 		fatal(0, "dsl_destroy_snapshot(%s, B_TRUE) = %d",
 		    fullname, error);
 	}
 
 	error = dsl_destroy_head(clonename);
+	if (ztest_failed(error))
+		goto out;
 	if (error)
 		fatal(0, "dsl_destroy_head(%s) = %d", clonename, error);
 
 	error = dmu_objset_hold(fullname, FTAG, &origin);
+	if (error == 0)
+		dmu_objset_rele(origin, FTAG);
+	if (ztest_failed(error))
+		goto out;
 	if (error != ENOENT)
 		fatal(0, "dmu_objset_hold(%s) = %d", fullname, error);
 
@@ -5695,6 +6017,8 @@ ztest_dmu_snapshot_hold(ztest_ds_t *zd, uint64_t id)
 			ztest_record_enospc("dmu_objset_snapshot");
 			goto out;
 		}
+		if (ztest_failed(error))
+			goto out;
 		fatal(0, "dmu_objset_snapshot(%s) = %d", fullname, error);
 	}
 
@@ -5706,28 +6030,40 @@ ztest_dmu_snapshot_hold(ztest_ds_t *zd, uint64_t id)
 	if (error == ENOSPC) {
 		ztest_record_enospc("dsl_dataset_user_hold");
 		goto out;
+	} else if (ztest_failed(error)) {
+		goto out;
 	} else if (error) {
 		fatal(0, "dsl_dataset_user_hold(%s, %s) = %u",
 		    fullname, tag, error);
 	}
 
 	error = dsl_destroy_snapshot(fullname, B_FALSE);
+	if (ztest_failed(error))
+		goto out;
 	if (error != EBUSY) {
 		fatal(0, "dsl_destroy_snapshot(%s, B_FALSE) = %d",
 		    fullname, error);
 	}
 
 	error = dsl_destroy_snapshot(fullname, B_TRUE);
+	if (ztest_failed(error))
+		goto out;
 	if (error) {
 		fatal(0, "dsl_destroy_snapshot(%s, B_TRUE) = %d",
 		    fullname, error);
 	}
 
 	error = user_release_one(fullname, tag);
+	if (ztest_failed(error))
+		goto out;
 	if (error)
 		fatal(0, "user_release_one(%s, %s) = %d", fullname, tag, error);
 
-	VERIFY3U(dmu_objset_hold(fullname, FTAG, &origin), ==, ENOENT);
+	error = dmu_objset_hold(fullname, FTAG, &origin);
+	if (error == 0)
+		dmu_objset_rele(origin, FTAG);
+	if (!ztest_failed(error))
+		VERIFY3U(error, ==, ENOENT);
 
 out:
 	rw_exit(&ztest_name_lock);
@@ -5928,7 +6264,13 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 				rw_enter(&ztest_name_lock, RW_WRITER);
 			}
 
-			VERIFY(vdev_offline(spa, guid0, flags) != EBUSY);
+			/*
+			 * While ztest_force_exit() fails the pool, it faults
+			 * every leaf, so taking one more offline would leave
+			 * no replicas.
+			 */
+			int error = vdev_offline(spa, guid0, flags);
+			VERIFY(error != EBUSY || ztest_fe_busy);
 
 			if (islog) {
 				rw_exit(&ztest_name_lock);
@@ -6125,6 +6467,11 @@ ztest_ddt_repair(ztest_ds_t *zd, uint64_t id)
 		uint64_t offset = i * blocksize;
 		int error = dmu_buf_hold(os, object, offset, FTAG, &db,
 		    DMU_READ_NO_PREFETCH);
+		if (ztest_failed(error)) {
+			dmu_tx_commit(tx);
+			rw_exit(&ztest_name_lock);
+			return;
+		}
 		if (error != 0) {
 			fatal(B_FALSE, "dmu_buf_hold(%p, %llu, %llu) = %u",
 			    os, (long long)object, (long long) offset, error);
@@ -6140,6 +6487,12 @@ ztest_ddt_repair(ztest_ds_t *zd, uint64_t id)
 
 	dmu_tx_commit(tx);
 	txg_wait_synced(spa_get_dsl(spa), txg);
+
+	/* If the pool has failed, the block may never have been written. */
+	if (spa_failed(spa)) {
+		rw_exit(&ztest_name_lock);
+		return;
+	}
 
 	/*
 	 * Find out what block we got.
@@ -6180,8 +6533,11 @@ ztest_scrub_impl(spa_t *spa)
 	if (error)
 		return (error);
 
-	while (dsl_scan_scrubbing(spa_get_dsl(spa)))
+	/* A failed pool stops the scrub. */
+	while (dsl_scan_scrubbing(spa_get_dsl(spa)) && !spa_failed(spa))
 		txg_wait_synced(spa_get_dsl(spa), 0);
+	if (spa_failed(spa))
+		return (EIO);
 
 	if (spa_get_errlog_size(spa) > 0)
 		return (ECKSUM);
@@ -6213,8 +6569,12 @@ ztest_scrub(ztest_ds_t *zd, uint64_t id)
 	(void) spa_scan(spa, POOL_SCAN_SCRUB);
 	(void) poll(NULL, 0, 100);
 
+	/*
+	 * Reads that fail while ztest_force_exit() fails the disks leave
+	 * errors in the error log.
+	 */
 	error = ztest_scrub_impl(spa);
-	if (error == EBUSY)
+	if (error == EBUSY || ztest_failed(error))
 		error = 0;
 	ASSERT0(error);
 }
@@ -6720,6 +7080,16 @@ ztest_thread(void *arg)
 		zc = ZTEST_GET_SHARED_CALLSTATE(rand);
 		call_next = zc->zc_next;
 
+		/*
+		 * Once the pool has failed, start no more tests: wait for
+		 * ztest_force_exit() to park us.  (ztest_spa is replaced
+		 * only while every test thread is parked.)
+		 */
+		if (spa_failed(ztest_spa)) {
+			(void) poll(NULL, 0, 10);
+			continue;
+		}
+
 		if (now >= call_next &&
 		    atomic_cas_64(&zc->zc_next, call_next, call_next +
 		    ztest_random(2 * zi->zi_interval[0] + 1)) == call_next) {
@@ -6856,38 +7226,77 @@ ztest_dataset_close(int d)
 }
 
 /*
- * Collect the guids of vd's leaf vdevs, or with guids == NULL, just count
- * them.
+ * Make every write to the pool's leaf vdevs fail.  The probe that follows a
+ * write error (see vdev_probe()) has to fail too, as it does when a disk
+ * dies: otherwise the vdevs look healthy, and failed writes are reissued
+ * forever instead of failing the pool.  The probe uses the vl_be area of the
+ * labels.
+ *
+ * Each handler covers every leaf in the pool at once, including leaves that
+ * tests add later.  With a handler per leaf, added one at a time, a txg could
+ * sync to the leaves that didn't have one yet after the tests had already
+ * seen errors from the ones that did, and so write a tx that a test had
+ * committed half done because it thought the pool had failed.  The probe
+ * handler comes first: it does nothing until a write fails.
  */
-static int
-ztest_force_exit_leaves(vdev_t *vd, uint64_t *guids)
+static void
+ztest_force_exit_inject(spa_t *spa, int ids[2])
 {
-	int n = 0;
+	zinject_record_t record = { 0 };
 
-	if (vd->vdev_ops->vdev_op_leaf) {
-		if (guids != NULL)
-			guids[0] = vd->vdev_guid;
-		return (1);
-	}
-	for (uint64_t c = 0; c < vd->vdev_children; c++) {
-		n += ztest_force_exit_leaves(vd->vdev_child[c],
-		    guids == NULL ? NULL : guids + n);
-	}
-	return (n);
+	record.zi_cmd = ZINJECT_LABEL_FAULT;
+	record.zi_error = EIO;
+	record.zi_start = offsetof(vdev_label_t, vl_be);
+	record.zi_end = record.zi_start + VDEV_PAD_SIZE - 1;
+	VERIFY0(zio_inject_fault(spa_name(spa), 0, &ids[0], &record));
+
+	bzero(&record, sizeof (record));
+	record.zi_cmd = ZINJECT_DEVICE_FAULT;
+	record.zi_error = EIO;
+	record.zi_iotype = ZIO_TYPE_WRITE;
+	VERIFY0(zio_inject_fault(spa_name(spa), 0, &ids[1], &record));
 }
 
 /*
- * Fail the pool at a random point, while it is syncing whatever the tests
- * left dirty, then export it, and import it again.  Every leaf vdev gets
- * write errors, so the pool can't write.  The pool fails either because it
- * has failmode=death, or because it was armed for forced exit (as by "zpool
- * export -F") and then suspended.  Half the time, the ARC is flushed first,
- * so that syncing context finds nothing cached.
+ * Wait for the other test threads to park between tests, for at most
+ * "secs" seconds.  Returns whether they all did.
+ */
+static boolean_t
+ztest_force_exit_park_others(int secs)
+{
+	clock_t deadline = ddi_get_lbolt() + SEC_TO_TICK(secs);
+	boolean_t parked;
+
+	mutex_enter(&ztest_fe_lock);
+	ztest_fe_pending = B_TRUE;
+	while (ztest_fe_parked < ztest_fe_running - 1 &&
+	    cv_timedwait(&ztest_fe_cv, &ztest_fe_lock, deadline) != -1)
+		continue;
+	parked = (ztest_fe_parked == ztest_fe_running - 1);
+	mutex_exit(&ztest_fe_lock);
+
+	return (parked);
+}
+
+/*
+ * Fail the pool at a random point, then export it, and import it again.
+ * Every leaf vdev gets write errors, so the pool can't write.  The pool fails
+ * either because it has failmode=death, or because it was armed for forced
+ * exit (as by "zpool export -F") and then suspended.  Half the time, the ARC
+ * is flushed first, so that syncing context finds nothing cached.
  *
- * The other test threads are parked between tests meanwhile, so that they
- * don't have to cope with a pool that fails under them.  The pool must
- * import at the last txg that synced before it failed: nothing written after
- * that can reach the disks.  The parent runs zdb on the pool after the pass.
+ * Usually (see -X) the other test threads keep running while the pool fails,
+ * so it fails in the middle of whatever they are doing: ZIL commits, writes,
+ * object and dataset changes, vdev changes.  Each of them must then give up
+ * (see ztest_failed()) and return, and they park between tests while the
+ * pool is exported and imported.  Otherwise, they park first, and the pool
+ * fails while it syncs whatever they left dirty.
+ *
+ * The pool must import at the last txg that synced before it failed: nothing
+ * written after that can reach the disks.  Every ZIL record that a commit
+ * acknowledged before the pool failed must be replayed when the datasets are
+ * opened again (see ztest_dataset_open()).  The parent runs zdb on the pool
+ * after the pass.
  */
 /* ARGSUSED */
 void
@@ -6897,35 +7306,29 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 	int datasets = MIN(zo->zo_datasets, zo->zo_threads);
 	boolean_t death = ztest_random(2);
 	boolean_t flush = ztest_random(2);
-	uint64_t *guids;
-	int *ids;
-	int nguids;
+	boolean_t live = ztest_random(100) < zo->zo_force_exit_live;
+	int fh[2];
 	nvlist_t *config;
 	spa_t *spa;
 	uint64_t pool_guid, failmode, txg, birth, ondisk;
-	clock_t deadline;
-	boolean_t parked;
 
 	if (zo->zo_no_force_exit || zo->zo_mmp_test)
 		return;
 
-	/*
-	 * Park the other threads.  A thread that is in the middle of a long
-	 * test can keep us waiting, in which case we give up.
-	 */
 	mutex_enter(&ztest_fe_lock);
-	if (ztest_fe_pending || !ztest_fe_ready) {
+	if (ztest_fe_busy || !ztest_fe_ready) {
 		mutex_exit(&ztest_fe_lock);
 		return;
 	}
-	ztest_fe_pending = B_TRUE;
-	deadline = ddi_get_lbolt() + SEC_TO_TICK(60);
-	while (ztest_fe_parked < ztest_fe_running - 1 &&
-	    cv_timedwait(&ztest_fe_cv, &ztest_fe_lock, deadline) != -1)
-		continue;
-	parked = (ztest_fe_parked == ztest_fe_running - 1);
+	ztest_fe_busy = B_TRUE;
 	mutex_exit(&ztest_fe_lock);
-	if (!parked) {
+
+	/*
+	 * Park the other threads, unless they are to keep going while the
+	 * pool fails.  A thread that is in the middle of a long test can keep
+	 * us waiting, in which case we give up.
+	 */
+	if (!live && !ztest_force_exit_park_others(60)) {
 		if (zo->zo_verbose >= 3) {
 			(void) printf("forced exit: test threads didn't "
 			    "park\n");
@@ -6933,30 +7336,20 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 		goto out;
 	}
 
+	/*
+	 * Keep ztest_resume_thread() from resuming the pool while it fails.
+	 */
 	rw_enter(&ztest_spa_lock, RW_WRITER);
 	spa = ztest_spa;
 	pool_guid = spa_guid(spa);
 	failmode = spa->spa_failmode;
 
 	if (zo->zo_verbose >= 3) {
-		(void) printf("forced exit: failing %s (%s%s)\n",
+		(void) printf("forced exit: failing %s (%s%s%s)\n",
 		    spa_name(spa), death ? "failmode=death" : "armed",
-		    flush ? ", ARC flushed" : "");
+		    flush ? ", ARC flushed" : "",
+		    live ? ", tests running" : "");
 	}
-
-	/*
-	 * Make every write to the pool's disks fail.  The probe that follows
-	 * a write error (see vdev_probe()) has to fail too, as it does when a
-	 * disk dies: otherwise the vdevs look healthy, and failed writes are
-	 * reissued forever instead of failing the pool.  The probe uses the
-	 * vl_be area of the labels.
-	 */
-	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
-	nguids = ztest_force_exit_leaves(spa->spa_root_vdev, NULL);
-	guids = umem_alloc(nguids * sizeof (uint64_t), UMEM_NOFAIL);
-	VERIFY3S(ztest_force_exit_leaves(spa->spa_root_vdev, guids), ==,
-	    nguids);
-	spa_config_exit(spa, SCL_VDEV, FTAG);
 
 	if (death) {
 		spa->spa_failmode = ZIO_FAILURE_MODE_DEATH;
@@ -6966,48 +7359,37 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 	}
 	if (flush)
 		arc_flush(spa, B_FALSE);
+	ztest_fe_faulting = B_TRUE;
+	ztest_force_exit_inject(spa, fh);
 
-	ids = umem_alloc(2 * nguids * sizeof (int), UMEM_NOFAIL);
-	for (int i = 0; i < nguids; i++) {
-		zinject_record_t record = { 0 };
-
-		record.zi_cmd = ZINJECT_DEVICE_FAULT;
-		record.zi_guid = guids[i];
-		record.zi_error = EIO;
-		record.zi_iotype = ZIO_TYPE_WRITE;
-		VERIFY0(zio_inject_fault(spa_name(spa), 0, &ids[2 * i],
-		    &record));
-
-		bzero(&record, sizeof (record));
-		record.zi_cmd = ZINJECT_LABEL_FAULT;
-		record.zi_guid = guids[i];
-		record.zi_error = EIO;
-		record.zi_start = offsetof(vdev_label_t, vl_be);
-		record.zi_end = record.zi_start + VDEV_PAD_SIZE - 1;
-		VERIFY0(zio_inject_fault(spa_name(spa), 0, &ids[2 * i + 1],
-		    &record));
+	/*
+	 * Whatever the tests are doing, or left dirty, will fail the pool
+	 * when it syncs.  If there is nothing, dirty the pool ourselves.
+	 */
+	for (int i = 0; !spa_failed(spa); i++) {
+		if (i == 600)
+			fatal(0, "forced exit: pool didn't fail");
+		if (i % 10 == 0)
+			(void) spa_history_log(spa, "ztest forced exit");
+		if (!spa_failed(spa))
+			(void) poll(NULL, 0, 100);
 	}
 
 	/*
-	 * Whatever the tests left dirty will fail the pool when it syncs.
-	 * If they left nothing, dirty the pool ourselves.
+	 * Every test that was running when the pool failed has to notice,
+	 * and give up, now that nothing it waits for on the pool can block.
 	 */
-	for (int i = 0; !spa_failed(spa); i++) {
-		if (i == 60)
-			fatal(0, "forced exit: pool didn't fail");
-		(void) spa_history_log(spa, "ztest forced exit");
-		if (!spa_failed(spa))
-			(void) poll(NULL, 0, 1000);
-	}
+	if (live && !ztest_force_exit_park_others(300))
+		fatal(0, "forced exit: test threads didn't stop after the "
+		    "pool failed");
 
 	/*
 	 * Nothing reaches the disks now, injected or not.  The injection
 	 * handlers hold the pool, so they have to go before the export.
 	 */
-	for (int i = 0; i < 2 * nguids; i++)
-		VERIFY0(zio_clear_fault(ids[i]));
-	umem_free(ids, 2 * nguids * sizeof (int));
-	umem_free(guids, nguids * sizeof (uint64_t));
+	VERIFY0(zio_clear_fault(fh[0]));
+	VERIFY0(zio_clear_fault(fh[1]));
+	ztest_fe_faulting = B_FALSE;
 
 	/*
 	 * The last txg that synced, and the last one that changed anything
@@ -7031,7 +7413,13 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 	VERIFY0(spa_import(zo->zo_pool, config, NULL, 0));
 	nvlist_free(config);
 	VERIFY0(spa_open(zo->zo_pool, &spa, ZTEST_SPA_TAG));
-	VERIFY3U(spa_guid(spa), ==, pool_guid);
+	/*
+	 * A reguid that was running when the pool failed changes the guid in
+	 * core, but its txg goes into the void, so the disks may still have
+	 * the old one.
+	 */
+	if (!live)
+		VERIFY3U(spa_guid(spa), ==, pool_guid);
 	VERIFY(!spa_failed(spa));
 
 	/*
@@ -7056,6 +7444,7 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 out:
 	mutex_enter(&ztest_fe_lock);
 	ztest_fe_pending = B_FALSE;
+	ztest_fe_busy = B_FALSE;
 	cv_broadcast(&ztest_fe_cv);
 	mutex_exit(&ztest_fe_lock);
 }
@@ -7083,6 +7472,7 @@ ztest_run(ztest_shared_t *zs)
 	mutex_init(&ztest_fe_lock, NULL, USYNC_THREAD, NULL);
 	cv_init(&ztest_fe_cv, NULL, USYNC_THREAD, NULL);
 	rw_init(&ztest_spa_lock, NULL, USYNC_THREAD, NULL);
+	ztest_fe_busy = B_FALSE;
 	ztest_fe_pending = B_FALSE;
 	ztest_fe_ready = B_FALSE;
 	ztest_fe_parked = 0;
