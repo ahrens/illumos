@@ -16,14 +16,22 @@
 
 #
 # Copyright (c) 2014, 2017 by Delphix. All rights reserved.
+# Copyright 2026 Oxide Computer Company
 #
 
 . $STF_SUITE/include/libtest.shlib
 . $STF_SUITE/tests/functional/removal/removal.kshlib
 
+#
+# Restore the value we found rather than a constant: a leftover low value
+# makes later tests gang (e.g. raw zvol initialization then starts over at
+# a smaller block size, again and again).
+#
+typeset orig_force_ganging=$(get_tunable metaslab_force_ganging)
+
 function cleanup
 {
-	log_must set_tunable64 metaslab_force_ganging $((2**17 + 1))
+	log_must set_tunable64 metaslab_force_ganging $orig_force_ganging
 	default_cleanup_noexit
 }
 

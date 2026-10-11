@@ -16,8 +16,17 @@
 
 #
 # Copyright (c) 2014 by Delphix. All rights reserved.
+# Copyright 2026 Oxide Computer Company
 #
 
 . $STF_SUITE/include/libtest.shlib
+
+#
+# removal_with_ganging restores metaslab_force_ganging in its own cleanup,
+# but that doesn't run if the test is killed (e.g. hung in "zpool wait"),
+# and a leftover low value makes all later tests gang.  Put back the
+# default, SPA_MAXBLOCKSIZE + 1.
+#
+log_must set_tunable64 metaslab_force_ganging $((2**24 + 1))
 
 default_cleanup
