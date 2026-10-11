@@ -826,7 +826,13 @@ vdev_trim_thread(void *arg)
 	vd->vdev_trim_partial = 0;
 	vd->vdev_trim_secure = 0;
 
-	VERIFY0(vdev_trim_load(vd));
+	/*
+	 * The vdev may have been detached while we waited, in which case it
+	 * has no parent, which loading its progress needs, and the loop below
+	 * doesn't run.
+	 */
+	if (!vd->vdev_detached)
+		VERIFY0(vdev_trim_load(vd));
 
 	ta.trim_vdev = vd;
 	ta.trim_extent_bytes_max = zfs_trim_extent_bytes_max;

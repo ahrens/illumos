@@ -473,8 +473,14 @@ vdev_initialize_thread(void *arg)
 	ASSERT(vdev_is_concrete(vd));
 	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 
+	/*
+	 * The vdev may have been detached since we were started, in which case
+	 * it has no parent, which loading its progress needs, and the loop
+	 * below doesn't run.
+	 */
 	vd->vdev_initialize_last_offset = 0;
-	VERIFY0(vdev_initialize_load(vd));
+	if (!vd->vdev_detached)
+		VERIFY0(vdev_initialize_load(vd));
 
 	abd_t *deadbeef = vdev_initialize_block_alloc();
 
