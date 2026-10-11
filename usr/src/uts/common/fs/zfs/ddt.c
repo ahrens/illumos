@@ -716,7 +716,7 @@ ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add)
 		cv_wait(&dde->dde_cv, &ddt->ddt_lock);
 
 	if (dde->dde_loaded)
-		return (dde);
+		return (dde->dde_failed ? NULL : dde);
 
 	dde->dde_loading = B_TRUE;
 
@@ -727,10 +727,8 @@ ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add)
 	for (type = 0; type < DDT_TYPES; type++) {
 		for (class = 0; class < DDT_CLASSES; class++) {
 			error = ddt_object_lookup(ddt, type, class, dde);
-			if (error != ENOENT) {
-				ASSERT0(error);
+			if (error != ENOENT)
 				break;
-			}
 		}
 		if (error != ENOENT)
 			break;
@@ -740,6 +738,20 @@ ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add)
 
 	ASSERT(dde->dde_loaded == B_FALSE);
 	ASSERT(dde->dde_loading == B_TRUE);
+
+	/*
+	 * If the DDT can't be read (its disks are failing), we don't know
+	 * whether the block has an entry.  The entry stays empty, so that
+	 * ddt_sync() leaves the DDT alone, and until then every lookup of it
+	 * returns NULL: the caller writes a plain block, or leaks the block it
+	 * was freeing, rather than change a refcount it can't see.
+	 */
+	if (error != 0 && error != ENOENT) {
+		bzero(dde->dde_phys, sizeof (dde->dde_phys));
+		dde->dde_failed = B_TRUE;
+		type = DDT_TYPES;
+		class = DDT_CLASSES;
+	}
 
 	dde->dde_type = type;	/* will be DDT_TYPES if no entry found */
 	dde->dde_class = class;	/* will be DDT_CLASSES if no entry found */
@@ -751,7 +763,7 @@ ddt_lookup(ddt_t *ddt, const blkptr_t *bp, boolean_t add)
 
 	cv_broadcast(&dde->dde_cv);
 
-	return (dde);
+	return (dde->dde_failed ? NULL : dde);
 }
 
 void
