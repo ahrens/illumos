@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2016 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef _SYS_DDT_H
@@ -123,6 +124,7 @@ struct ddt_entry {
 	enum ddt_class	dde_class;
 	uint8_t		dde_loading;
 	uint8_t		dde_loaded;
+	uint8_t		dde_failed;	/* couldn't be read */
 	kcondvar_t	dde_cv;
 	avl_node_t	dde_node;
 };
