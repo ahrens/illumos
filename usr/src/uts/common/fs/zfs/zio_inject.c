@@ -23,6 +23,7 @@
  * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2017, Intel Corporation.
  * Copyright (c) 2024, Klara Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*
@@ -36,7 +37,8 @@
  *
  * Device level injection is done using the 'zi_guid' field.  If this is set, it
  * means that the error is destined for a particular device, not a piece of
- * data.
+ * data.  A device or label fault whose 'zi_guid' is 0 applies to every leaf
+ * vdev in the pool, including leaves added after it, all at once.
  *
  * This is a rather poor data structure and algorithm, but we don't expect more
  * than a few faults at any one time, so it should be sufficient for our needs.
@@ -292,6 +294,18 @@ zio_handle_fault_injection(zio_t *zio, int error)
 }
 
 /*
+ * A device or label fault applies to the leaf it names, or with no guid, to
+ * every leaf in its pool.
+ */
+static boolean_t
+zio_inject_vdev_match(inject_handler_t *handler, vdev_t *vd)
+{
+	if (handler->zi_record.zi_guid == 0)
+		return (vd->vdev_spa == handler->zi_spa);
+	return (vd->vdev_guid == handler->zi_record.zi_guid);
+}
+
+/*
  * Determine if the zio is part of a label update and has an injection
  * handler associated with that portion of the label. Currently, we
  * allow error injection in either the nvlist or the uberblock region of
@@ -329,7 +343,7 @@ zio_handle_label_injection(zio_t *zio, int error)
 		start = vdev_label_offset(vd->vdev_psize, label, start);
 		end = vdev_label_offset(vd->vdev_psize, label, end);
 
-		if (zio->io_vd->vdev_guid == handler->zi_record.zi_guid &&
+		if (zio_inject_vdev_match(handler, vd) &&
 		    (offset >= start && offset <= end)) {
 			ret = error;
 			break;
@@ -366,7 +380,7 @@ zio_handle_device_injection(vdev_t *vd, zio_t *zio, int error)
 		if (handler->zi_record.zi_cmd != ZINJECT_DEVICE_FAULT)
 			continue;
 
-		if (vd->vdev_guid == handler->zi_record.zi_guid) {
+		if (zio_inject_vdev_match(handler, vd)) {
 			if (handler->zi_record.zi_failfast &&
 			    (zio == NULL || (zio->io_flags &
 			    (ZIO_FLAG_IO_RETRY | ZIO_FLAG_TRYHARD)))) {
