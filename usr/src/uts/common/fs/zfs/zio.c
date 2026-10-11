@@ -3080,7 +3080,7 @@ zio_ddt_write(zio_t *zio)
 	zio_t *cio = NULL;
 	zio_t *dio = NULL;
 	ddt_t *ddt = ddt_select(spa, bp);
-	ddt_entry_t *dde;
+	ddt_entry_t *dde = NULL;
 	ddt_phys_t *ddp;
 
 	ASSERT(BP_GET_DEDUP(bp));
@@ -3089,11 +3089,18 @@ zio_ddt_write(zio_t *zio)
 	ASSERT(!(zio->io_bp_override && (zio->io_flags & ZIO_FLAG_RAW)));
 
 	/*
-	 * Dedup would read the DDT.  A write that was set up for dedup before
-	 * the pool failed is written as a plain block instead, as it would
-	 * have been had the pool already failed (see zio_write_bp_init()).
+	 * Dedup would read the DDT, so on a failed pool a dedup write is
+	 * written as a plain block instead, whether the pool failed before or
+	 * after the write was set up.  So is one whose DDT entry can't be
+	 * read.
 	 */
-	if (spa_failed(spa)) {
+	if (!spa_failed(spa)) {
+		ddt_enter(ddt);
+		dde = ddt_lookup(ddt, bp, B_TRUE);
+		if (dde == NULL)
+			ddt_exit(ddt);
+	}
+	if (dde == NULL) {
 		zp->zp_dedup = zp->zp_dedup_verify = B_FALSE;
 		BP_SET_DEDUP(bp, 0);
 		if (zio->io_bp_override != NULL)
@@ -3103,8 +3110,6 @@ zio_ddt_write(zio_t *zio)
 		return (ZIO_PIPELINE_CONTINUE);
 	}
 
-	ddt_enter(ddt);
-	dde = ddt_lookup(ddt, bp, B_TRUE);
 	ddp = &dde->dde_phys[p];
 
 	if (zp->zp_dedup_verify && zio_ddt_collision(zio, ddt, dde)) {
@@ -3212,10 +3217,16 @@ zio_ddt_free(zio_t *zio)
 	ASSERT(BP_GET_DEDUP(bp));
 	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
 
+	/*
+	 * If the DDT entry can't be read, we can't tell whether anything else
+	 * still refers to the block, so it isn't freed.
+	 */
 	ddt_enter(ddt);
 	freedde = dde = ddt_lookup(ddt, bp, B_TRUE);
-	ddp = ddt_phys_select(dde, bp);
-	ddt_phys_decref(ddp);
+	if (dde != NULL) {
+		ddp = ddt_phys_select(dde, bp);
+		ddt_phys_decref(ddp);
+	}
 	ddt_exit(ddt);
 
 	return (ZIO_PIPELINE_CONTINUE);
