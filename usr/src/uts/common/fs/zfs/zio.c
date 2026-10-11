@@ -1986,6 +1986,14 @@ zio_reexecute(zio_t *pio)
 	pio->io_error = 0;
 	for (int w = 0; w < ZIO_WAIT_TYPES; w++)
 		pio->io_state[w] = 0;
+
+	/*
+	 * Start a fresh allocation trace.  A write that keeps failing
+	 * is reexecuted indefinitely, and each attempt would otherwise
+	 * add to the same list until it reaches its limit.
+	 */
+	metaslab_trace_fini(&pio->io_alloc_list);
+	metaslab_trace_init(&pio->io_alloc_list);
 	for (int c = 0; c < ZIO_CHILD_TYPES; c++)
 		pio->io_child_error[c] = 0;
 
