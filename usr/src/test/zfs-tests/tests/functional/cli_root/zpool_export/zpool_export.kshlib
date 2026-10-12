@@ -1,0 +1,28 @@
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+
+#
+# Copyright 2026 Oxide Computer Company
+#
+
+. $STF_SUITE/tests/functional/cli_root/zpool_export/zpool_export.cfg
+
+#
+# Has the pool failed (see spa_fail() in the kernel)?  Ask the kernel, as
+# failmode/failmode.kshlib does.
+#
+function pool_has_failed # pool
+{
+	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_exit'
+	typeset state=$(print -r -- "::walk spa | $fmt" | mdb -k |
+	    nawk -v pool=$1 '$1 == pool { print $2 }')
+	[[ $state == 2 ]]
+}

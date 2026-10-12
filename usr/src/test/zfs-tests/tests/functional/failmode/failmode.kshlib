@@ -202,3 +202,164 @@ function proc_is_blocked # pid
 	((pct >= 50)) && return 2
 	return 0
 }
+
+#
+# The rest of this file is adapted from OpenZFS's failmode.kshlib
+# (Copyright (c) 2025, Klara, Inc.): conv=fsync and oflag=sync need GNU dd,
+# illumos has no pool state kstat or ZIL kstats, and vdev probes are made to
+# fail with label errors, as zinject -T probe isn't available.
+#
+
+typeset -A failmode_sync_helper_cmd=(
+    ["fsync"]='gnu_dd if=/dev/urandom of=DATAFILE bs=128k count=1 conv=fsync'
+    ["msync"]='mmap_write_sync DATAFILE'
+    ["osync"]='gnu_dd if=/dev/urandom of=DATAFILE bs=128k count=1 oflag=sync'
+    ["syncalways"]='dd if=/dev/urandom of=DATAFILE bs=128k count=1'
+)
+
+typeset -A failmode_sync_helper_dsopts=(
+    ["syncalways"]="-o sync=always"
+)
+
+function failmode_sync_cleanup
+{
+	# zinject handlers hold the pool, so clear them before exporting
+	zinject -c all || true
+	if poolexists $TESTPOOL && pool_has_failed $TESTPOOL; then
+		zpool export -f $TESTPOOL
+	fi
+	poolexists $TESTPOOL && zpool clear $TESTPOOL
+	destroy_pool $TESTPOOL
+}
+
+#
+# failmode_sync_test <failmode> <helper>
+#
+# run a failmode sync test:
+# - failmode: wait|continue|death
+# - helper: fsync|msync|osync|syncalways
+#
+function failmode_sync_test
+{
+	typeset failmode=$1
+	typeset helper=$2
+
+	# we'll need two disks, one for the main pool, one for the log
+	read -r DISK1 DISK2 _ <<<"$DISKS"
+
+	# file to write to the pool
+	typeset datafile="/$TESTPOOL/$TESTFS/datafile"
+
+	# create a single-disk pool with a separate log and the wanted failmode
+	log_must zpool create \
+	    -f -o failmode=$failmode $TESTPOOL $DISK1 log $DISK2
+
+	# create the test dataset. we bias the ZIL towards the log device to
+	# try to ensure that the sync write never involves the main device
+	log_must zfs create \
+	    -o recordsize=128k -o logbias=latency \
+	    ${failmode_sync_helper_dsopts[$helper]} \
+	    $TESTPOOL/$TESTFS
+
+	# create the target file. the ZIL head structure is created on first
+	# use, and does a full txg wait to finish, which we want to avoid
+	log_must gnu_dd if=/dev/zero of=$datafile bs=128k count=1 conv=fsync
+	log_must zpool sync
+
+	# inject errors. writes will fail, as will the followup probes
+	zinject -d $DISK1 -e io -T write $TESTPOOL
+	zinject -d $DISK1 -L pad2 $TESTPOOL
+	zinject -d $DISK2 -e io -T write $TESTPOOL
+	zinject -d $DISK2 -L pad2 $TESTPOOL
+
+	# run the helper program in the background. the pool should immediately
+	# suspend, and the sync op block or fail based on the failmode
+	typeset helper_cmd=${failmode_sync_helper_cmd[$helper]/DATAFILE/$datafile}
+	log_note "running failmode sync helper: $helper_cmd"
+	$helper_cmd &
+	typeset -i pid=$!
+
+	# should only take a moment, but give it a chance. a death pool fails
+	# rather than suspending
+	if [[ $failmode = "death" ]]; then
+		failmode_wait_failed $TESTPOOL
+	else
+		log_note "waiting for pool to suspend"
+		typeset -i tries=10
+		until pool_is_suspended $TESTPOOL; do
+			if ((tries-- == 0)); then
+				log_fail "pool didn't suspend"
+			fi
+			sleep 1
+		done
+	fi
+
+	# give the sync op a moment to notice the suspend and return
+	sleep 1
+
+	# see if the helper program blocked
+	typeset -i blocked
+	if kill -0 $pid ; then
+		blocked=1
+		log_note "$helper: blocked in the kernel"
+	else
+		blocked=0
+		log_note "$helper: exited while pool suspended"
+	fi
+
+	if [[ $failmode = "death" ]]; then
+		# a failed pool can't come back: the only way out is the
+		# export, which must not wait for the helper. the helper
+		# may still be running only if it is blocked, which fails
+		# the test below; don't let the export wait on it.
+		((blocked)) && kill -9 $pid
+		# zinject handlers hold the pool, so clear them first. that
+		# can't revive a failed pool.
+		log_must zinject -c all
+		log_must zpool export -f $TESTPOOL
+		wait $pid
+		typeset -i rc=$?
+
+		# the pool comes back with what was synced before it failed
+		log_must zpool import $TESTPOOL
+		log_must zpool scrub -w $TESTPOOL
+		log_must check_pool_status $TESTPOOL "errors" \
+		    "No known data errors"
+	else
+		# bring the pool back online
+		zinject -c all
+		zpool clear $TESTPOOL
+
+		# program definitely exited now, get its return code
+		wait $pid
+		typeset -i rc=$?
+	fi
+
+	failmode_sync_cleanup
+
+	log_note "$helper: blocked=$blocked rc=$rc"
+
+	# confirm expected results for the failmode
+	if [[ $failmode = "wait" ]] ; then
+		# - sync op blocked when the pool suspended
+		# - after resume, sync op succeeded, helper returned success
+		log_must test $blocked -eq 1
+		log_must test $rc -eq 0
+	elif [[ $failmode = "continue" ]] ; then
+		# - helper exited when the pool suspended
+		# - sync op returned an error, so helper returned failure
+		log_must test $blocked -eq 0
+		log_must test $rc -ne 0
+	elif [[ $failmode = "death" ]] ; then
+		# - helper exited when the pool failed
+		# - sync op returned an error: nothing written after the
+		#   failure is on disk, so it must not report success
+		log_must test $blocked -eq 0
+		log_must test $rc -ne 0
+	else
+		log_fail "impossible failmode: $failmode"
+	fi
+
+	# illumos's log_must returns 1 even when the command succeeds
+	return 0
+}

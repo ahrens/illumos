@@ -3013,4 +3013,118 @@ function sha256digest
 	return 0
 }
 
+#
+# Return 0 if the given pool is suspended.  The status message ID is used
+# because 'zpool list -o health' does not report suspension.
+#
+function is_pool_suspended #pool
+{
+	#
+	# Read spa_suspended from the kernel rather than asking zpool status,
+	# which needs the spa_namespace_lock: some tests park a thread that
+	# holds that lock on the suspended pool.
+	#
+	echo "::walk spa | ::print spa_t spa_name spa_suspended" | \
+	    mdb -k 2>/dev/null | awk -v p="\"$1\"" '
+	    $1 == "spa_name" { cur = $4 }
+	    $1 == "spa_suspended" && cur == p && $3 != "0" { found = 1 }
+	    END { exit !found }'
+}
+
+#
+# Suspend the given pool using zinject to fail the given list of VDEVs
+#
+function suspend_pool
+{
+	typeset pool=$1
+	shift
+
+	for vdev in $@; do
+		zinject -d $vdev -e io -T write $pool
+		# Fail the label I/O of vdev probes too.
+		zinject -d $vdev -L pad2 $pool
+	done
+
+	# Dirty the pool so that the next txg sync runs into the injected
+	# errors even if nothing else is writing to it.  A buffered write
+	# returns before it is synced, so this does not block on the
+	# suspended pool.
+	if [[ $(zfs get -H -o value mounted $pool) == "yes" ]]; then
+		typeset mntpnt=$(zfs get -H -o value mountpoint $pool)
+		dd if=/dev/urandom of=$mntpnt/.suspend_pool bs=128k count=1 \
+		    2>/dev/null
+	fi
+
+	if ! wait_pool_suspended $pool; then
+		zinject -c all
+		zpool status -s
+		return 1
+	fi
+
+	zinject -c all
+
+	return 0
+}
+
+#
+# Clear ZFS labels from the given disks, e.g. those of a pool which was
+# forcibly exported or destroyed without updating its labels, so that later
+# tests do not find a stale pool on them.
+#
+function labelclear_disks
+{
+	typeset disk
+
+	for disk in "$@"; do
+		zpool labelclear -f $disk >/dev/null 2>&1
+	done
+	return 0
+}
+
+#
+# Wait up to $2 (default 30) seconds for a pool to become suspended.
+#
+function wait_pool_suspended
+{
+	typeset pool=$1
+	typeset -i tries=${2:-30}
+
+	log_note "waiting for pool ${pool} to suspend"
+	until is_pool_suspended $pool; do
+		if ((tries-- == 0)); then
+			log_note "UNEXPECTED -- pool ${pool} did not suspend"
+			return 1
+		fi
+		sleep 1
+	done
+
+	return 0
+}
+
+#
+# Cleanup leftovers after suspend_pool() work
+#
+function clear_suspension_artifacts
+{
+	typeset pool=$1
+
+	poolexists $pool || return 0
+
+	zinject -c all
+	zpool clear $pool
+}
+
+#
+# Return 0 if any kernel thread of the given process has the given function
+# on its stack.
+#
+function pid_stack_has #pid func
+{
+	typeset pid=$1
+	typeset func=$2
+
+	echo "0t$pid::pid2proc | ::walk thread | ::findstack -v" | mdb -k | \
+	    tee /dev/stderr | grep -q "$func"
+}
+
 . ${STF_SUITE}/include/kstat.shlib

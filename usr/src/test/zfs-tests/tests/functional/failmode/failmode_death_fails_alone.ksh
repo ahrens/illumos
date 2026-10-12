@@ -66,6 +66,8 @@ if pool_is_suspended $TESTPOOL; then
 fi
 typeset health=$(zpool list -H -o health $TESTPOOL)
 [[ $health == FAILED ]] || log_fail "failed pool's health is $health"
+health=$(zpool get -H -o value health $TESTPOOL)
+[[ $health == FAILED ]] || log_fail "zpool get shows health $health"
 zpool status $TESTPOOL | grep -q "^ *state: FAILED" ||
     log_fail "zpool status doesn't show the pool as FAILED"
 log_mustnot zpool clear $TESTPOOL

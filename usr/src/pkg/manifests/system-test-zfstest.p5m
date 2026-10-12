@@ -46,6 +46,7 @@ file path=opt/zfs-tests/bin/mkbusy mode=0555
 file path=opt/zfs-tests/bin/mkfiles mode=0555
 file path=opt/zfs-tests/bin/mkholes mode=0555
 file path=opt/zfs-tests/bin/mktree mode=0555
+file path=opt/zfs-tests/bin/mmap_write_sync mode=0555
 file path=opt/zfs-tests/bin/mmapwrite mode=0555
 file path=opt/zfs-tests/bin/randfree_file mode=0555
 file path=opt/zfs-tests/bin/randwritecomp mode=0555
@@ -1573,6 +1574,12 @@ dir  path=opt/zfs-tests/tests/functional/cli_root/zpool_export
 file path=opt/zfs-tests/tests/functional/cli_root/zpool_export/cleanup mode=0555
 file path=opt/zfs-tests/tests/functional/cli_root/zpool_export/setup mode=0555
 file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export.cfg \
+    mode=0444
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export.kshlib \
+    mode=0444
+file \
     path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_001_pos \
     mode=0555
 file \
@@ -1583,6 +1590,36 @@ file \
     mode=0555
 file \
     path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_004_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_001_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_002_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_003_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_004_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_005_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_006_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_receive_001_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_receive_002_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_send_001_pos \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_hardforce_send_002_pos \
     mode=0555
 file \
     path=opt/zfs-tests/tests/functional/cli_root/zpool_export/zpool_export_parallel_admin \
@@ -2458,16 +2495,40 @@ file path=opt/zfs-tests/tests/functional/failmode/failmode_death_export_f \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_death_fails_alone \
     mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_death_probe_errors \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_death_props mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_dmu_tx_continue \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_dmu_tx_wait mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_fsync_continue \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_fsync_death mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_fsync_wait mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_health mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_msync_continue \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_msync_death mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_msync_wait mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_nowait_continue \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_nowait_wait mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_osync_continue \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_osync_death mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_osync_wait mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_status_resilver \
     mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_syncalways_continue \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_syncalways_death \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_syncalways_wait \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_transient_no_errlog \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_vdev_state mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/failmode_vdev_state_death \
     mode=0555
 file \
     path=opt/zfs-tests/tests/functional/failmode/failmode_write_errors_probe_ok \
@@ -2513,6 +2574,8 @@ file path=opt/zfs-tests/tests/functional/fault/auto_spare_sorted_001_pos \
 file path=opt/zfs-tests/tests/functional/fault/cleanup mode=0555
 file path=opt/zfs-tests/tests/functional/fault/fault.cfg mode=0444
 file path=opt/zfs-tests/tests/functional/fault/setup mode=0555
+file path=opt/zfs-tests/tests/functional/fault/suspend_on_probe_errors mode=0555
+file path=opt/zfs-tests/tests/functional/fault/suspend_txg_sync_spin mode=0555
 file path=opt/zfs-tests/tests/functional/fault/zpool_status_-s mode=0555
 dir  path=opt/zfs-tests/tests/functional/features
 dir  path=opt/zfs-tests/tests/functional/features/async_destroy

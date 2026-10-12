@@ -363,6 +363,13 @@ tags = ['functional', 'cli_root', 'zpool_expand']
 [tests/functional/cli_root/zpool_export]
 tests = ['zpool_export_001_pos', 'zpool_export_002_pos',
     'zpool_export_003_neg', 'zpool_export_004_pos',
+    'zpool_export_hardforce_001_pos', 'zpool_export_hardforce_002_pos',
+    'zpool_export_hardforce_003_pos', 'zpool_export_hardforce_004_pos',
+    'zpool_export_hardforce_005_pos', 'zpool_export_hardforce_006_pos',
+    'zpool_export_hardforce_receive_001_pos',
+    'zpool_export_hardforce_receive_002_pos',
+    'zpool_export_hardforce_send_001_pos',
+    'zpool_export_hardforce_send_002_pos',
     'zpool_export_parallel_admin', 'zpool_export_parallel_pos']
 tags = ['functional', 'cli_root', 'zpool_export']
 
@@ -577,6 +584,10 @@ tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'forced_export_idle', 'forced_export_read_errors_only',
     'export_suspended_eagain', 'forced_export_ereports',
     'failmode_death_export_f', 'forced_export_other_pools',
+    'failmode_fsync_wait', 'failmode_msync_wait', 'failmode_osync_wait',
+    'failmode_syncalways_wait', 'failmode_fsync_death', 'failmode_msync_death',
+    'failmode_osync_death', 'failmode_syncalways_death',
+    'failmode_vdev_state_death',
     'forced_export_busy_fs_continue', 'forced_export_busy_fs_death',
     'forced_export_zvol_continue', 'forced_export_zvol_death',
     'forced_export_idle_lofi', 'failmode_write_errors_probe_ok',
