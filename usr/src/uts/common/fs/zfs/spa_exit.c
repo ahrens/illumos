@@ -357,16 +357,59 @@ spa_exit_poisoned_read(spa_t *spa, const struct zbookmark_phys *zb)
 	    (u_longlong_t)zb->zb_blkid);
 }
 
+#ifdef _KERNEL
+static callb_id_t spa_shutdown_cbid;
+
+/*
+ * At shutdown, uadmin(2) unmounts every file system.  The unmount of one in a
+ * suspended pool waits for the pool to resume, which never happens, and the
+ * system hangs.  Just before that, arm every pool for forced exit: a pool that
+ * is suspended, or suspends while its file systems are being unmounted, fails
+ * instead, losing its unsynced changes as it would anyway.  A pool that never
+ * suspends behaves as usual.
+ */
+/* ARGSUSED */
+static boolean_t
+spa_shutdown_callb(void *arg, int code)
+{
+	mutex_enter(&spa_namespace_avl_lock);
+	spa_t *spa = avl_first(&spa_namespace_avl);
+	while (spa != NULL) {
+		if (!spa_exit_hold(spa)) {
+			spa = AVL_NEXT(&spa_namespace_avl, spa);
+			continue;
+		}
+		mutex_exit(&spa_namespace_avl_lock);
+		spa_exit_arm(spa);
+		mutex_enter(&spa_namespace_avl_lock);
+		/* The hold kept the pool in the tree. */
+		spa_t *next = AVL_NEXT(&spa_namespace_avl, spa);
+		spa_exit_rele(spa);
+		spa = next;
+	}
+	mutex_exit(&spa_namespace_avl_lock);
+
+	return (B_TRUE);
+}
+#endif
+
 void
 spa_exit_init(void)
 {
 	cv_init(&spa_exit_hold_cv, NULL, CV_DEFAULT, NULL);
 	spa_exit_stat_init();
+#ifdef _KERNEL
+	spa_shutdown_cbid = callb_add(spa_shutdown_callb, NULL,
+	    CB_CL_UADMIN_PRE_VFS, "zfs_shutdown");
+#endif
 }
 
 void
 spa_exit_fini(void)
 {
+#ifdef _KERNEL
+	(void) callb_delete(spa_shutdown_cbid);
+#endif
 	spa_exit_stat_fini();
 	cv_destroy(&spa_exit_hold_cv);
 }
