@@ -739,6 +739,7 @@ dsl_scan_setup_sync(void *arg, dmu_tx_t *tx)
 	scn->scn_phys.scn_state = DSS_SCANNING;
 	scn->scn_phys.scn_min_txg = 0;
 	scn->scn_phys.scn_max_txg = tx->tx_txg;
+	scn->scn_setup_txg = tx->tx_txg;
 	scn->scn_phys.scn_ddt_class_max = DDT_CLASSES - 1; /* the entire DDT */
 	scn->scn_phys.scn_start_time = gethrestime_sec();
 	scn->scn_phys.scn_errors = 0;
@@ -3495,6 +3496,18 @@ dsl_scan_sync(dsl_pool_t *dp, dmu_tx_t *tx)
 		return;
 
 	if (!dsl_scan_is_running(scn) || dsl_scan_is_paused_scrub(scn))
+		return;
+
+	/*
+	 * Don't start scanning in the txg the scan was set up in.  A
+	 * resilver's scn_max_txg comes from the DTLs, and goes past this txg
+	 * if a write failed in it, so the scan would visit blocks born in
+	 * this txg.  It runs in sync pass 1, and later passes can rewrite
+	 * those (MOS) blocks in place, so the reads it queued for them would
+	 * fail with ECKSUM on every DVA.  By the next txg, every block the
+	 * scan can visit is final.
+	 */
+	if (scn->scn_setup_txg == tx->tx_txg)
 		return;
 
 	/*
