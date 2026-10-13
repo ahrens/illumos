@@ -430,6 +430,7 @@ struct zio {
 	zio_priority_t	io_priority;
 	uint8_t		io_reexecute;
 	uint8_t		io_state[ZIO_WAIT_TYPES];
+	uint_t		io_reexecute_count;	/* see zio_reexecute_max */
 	uint64_t	io_txg;
 	spa_t		*io_spa;
 	blkptr_t	*io_bp;

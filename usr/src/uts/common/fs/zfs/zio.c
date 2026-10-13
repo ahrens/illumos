@@ -84,6 +84,16 @@ extern vmem_t *zio_alloc_arena;
 /* Mark IOs as "slow" if they take longer than 30 seconds */
 int zio_slow_io_ms = (30 * MILLISEC);
 
+/*
+ * An allocating write that fails for any reason but ENOSPC is reexecuted at
+ * once, so that it can be allocated somewhere else.  If its disk keeps
+ * failing writes while still answering probes, nothing ever faults the disk
+ * and the write would be reexecuted forever, without the pool suspending.
+ * After this many reexecutions the write suspends the pool instead, like
+ * any other write that can't succeed.
+ */
+uint_t zio_reexecute_max = 100;
+
 #define	BP_SPANB(indblkshift, level) \
 	(((uint64_t)1) << ((level) * ((indblkshift) - SPA_BLKPTRSHIFT)))
 #define	COMPARE_META_LEVEL	0x80000000ul
@@ -4367,10 +4377,15 @@ zio_done(zio_t *zio)
 
 		if (IO_IS_ALLOCATING(zio) &&
 		    !(zio->io_flags & ZIO_FLAG_CANFAIL)) {
-			if (zio->io_error != ENOSPC)
-				zio->io_reexecute |= ZIO_REEXECUTE_NOW;
-			else
+			if (zio->io_error == ENOSPC) {
 				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+			} else if (zio->io_reexecute_count <
+			    zio_reexecute_max) {
+				zio->io_reexecute_count++;
+				zio->io_reexecute |= ZIO_REEXECUTE_NOW;
+			} else {
+				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+			}
 		}
 
 		if ((zio->io_type == ZIO_TYPE_READ ||
