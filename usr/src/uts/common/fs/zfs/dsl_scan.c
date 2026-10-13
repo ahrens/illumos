@@ -764,6 +764,21 @@ dsl_scan_setup_sync(void *arg, dmu_tx_t *tx)
 			spa_event_notify(spa, NULL, NULL, ESC_ZFS_SCRUB_START);
 		}
 
+		/*
+		 * The DTL max is exclusive, so a write that failed in the
+		 * syncing txg makes it tx_txg + 1, and the scan would visit
+		 * blocks born in this txg.  The scan starts in sync pass 1,
+		 * and later passes can rewrite those (MOS) blocks in place,
+		 * so the queued reads would fail with ECKSUM.  A scrub has no
+		 * reason to look past the last synced txg; the DTL entries
+		 * for this txg stay, since the scrub only excises
+		 * [0, scn_max_txg).
+		 */
+		if (*funcp == POOL_SCAN_SCRUB) {
+			scn->scn_phys.scn_max_txg =
+			    MIN(scn->scn_phys.scn_max_txg, tx->tx_txg);
+		}
+
 		spa->spa_scrub_started = B_TRUE;
 		/*
 		 * If this is an incremental scrub, limit the DDT scrub phase
