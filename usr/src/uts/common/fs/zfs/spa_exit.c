@@ -54,7 +54,7 @@
  * along its usual success path.  Frees and claims are no-ops.  I/O that was
  * parked while the pool was suspended is reexecuted into the fence, and I/O
  * that was already queued below it completes there.  Nothing reports errors,
- * updates vdev stats or reexecutes on a failed pool (zio_done()):
+ * updates vdev stats or reexecutes on a failed pool (zio_done_report()):
  * spa_fail() posted one ereport for the pool.
  *
  * Draining

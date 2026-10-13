@@ -401,16 +401,6 @@ typedef int zio_pipe_stage_t(zio_t *zio);
 #define	ZIO_REEXECUTE_SUSPEND	0x02
 
 /*
- * Why a zio wants to suspend, for failmode=death (see zio_suspend()): it ran
- * out of space, or it failed for any other reason.  Set with
- * ZIO_REEXECUTE_SUSPEND.
- */
-#define	ZIO_REEXECUTE_ENOSPC	0x04
-#define	ZIO_REEXECUTE_FAILED	0x08
-#define	ZIO_REEXECUTE_SUSPEND_ALL	\
-	(ZIO_REEXECUTE_SUSPEND | ZIO_REEXECUTE_ENOSPC | ZIO_REEXECUTE_FAILED)
-
-/*
  * The io_trim flags are used to specify the type of TRIM to perform.  They
  * only apply to ZIO_TYPE_TRIM zios and are distinct from io_flags.
  */

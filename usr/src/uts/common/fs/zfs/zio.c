@@ -88,9 +88,9 @@ int zio_slow_io_ms = (30 * MILLISEC);
  * An allocating write that fails for any reason but ENOSPC is reexecuted at
  * once, so that it can be allocated somewhere else.  If its disk keeps
  * failing writes while still answering probes, nothing ever faults the disk
- * and the write would be reexecuted forever, without the pool suspending.
- * After this many reexecutions the write suspends the pool instead, like
- * any other write that can't succeed.
+ * and the write would be reexecuted forever, without the pool suspending (or,
+ * under failmode=death, failing).  After this many reexecutions the write
+ * suspends the pool instead, like any other write that can't succeed.
  */
 uint_t zio_reexecute_max = 100;
 
@@ -4438,14 +4438,138 @@ zio_dva_throttle_done(zio_t *zio)
 	zio_allocate_dispatch(zio->io_spa, pio->io_allocator);
 }
 
-static int
-zio_done(zio_t *zio)
+/*
+ * Account for a completed zio, report its errors, and decide whether it
+ * should be reexecuted.  None of that happens once the pool has failed: its
+ * errors are expected and are not worth reporting one by one (spa_fail()
+ * posted a pool-level ereport), and nothing is retried or suspended.  Its
+ * pending checksum reports are dropped.  The caller says whether the pool
+ * has failed, since it must decide the same way later on.
+ */
+static void
+zio_done_report(zio_t *zio, uint64_t psize, boolean_t failed)
 {
 	spa_t *spa = zio->io_spa;
 	zio_t *lio = zio->io_logical;
 	blkptr_t *bp = zio->io_bp;
 	vdev_t *vd = zio->io_vd;
 	boolean_t log_error = B_FALSE;
+
+	if (failed) {
+		while (zio->io_cksum_report != NULL) {
+			zio_cksum_report_t *zcr = zio->io_cksum_report;
+			zio->io_cksum_report = zcr->zcr_next;
+			zfs_ereport_free_checksum(zcr);
+		}
+		return;
+	}
+
+	vdev_stat_update(zio, psize);
+
+	if (zio->io_delay >= MSEC2NSEC(zio_slow_io_ms)) {
+		if (zio->io_vd != NULL && !vdev_is_dead(zio->io_vd)) {
+			/*
+			 * We want to only increment our slow IO counters if
+			 * the IO is valid (i.e. not if the drive is removed).
+			 *
+			 * zfs_ereport_post() will also do these checks, but
+			 * it can also have other failures, so we need to
+			 * increment the slow_io counters independent of it.
+			 */
+			if (zfs_ereport_is_valid(FM_EREPORT_ZFS_DELAY,
+			    zio->io_spa, zio->io_vd, zio)) {
+				mutex_enter(&zio->io_vd->vdev_stat_lock);
+				zio->io_vd->vdev_stat.vs_slow_ios++;
+				mutex_exit(&zio->io_vd->vdev_stat_lock);
+
+				(void) zfs_ereport_post(FM_EREPORT_ZFS_DELAY,
+				    zio->io_spa, zio->io_vd, &zio->io_bookmark,
+				    zio, 0, 0);
+			}
+		}
+	}
+
+	if (zio->io_error) {
+		/*
+		 * If this I/O is attached to a particular vdev,
+		 * generate an error message describing the I/O failure
+		 * at the block level.  We ignore these errors if the
+		 * device is currently unavailable.
+		 */
+		if (zio->io_error != ECKSUM && vd != NULL && !vdev_is_dead(vd))
+			(void) zfs_ereport_post(FM_EREPORT_ZFS_IO, spa, vd,
+			    &zio->io_bookmark, zio, 0, 0);
+
+		if ((zio->io_error == EIO || !(zio->io_flags &
+		    (ZIO_FLAG_SPECULATIVE | ZIO_FLAG_DONT_PROPAGATE))) &&
+		    zio == lio) {
+			/*
+			 * For logical I/O requests, generate a logical data
+			 * ereport, and tell the SPA to log the error unless
+			 * the zio will be reexecuted (see below).
+			 */
+			log_error = B_TRUE;
+			(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA, spa, NULL,
+			    &zio->io_bookmark, zio, 0, 0);
+		}
+	}
+
+	if (zio->io_error && zio == lio) {
+		/*
+		 * Determine whether zio should be reexecuted.  This will
+		 * propagate all the way to the root via zio_notify_parent().
+		 */
+		ASSERT(vd == NULL && bp != NULL);
+		ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
+
+		if (IO_IS_ALLOCATING(zio) &&
+		    !(zio->io_flags & ZIO_FLAG_CANFAIL)) {
+			if (zio->io_error == ENOSPC) {
+				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+			} else if (zio->io_reexecute_count <
+			    zio_reexecute_max) {
+				zio->io_reexecute_count++;
+				zio->io_reexecute |= ZIO_REEXECUTE_NOW;
+			} else {
+				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+			}
+		}
+
+		if ((zio->io_type == ZIO_TYPE_READ ||
+		    zio->io_type == ZIO_TYPE_FREE) &&
+		    !(zio->io_flags & ZIO_FLAG_SCAN_THREAD) &&
+		    zio->io_error == ENXIO &&
+		    spa_load_state(spa) == SPA_LOAD_NONE &&
+		    spa_get_failmode(spa) != ZIO_FAILURE_MODE_CONTINUE)
+			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+
+		if (!(zio->io_flags & ZIO_FLAG_CANFAIL) && !zio->io_reexecute)
+			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
+
+		/*
+		 * Here is a possibly good place to attempt to do
+		 * either combinatorial reconstruction or error correction
+		 * based on checksums.  It also might be a good place
+		 * to send out preliminary ereports before we suspend
+		 * processing.
+		 */
+	}
+
+	/*
+	 * A zio that will be reexecuted, now or when the pool resumes, hasn't
+	 * failed permanently, so don't put it in the persistent error log.  A
+	 * write that fails until the pool suspends would otherwise leave an
+	 * entry per attempt, even though it eventually succeeds.
+	 */
+	if (log_error && zio->io_reexecute == 0)
+		spa_log_error(spa, &zio->io_bookmark);
+}
+
+static int
+zio_done(zio_t *zio)
+{
+	spa_t *spa = zio->io_spa;
+	blkptr_t *bp = zio->io_bp;
 	uint64_t psize = zio->io_size;
 	zio_t *pio, *pio_next;
 	zio_link_t *zl = NULL;
@@ -4460,9 +4584,8 @@ zio_done(zio_t *zio)
 	}
 
 	/*
-	 * Once the pool has failed, errors are expected and are not worth
-	 * reporting one by one (spa_fail() posted a pool-level ereport), and
-	 * nothing is retried or suspended.
+	 * Look once: whether the pool has failed decides both what is reported
+	 * (see zio_done_report()) and what errors are absorbed, below.
 	 */
 	failed = spa_failed(spa);
 
@@ -4522,19 +4645,11 @@ zio_done(zio_t *zio)
 	zio_inherit_child_errors(zio, ZIO_CHILD_GANG);
 	zio_inherit_child_errors(zio, ZIO_CHILD_DDT);
 
-	if (failed) {
-		while (zio->io_cksum_report != NULL) {
-			zio_cksum_report_t *zcr = zio->io_cksum_report;
-			zio->io_cksum_report = zcr->zcr_next;
-			zfs_ereport_free_checksum(zcr);
-		}
-	}
-
 	/*
 	 * If the I/O on the transformed data was successful, generate any
 	 * checksum reports now while we still have the transformed data.
 	 */
-	if (zio->io_error == 0) {
+	if (zio->io_error == 0 && !failed) {
 		while (zio->io_cksum_report != NULL) {
 			zio_cksum_report_t *zcr = zio->io_cksum_report;
 			uint64_t align = zcr->zcr_align;
@@ -4559,109 +4674,7 @@ zio_done(zio_t *zio)
 
 	zio_pop_transforms(zio);	/* note: may set zio->io_error */
 
-	if (!failed)
-		vdev_stat_update(zio, psize);
-
-	if (!failed && zio->io_delay >= MSEC2NSEC(zio_slow_io_ms)) {
-		if (zio->io_vd != NULL && !vdev_is_dead(zio->io_vd)) {
-			/*
-			 * We want to only increment our slow IO counters if
-			 * the IO is valid (i.e. not if the drive is removed).
-			 *
-			 * zfs_ereport_post() will also do these checks, but
-			 * it can also have other failures, so we need to
-			 * increment the slow_io counters independent of it.
-			 */
-			if (zfs_ereport_is_valid(FM_EREPORT_ZFS_DELAY,
-			    zio->io_spa, zio->io_vd, zio)) {
-				mutex_enter(&zio->io_vd->vdev_stat_lock);
-				zio->io_vd->vdev_stat.vs_slow_ios++;
-				mutex_exit(&zio->io_vd->vdev_stat_lock);
-
-				(void) zfs_ereport_post(FM_EREPORT_ZFS_DELAY,
-				    zio->io_spa, zio->io_vd, &zio->io_bookmark,
-				    zio, 0, 0);
-			}
-		}
-	}
-
-	if (zio->io_error && !failed) {
-		/*
-		 * If this I/O is attached to a particular vdev,
-		 * generate an error message describing the I/O failure
-		 * at the block level.  We ignore these errors if the
-		 * device is currently unavailable.
-		 */
-		if (zio->io_error != ECKSUM && vd != NULL && !vdev_is_dead(vd))
-			(void) zfs_ereport_post(FM_EREPORT_ZFS_IO, spa, vd,
-			    &zio->io_bookmark, zio, 0, 0);
-
-		if ((zio->io_error == EIO || !(zio->io_flags &
-		    (ZIO_FLAG_SPECULATIVE | ZIO_FLAG_DONT_PROPAGATE))) &&
-		    zio == lio) {
-			/*
-			 * For logical I/O requests, generate a logical data
-			 * ereport, and tell the SPA to log the error unless
-			 * the zio will be reexecuted (see below).
-			 */
-			log_error = B_TRUE;
-			(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA, spa, NULL,
-			    &zio->io_bookmark, zio, 0, 0);
-		}
-	}
-
-	if (zio->io_error && zio == lio && !failed) {
-		/*
-		 * Determine whether zio should be reexecuted.  This will
-		 * propagate all the way to the root via zio_notify_parent().
-		 */
-		ASSERT(vd == NULL && bp != NULL);
-		ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
-
-		if (IO_IS_ALLOCATING(zio) &&
-		    !(zio->io_flags & ZIO_FLAG_CANFAIL)) {
-			if (zio->io_error == ENOSPC) {
-				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND |
-				    ZIO_REEXECUTE_ENOSPC;
-			} else if (zio->io_reexecute_count <
-			    zio_reexecute_max) {
-				zio->io_reexecute_count++;
-				zio->io_reexecute |= ZIO_REEXECUTE_NOW;
-			} else {
-				zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND;
-			}
-		}
-
-		if ((zio->io_type == ZIO_TYPE_READ ||
-		    zio->io_type == ZIO_TYPE_FREE) &&
-		    !(zio->io_flags & ZIO_FLAG_SCAN_THREAD) &&
-		    zio->io_error == ENXIO &&
-		    spa_load_state(spa) == SPA_LOAD_NONE &&
-		    spa_get_failmode(spa) != ZIO_FAILURE_MODE_CONTINUE)
-			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND |
-			    ZIO_REEXECUTE_FAILED;
-
-		if (!(zio->io_flags & ZIO_FLAG_CANFAIL) && !zio->io_reexecute)
-			zio->io_reexecute |= ZIO_REEXECUTE_SUSPEND |
-			    ZIO_REEXECUTE_FAILED;
-
-		/*
-		 * Here is a possibly good place to attempt to do
-		 * either combinatorial reconstruction or error correction
-		 * based on checksums.  It also might be a good place
-		 * to send out preliminary ereports before we suspend
-		 * processing.
-		 */
-	}
-
-	/*
-	 * A zio that will be reexecuted, now or when the pool resumes, hasn't
-	 * failed permanently, so don't put it in the persistent error log.  A
-	 * write that fails until the pool suspends would otherwise leave an
-	 * entry per attempt, even though it eventually succeeds.
-	 */
-	if (log_error && zio->io_reexecute == 0)
-		spa_log_error(spa, &zio->io_bookmark);
+	zio_done_report(zio, psize, failed);
 
 	/*
 	 * If there were logical child errors, they apply to us now.
@@ -4696,7 +4709,7 @@ zio_done(zio_t *zio)
 	 */
 	if ((zio->io_flags & ZIO_FLAG_GODFATHER) &&
 	    (zio->io_reexecute & ZIO_REEXECUTE_SUSPEND))
-		zio->io_reexecute &= ~ZIO_REEXECUTE_SUSPEND_ALL;
+		zio->io_reexecute &= ~ZIO_REEXECUTE_SUSPEND;
 
 	if (zio->io_reexecute) {
 		/*
