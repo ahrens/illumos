@@ -22,6 +22,7 @@
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  * Copyright (c) 2017, 2019, Datto Inc. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_DSL_SCAN_H
@@ -110,6 +111,7 @@ typedef struct dsl_scan {
 	struct dsl_pool *scn_dp;
 	uint64_t scn_restart_txg;
 	uint64_t scn_done_txg;
+	uint64_t scn_setup_txg;		/* in-core; see dsl_scan_sync() */
 	uint64_t scn_sync_start_time;
 	uint64_t scn_issued_before_pass;
 
