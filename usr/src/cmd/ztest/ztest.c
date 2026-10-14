@@ -5770,18 +5770,24 @@ ztest_fault_inject(ztest_ds_t *zd, uint64_t id)
 			 * Make vd0 explicitly claim to be unreadable,
 			 * or unwriteable, or reach behind its back
 			 * and close the underlying fd.  We can do this if
-			 * maxfaults == 0 because we'll fail and reexecute,
-			 * and we can do it if maxfaults >= 2 because we'll
-			 * have enough redundancy.  If maxfaults == 1, the
-			 * combination of this with injection of random data
-			 * corruption below exceeds the pool's fault tolerance.
+			 * maxfaults >= 2 because we'll have enough redundancy.
+			 * If maxfaults == 0 we can only make it unwriteable:
+			 * failed writes suspend the pool and are reexecuted
+			 * after ztest_resume() clears the fault, but failed
+			 * reads don't suspend it, and without redundancy each
+			 * one is a permanent error that ztest_scrub() reports.
+			 * If maxfaults == 1, the combination of this with
+			 * injection of random data corruption below exceeds
+			 * the pool's fault tolerance.
 			 */
 			vdev_file_t *vf = vd0->vdev_tsd;
 
 			zfs_dbgmsg("injecting fault to vdev %llu; maxfaults=%d",
 			    (long long)vd0->vdev_id, (int)maxfaults);
 
-			if (vf != NULL && ztest_random(3) == 0) {
+			if (maxfaults == 0) {
+				vd0->vdev_cant_write = B_TRUE;
+			} else if (vf != NULL && ztest_random(3) == 0) {
 				(void) close(vf->vf_vnode->v_fd);
 				vf->vf_vnode->v_fd = -1;
 			} else if (ztest_random(2) == 0) {
