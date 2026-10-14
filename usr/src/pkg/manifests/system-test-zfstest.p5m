@@ -2558,10 +2558,18 @@ file \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_other_pools \
     mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_pinned.kshlib \
+    mode=0444
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_pinned_sync \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_pinned_zil \
+    mode=0555
 file \
     path=opt/zfs-tests/tests/functional/failmode/forced_export_read_errors_only \
     mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_recv mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_retry mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_send mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_continue \
     mode=0555
