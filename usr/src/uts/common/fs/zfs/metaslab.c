@@ -3383,12 +3383,14 @@ metaslab_activate(metaslab_t *msp, int allocator, uint64_t activation_weight)
 	 * that case, don't bother activating it. This can happen if the
 	 * metaslab had space during find_valid_metaslab, but another thread
 	 * loaded it and used all that space while we were waiting to grab the
-	 * lock.
+	 * lock.  The metaslab may have a little space again, because
+	 * metaslab_unalloc_dva() (a failed or reexecuted allocating write)
+	 * returns space to ms_allocatable without reweighting it; that space
+	 * is taken into account when the metaslab is reweighted in
+	 * metaslab_sync_done().
 	 */
-	if (msp->ms_weight == 0) {
-		ASSERT0(range_tree_space(msp->ms_allocatable));
+	if (msp->ms_weight == 0)
 		return (SET_ERROR(ENOSPC));
-	}
 
 	if ((error = metaslab_activate_allocator(msp->ms_group, msp,
 	    allocator, activation_weight)) != 0) {
