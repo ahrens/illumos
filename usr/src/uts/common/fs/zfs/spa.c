@@ -6003,6 +6003,25 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	spa_open_ref(spa, FTAG);
 	mutex_exit(&spa_namespace_lock);
 	spa_async_suspend(spa);
+
+	boolean_t active = (spa->spa_state != POOL_STATE_UNINITIALIZED &&
+	    spa->spa_sync_on);
+
+	/*
+	 * Objsets may be open only because they're dirty, so we have to force
+	 * it to sync before checking spa_refcnt.  First let the pool sync
+	 * without holding spa_namespace_lock, which would block administration
+	 * of every other pool if this one is slow.  If the pool is or becomes
+	 * suspended, give up.
+	 */
+	if (active && txg_wait_synced_flags(spa->spa_dsl_pool, 0,
+	    TXG_WAIT_SUSPEND) != 0) {
+		mutex_enter(&spa_namespace_lock);
+		spa_close(spa, FTAG);
+		error = SET_ERROR(EAGAIN);
+		goto fail;
+	}
+
 	mutex_enter(&spa_namespace_lock);
 	spa->spa_export_thread = curthread;
 	spa_close(spa, FTAG);
@@ -6011,13 +6030,15 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	 * The pool will be in core if it's openable,
 	 * in which case we can modify its state.
 	 */
-	if (spa->spa_state != POOL_STATE_UNINITIALIZED && spa->spa_sync_on) {
+	if (active) {
 		/*
-		 * Objsets may be open only because they're dirty, so we
-		 * have to force it to sync before checking spa_refcnt.
-		 * If the pool is or becomes suspended, give up rather than
-		 * wait forever while holding spa_namespace_lock, which
-		 * would block administration of every other pool.
+		 * Whatever was dirtied while we weren't holding
+		 * spa_namespace_lock must sync too, and from here until the
+		 * reference check below we must keep holding it, so that
+		 * nothing opens the pool in between.  This is normally quick,
+		 * since we just synced.  Again, give up if the pool is or
+		 * becomes suspended, rather than wait forever while holding
+		 * spa_namespace_lock.
 		 */
 		if (txg_wait_synced_flags(spa->spa_dsl_pool, 0,
 		    TXG_WAIT_SUSPEND) != 0) {
