@@ -4236,6 +4236,7 @@ zio_done(zio_t *zio)
 	zio_t *lio = zio->io_logical;
 	blkptr_t *bp = zio->io_bp;
 	vdev_t *vd = zio->io_vd;
+	boolean_t log_error = B_FALSE;
 	uint64_t psize = zio->io_size;
 	zio_t *pio, *pio_next;
 	zio_link_t *zl = NULL;
@@ -4373,10 +4374,11 @@ zio_done(zio_t *zio)
 		    (ZIO_FLAG_SPECULATIVE | ZIO_FLAG_DONT_PROPAGATE))) &&
 		    zio == lio) {
 			/*
-			 * For logical I/O requests, tell the SPA to log the
-			 * error and generate a logical data ereport.
+			 * For logical I/O requests, generate a logical data
+			 * ereport, and tell the SPA to log the error unless
+			 * the zio will be reexecuted (see below).
 			 */
-			spa_log_error(spa, &zio->io_bookmark);
+			log_error = B_TRUE;
 			(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA, spa, NULL,
 			    &zio->io_bookmark, zio, 0, 0);
 		}
@@ -4422,6 +4424,21 @@ zio_done(zio_t *zio)
 		 * processing.
 		 */
 	}
+
+	/*
+	 * A zio that will be reexecuted, now or when the pool resumes, hasn't
+	 * failed permanently, so don't put it in the persistent error log.  A
+	 * write that fails until the pool suspends would otherwise leave an
+	 * entry per attempt, even though it eventually succeeds.
+	 *
+	 * Nor does a write whose caller handles its failure (ZIO_FLAG_CANFAIL),
+	 * such as a log block or dmu_sync() write: the ZIL waits for the txg
+	 * to sync the data instead, and nothing points to the failed block.
+	 */
+	if (log_error && zio->io_reexecute == 0 &&
+	    !(zio->io_type == ZIO_TYPE_WRITE &&
+	    (zio->io_flags & ZIO_FLAG_CANFAIL)))
+		spa_log_error(spa, &zio->io_bookmark);
 
 	/*
 	 * If there were logical child errors, they apply to us now.
