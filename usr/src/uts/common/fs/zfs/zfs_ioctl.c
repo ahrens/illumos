@@ -1709,13 +1709,19 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	zfs_log_history(zc);
 
 	/*
-	 * The open volumes of a failed pool would keep it from being
-	 * exported, so fail them first (see zvol_fail()).  If the pool fails
-	 * while we export it, they are still open, so try again once.
+	 * The open volumes and mounted file systems of a failed pool would
+	 * keep it from being exported, so fail the volumes (see zvol_fail())
+	 * and detach the file systems (see zfs_fail_mounts()) first.  If the
+	 * pool fails while we export it, they are still there, so try again
+	 * once.  Arming the pool first fails it now if it is suspended.
 	 */
+	if (hardforce)
+		(void) spa_exit_arm_by_name(zc->zc_name);
+	(void) zfs_fail_mounts(zc->zc_name);
 	(void) zvol_fail_minors(zc->zc_name);
 	error = spa_export(zc->zc_name, NULL, force, hardforce);
-	if (error == EBUSY && zvol_fail_minors(zc->zc_name) != 0)
+	if (error == EBUSY && zfs_fail_mounts(zc->zc_name) +
+	    zvol_fail_minors(zc->zc_name) != 0)
 		error = spa_export(zc->zc_name, NULL, force, hardforce);
 	if (error == 0)
 		zvol_remove_minors(zc->zc_name);

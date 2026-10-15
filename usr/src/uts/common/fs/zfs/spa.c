@@ -6388,8 +6388,9 @@ fail:
 
 /*
  * Wait for the references on a failed pool to go away, for up to
- * TXG_SIZE * zfs_txg_timeout seconds.  Its file systems have been unmounted,
- * and threads that were waiting on it have been woken up and are failing out.
+ * TXG_SIZE * zfs_txg_timeout seconds.  Its file systems have been unmounted
+ * or detached (zfs_fail_mounts()), and threads that were waiting on it have
+ * been woken up and are failing out.
  * Fault injection handlers, which also keep a pool from being exported, are
  * waited for too.  Called and returns with spa_namespace_lock held, which is
  * dropped while we wait.  Returns EBUSY if references remain, or EINTR.

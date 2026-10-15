@@ -26,7 +26,7 @@
  * Copyright 2019 Joyent, Inc.
  * Copyright 2020 Joshua M. Clulow <josh@sysmgr.org>
  * Copyright 2020 OmniOS Community Edition (OmniOSce) Association.
- * Copyright 2024 Oxide Computer Company
+ * Copyright 2026 Oxide Computer Company
  * Copyright 2025 MNX Cloud, Inc.
  */
 
@@ -48,6 +48,7 @@
 #include <sys/zfs_znode.h>
 #include <sys/zfs_dir.h>
 #include <sys/zil.h>
+#include <sys/txg.h>
 #include <sys/fs/zfs.h>
 #include <sys/dmu.h>
 #include <sys/dsl_prop.h>
@@ -112,6 +113,39 @@ static const fs_operation_def_t zfs_vfsops_template[] = {
  * from being unloaded after a umount -f
  */
 static uint32_t	zfs_active_fs_count = 0;
+
+/*
+ * The file systems that own their datasets: those being mounted
+ * (z_mounting) and those mounted, until they are unmounted, or detached from
+ * a failed pool (zfs_fail_mounts()).  z_spa stays valid while a file system
+ * is on the list, since its dataset holds the pool.
+ */
+static list_t zfs_mounts;
+static kmutex_t zfs_mounts_lock;
+static kcondvar_t zfs_mounts_cv;
+static uint64_t zfs_mounts_gen;
+
+static int zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting);
+
+/*
+ * Take a file system off zfs_mounts, if it is on it: it is about to release
+ * its dataset.  If zfs_fail_mounts() is detaching it, wait for that to finish
+ * if asked to: an unmount must, since the file system is freed after it.
+ */
+static void
+zfs_mounts_remove(zfsvfs_t *zfsvfs, boolean_t wait)
+{
+	mutex_enter(&zfs_mounts_lock);
+	while (wait && zfsvfs->z_failing)
+		cv_wait(&zfs_mounts_cv, &zfs_mounts_lock);
+	if (list_link_active(&zfsvfs->z_mounts_node))
+		list_remove(&zfs_mounts, zfsvfs);
+	if (zfsvfs->z_mounting) {
+		zfsvfs->z_mounting = B_FALSE;
+		cv_broadcast(&zfs_mounts_cv);
+	}
+	mutex_exit(&zfs_mounts_lock);
+}
 
 static char *noatime_cancel[] = { MNTOPT_ATIME, NULL };
 static char *atime_cancel[] = { MNTOPT_NOATIME, NULL };
@@ -1350,6 +1384,7 @@ zfsvfs_free(zfsvfs_t *zfsvfs)
 	rw_enter(&zfsvfs_lock, RW_READER);
 	rw_exit(&zfsvfs_lock);
 
+	ASSERT(!list_link_active(&zfsvfs->z_mounts_node));
 	zfs_fuid_destroy(zfsvfs);
 
 	mutex_destroy(&zfsvfs->z_znodes_lock);
@@ -1403,6 +1438,22 @@ zfs_domount(vfs_t *vfsp, char *osname)
 	if (error)
 		return (error);
 	zfsvfs->z_vfs = vfsp;
+
+	/*
+	 * A failed pool's file systems are detached from it before it is
+	 * exported (see zfs_fail_mounts()), so don't mount new ones.  If it
+	 * fails while we mount, zfs_fail_mounts() waits for us, and we fail
+	 * the mount below.
+	 */
+	zfsvfs->z_spa = dmu_objset_spa(zfsvfs->z_os);
+	if (spa_failed(zfsvfs->z_spa)) {
+		error = SET_ERROR(EIO);
+		goto out;
+	}
+	mutex_enter(&zfs_mounts_lock);
+	zfsvfs->z_mounting = B_TRUE;
+	list_insert_tail(&zfs_mounts, zfsvfs);
+	mutex_exit(&zfs_mounts_lock);
 
 	/* Initialize the generic filesystem structure. */
 	vfsp->vfs_bcount = 0;
@@ -1467,20 +1518,52 @@ zfs_domount(vfs_t *vfsp, char *osname)
 		dmu_objset_set_user(zfsvfs->z_os, zfsvfs);
 		mutex_exit(&zfsvfs->z_os->os_user_ptr_lock);
 	} else {
-		error = zfsvfs_setup(zfsvfs, B_TRUE);
+		if ((error = zfsvfs_setup(zfsvfs, B_TRUE)) != 0)
+			goto out;
 	}
 
-	/* cache the root vnode for this mount */
+	/*
+	 * Cache the root vnode for this mount.  A failed pool can't read it if
+	 * it isn't cached already.
+	 */
 	znode_t *rootzp;
-	if (error = zfs_zget(zfsvfs, zfsvfs->z_root, &rootzp)) {
-		goto out;
-	}
+	if ((error = zfs_zget(zfsvfs, zfsvfs->z_root, &rootzp)) != 0)
+		goto teardown;
 	zfsvfs->z_rootdir = ZTOV(rootzp);
 
 	if (!zfsvfs->z_issnap)
 		zfsctl_create(zfsvfs);
+
+	/*
+	 * If the pool failed while we were mounting (in the log replay, say,
+	 * whose errors zfsvfs_setup() ignores), fail the mount, rather than
+	 * leave zfs_fail_mounts() a file system to detach.
+	 */
+	mutex_enter(&zfs_mounts_lock);
+	if (spa_failed(zfsvfs->z_spa)) {
+		mutex_exit(&zfs_mounts_lock);
+		error = SET_ERROR(EIO);
+		goto teardown;
+	}
+	zfsvfs->z_mounting = B_FALSE;
+	cv_broadcast(&zfs_mounts_cv);
+	mutex_exit(&zfs_mounts_lock);
+	goto out;
+
+teardown:
+	/*
+	 * Give the file system up as an unmount would: zfsvfs_setup() opened
+	 * the log and registered the property callbacks.
+	 */
+	VERIFY0(zfsvfs_teardown(zfsvfs, B_TRUE));
+	mutex_enter(&zfsvfs->z_os->os_user_ptr_lock);
+	dmu_objset_set_user(zfsvfs->z_os, NULL);
+	mutex_exit(&zfsvfs->z_os->os_user_ptr_lock);
+	if (zfsvfs->z_ctldir != NULL)
+		zfsctl_destroy(zfsvfs);
 out:
 	if (error) {
+		zfs_mounts_remove(zfsvfs, B_FALSE);
 		dmu_objset_disown(zfsvfs->z_os, B_TRUE, zfsvfs);
 		zfsvfs_free(zfsvfs);
 	} else {
@@ -2028,9 +2111,21 @@ zfs_mount(vfs_t *vfsp, vnode_t *mvp, struct mounta *uap, cred_t *cr)
 	 * according to those options set in the current VFS options.
 	 */
 	if (uap->flags & MS_REMOUNT) {
-		/* refresh mount options */
-		zfs_unregister_callbacks(vfsp->vfs_data);
-		error = zfs_register_callbacks(vfsp);
+		zfsvfs_t *zfsvfs = vfsp->vfs_data;
+
+		/*
+		 * A file system detached from its failed pool (see
+		 * zfs_fail_mounts()), or whose resume failed, has no objset.
+		 */
+		rrm_enter_read(&zfsvfs->z_teardown_lock, FTAG);
+		if (zfsvfs->z_unmounted || zfsvfs->z_os == NULL) {
+			error = SET_ERROR(EIO);
+		} else {
+			/* refresh mount options */
+			zfs_unregister_callbacks(zfsvfs);
+			error = zfs_register_callbacks(vfsp);
+		}
+		rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
 		goto out;
 	}
 
@@ -2243,8 +2338,12 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 		rw_exit(&zfsvfs->z_teardown_inactive_lock);
 		rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
 
-		/* Drop the cached root vp now that it is safe */
-		VN_RELE(vp);
+		/*
+		 * Drop the cached root vp now that it is safe.  A mount that
+		 * failed may not have cached it (see zfs_domount()).
+		 */
+		if (vp != NULL)
+			VN_RELE(vp);
 	}
 
 	/*
@@ -2352,12 +2451,14 @@ zfs_umount(vfs_t *vfsp, int fflag, cred_t *cr)
 
 	vfsp->vfs_flag |= VFS_UNMOUNTED;
 
+	zfs_mounts_remove(zfsvfs, B_TRUE);
 	VERIFY(zfsvfs_teardown(zfsvfs, B_TRUE) == 0);
 	os = zfsvfs->z_os;
 
 	/*
-	 * z_os will be NULL if there was an error in
-	 * attempting to reopen zfsvfs.
+	 * z_os will be NULL if there was an error in attempting to reopen
+	 * zfsvfs, or if it was detached from its failed pool (see
+	 * zfs_fail_mounts()).
 	 */
 	if (os != NULL) {
 		/*
@@ -2522,6 +2623,7 @@ zfs_resume_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 		 * the unmount below.
 		 */
 		zfsvfs->z_os = NULL;
+		zfs_mounts_remove(zfsvfs, B_FALSE);
 		dsl_dataset_disown(ds, DS_HOLD_FLAG_DECRYPT, zfsvfs);
 		goto bail;
 	}
@@ -2571,6 +2673,153 @@ bail:
 			(void) dounmount(zfsvfs->z_vfs, MS_FORCE, CRED());
 	}
 	return (err);
+}
+
+/*
+ * Detach a file system from its failed pool (see zfs_fail_mounts()): close
+ * its log, release the dbufs of its znodes and its dataset, and leave it
+ * with no objset, so that its vnode operations fail with EIO (ZFS_ENTER()).
+ * Like a file system whose resume failed, it stays mounted until it is
+ * unmounted, which then always succeeds.  Returns EBUSY if its log still has
+ * writes in flight at the deadline, and ENOENT if it has already released
+ * its dataset.
+ */
+static int
+zfsvfs_detach(zfsvfs_t *zfsvfs, clock_t deadline)
+{
+	objset_t *os;
+	znode_t *zp;
+	int error = 0;
+
+	/*
+	 * Closing the log waits for its writes in flight, which may never
+	 * finish if they reached a device before the pool failed and the
+	 * device stopped answering.  Wait for them here, for no longer than
+	 * the deadline, rather than in zil_close() with the file system
+	 * locked out.  A suspended receive or rollback holds z_teardown_lock
+	 * until it resumes the file system, which it does at once on a
+	 * failed pool.
+	 */
+	rrm_enter_read(&zfsvfs->z_teardown_lock, FTAG);
+	if (zfsvfs->z_log != NULL) {
+		error = zil_failed_wait(zfsvfs->z_log,
+		    MAX(deadline - ddi_get_lbolt(), 1));
+	}
+	rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+	if (error != 0)
+		return (error);
+
+	zfs_unlinked_drain_stop_wait(zfsvfs);
+	rrm_enter(&zfsvfs->z_teardown_lock, RW_WRITER, FTAG);
+	os = zfsvfs->z_os;
+	if (zfsvfs->z_unmounted || os == NULL) {
+		rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+		return (SET_ERROR(ENOENT));
+	}
+
+	(void) dnlc_purge_vfsp(zfsvfs->z_parent->z_vfs, 0);
+
+	/* zil_close() can call zfs_inactive(); see zfsvfs_teardown(). */
+	if (zfsvfs->z_log != NULL) {
+		zil_close(zfsvfs->z_log);
+		zfsvfs->z_log = NULL;
+	}
+
+	rw_enter(&zfsvfs->z_teardown_inactive_lock, RW_WRITER);
+	mutex_enter(&zfsvfs->z_znodes_lock);
+	for (zp = list_head(&zfsvfs->z_all_znodes); zp != NULL;
+	    zp = list_next(&zfsvfs->z_all_znodes, zp)) {
+		if (zp->z_sa_hdl != NULL)
+			zfs_znode_dmu_fini(zp);
+	}
+	mutex_exit(&zfsvfs->z_znodes_lock);
+
+	zfs_unregister_callbacks(zfsvfs);
+	dmu_objset_evict_dbufs(os);
+	mutex_enter(&os->os_user_ptr_lock);
+	dmu_objset_set_user(os, NULL);
+	mutex_exit(&os->os_user_ptr_lock);
+	zfsvfs->z_os = NULL;
+
+	rw_exit(&zfsvfs->z_teardown_inactive_lock);
+	rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+
+	zfs_mounts_remove(zfsvfs, B_FALSE);
+	dmu_objset_disown(os, B_TRUE, zfsvfs);
+	return (0);
+}
+
+/*
+ * Detach the file systems of the named failed pool from it (see
+ * zfsvfs_detach()), so that they don't keep it from being exported.  Each
+ * file system releases its dataset but stays mounted, and its vnode
+ * operations fail with EIO, until it is unmounted.  The export can't rely on
+ * their having been unmounted: unmounting a file system closes its log,
+ * which waits for log writes that may never finish, and the unmounts race
+ * with the mounts and receives that the failing pool wakes up.  "zpool
+ * export" unmounts them once the pool is gone (zpool_unmount_detached()).
+ * Mounts in progress are waited for: they fail (see zfs_domount()).  A file
+ * system whose log writes are still in flight at the deadline is left
+ * alone, and keeps the pool busy.  Waits
+ * for up to TXG_SIZE * zfs_txg_timeout seconds in all, as
+ * spa_export_failed_wait() does.  Returns the number of file systems
+ * detached.
+ */
+int
+zfs_fail_mounts(const char *pool)
+{
+	extern int zfs_txg_timeout;
+	clock_t deadline = ddi_get_lbolt() + TXG_SIZE * zfs_txg_timeout * hz;
+	int detached = 0;
+
+	/* Only compared with z_spa: the pool may go away meanwhile. */
+	spa_t *spa = spa_failed_by_name(pool);
+	if (spa == NULL)
+		return (0);
+
+	mutex_enter(&zfs_mounts_lock);
+	uint64_t gen = ++zfs_mounts_gen;
+	for (;;) {
+		zfsvfs_t *zfsvfs;
+		boolean_t mounting = B_FALSE;
+
+		/* Try each file system once. */
+		for (zfsvfs = list_head(&zfs_mounts); zfsvfs != NULL;
+		    zfsvfs = list_next(&zfs_mounts, zfsvfs)) {
+			if (zfsvfs->z_spa != spa || zfsvfs->z_failing ||
+			    zfsvfs->z_fail_gen == gen)
+				continue;
+			if (!zfsvfs->z_mounting)
+				break;
+			mounting = B_TRUE;
+		}
+		if (zfsvfs == NULL) {
+			if (!mounting || cv_timedwait(&zfs_mounts_cv,
+			    &zfs_mounts_lock, deadline) == -1)
+				break;
+			continue;
+		}
+
+		/* z_failing keeps the file system from being unmounted. */
+		zfsvfs->z_fail_gen = gen;
+		zfsvfs->z_failing = B_TRUE;
+		mutex_exit(&zfs_mounts_lock);
+
+		int error = zfsvfs_detach(zfsvfs, deadline);
+		if (error == 0) {
+			detached++;
+		} else if (error == EBUSY) {
+			zfs_dbgmsg("pool '%s' failed: file system %p still "
+			    "has log writes in flight", pool, zfsvfs);
+		}
+
+		mutex_enter(&zfs_mounts_lock);
+		zfsvfs->z_failing = B_FALSE;
+		cv_broadcast(&zfs_mounts_cv);
+	}
+	mutex_exit(&zfs_mounts_lock);
+
+	return (detached);
 }
 
 static void
@@ -2647,12 +2896,21 @@ zfs_init(void)
 	 */
 	zfs_znode_init();
 
+	list_create(&zfs_mounts, sizeof (zfsvfs_t),
+	    offsetof(zfsvfs_t, z_mounts_node));
+	mutex_init(&zfs_mounts_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&zfs_mounts_cv, NULL, CV_DEFAULT, NULL);
+
 	dmu_objset_register_type(DMU_OST_ZFS, zfs_space_delta_cb);
 }
 
 void
 zfs_fini(void)
 {
+	cv_destroy(&zfs_mounts_cv);
+	mutex_destroy(&zfs_mounts_lock);
+	list_destroy(&zfs_mounts);
+
 	zfsctl_fini();
 	zfs_znode_fini();
 }

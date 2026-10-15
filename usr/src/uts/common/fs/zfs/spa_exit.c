@@ -97,10 +97,15 @@
  * since spa_lookup(), and every command that looks a pool up, waits for that.
  * Open volumes would keep the pool busy, so zfs_ioc_pool_export() fails them
  * first (zvol_fail_minors()): their I/O fails with EIO, their opens with
- * ENXIO, and their minors go away at the last close.  The intent logs are
- * closed without committing anything (zil_failed_close()).  spa_unload()
- * waits for the arming threads (spa_exit_unload_wait()), and spa_activate()
- * starts the next import of the pool in SPA_EXIT_NONE.
+ * ENXIO, and their minors go away at the last close.  So would mounted file
+ * systems, so it detaches them (zfs_fail_mounts()): they release their
+ * datasets and stay mounted, and their operations fail with EIO.  "zpool
+ * export" unmounts them once the pool is gone.  Unmounting them first can't
+ * be relied on: it races with the mounts and receives that the failure woke
+ * up, and closing their logs waits for writes that may never finish.  The
+ * intent logs are closed without committing anything (zil_failed_close()).
+ * spa_unload() waits for the arming threads (spa_exit_unload_wait()), and
+ * spa_activate() starts the next import of the pool in SPA_EXIT_NONE.
  */
 
 #include <sys/zfs_context.h>
@@ -290,17 +295,21 @@ spa_exit_arm_by_name(const char *name)
 
 /*
  * Has the named pool failed (see spa_failed())?  Like
- * spa_exit_arm_by_name(), this doesn't take spa_namespace_lock.
+ * spa_exit_arm_by_name(), this doesn't take spa_namespace_lock.  Returns the
+ * pool if it has, or NULL.  The pool isn't held, so it may be exported and
+ * freed at any time: the result is only good for comparing with pools that
+ * are known to be held, as zfs_fail_mounts() does.
  */
-boolean_t
+spa_t *
 spa_failed_by_name(const char *name)
 {
 	mutex_enter(&spa_namespace_avl_lock);
 	spa_t *spa = spa_exit_find(name);
-	boolean_t failed = (spa != NULL && spa_failed(spa));
+	if (spa != NULL && !spa_failed(spa))
+		spa = NULL;
 	mutex_exit(&spa_namespace_avl_lock);
 
-	return (failed);
+	return (spa);
 }
 
 /*

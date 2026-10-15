@@ -1720,6 +1720,23 @@ zpool_export_one(zpool_handle_t *zhp, void *data)
 		return (1);
 	}
 
+	/*
+	 * A failed pool's file systems were detached from it rather than
+	 * unmounted (see zpool_disable_datasets()), and are still mounted.
+	 * Now that the pool is gone, unmount them.  Any other pool's were
+	 * unmounted already, so there is nothing to do.
+	 */
+	if (cb->tpool != NULL)
+		(void) pthread_mutex_lock(&cb->mnttab_lock);
+	int left = zpool_unmount_detached(g_zfs, zpool_get_name(zhp));
+	if (cb->tpool != NULL)
+		(void) pthread_mutex_unlock(&cb->mnttab_lock);
+	if (left != 0) {
+		(void) fprintf(stderr, gettext("warning: %d file system(s) "
+		    "of '%s' are still mounted, and fail with EIO until they "
+		    "are unmounted\n"), left, zpool_get_name(zhp));
+	}
+
 	return (0);
 }
 

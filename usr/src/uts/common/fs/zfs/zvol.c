@@ -1321,7 +1321,7 @@ zvol_fail_minors(const char *name)
 	size_t len = strlen(name);
 	int failed = 0;
 
-	if (!spa_failed_by_name(name))
+	if (spa_failed_by_name(name) == NULL)
 		return (0);
 
 	mutex_enter(&zfsdev_state_lock);
