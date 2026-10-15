@@ -23,6 +23,7 @@
  * Copyright (c) 2011, 2016 by Delphix. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright (c) 2017 Datto Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/bpobj.h>
@@ -475,7 +476,11 @@ bpobj_enqueue_subobj(bpobj_t *bpo, uint64_t subobj, dmu_tx_t *tx)
 	bpobj_close(&subbpo);
 }
 
-void
+/*
+ * Returns an error, and leaves the bpobj alone, if the block that the
+ * blkptr goes in can't be read.
+ */
+int
 bpobj_enqueue(bpobj_t *bpo, const blkptr_t *bp, dmu_tx_t *tx)
 {
 	blkptr_t stored_bp = *bp;
@@ -519,10 +524,17 @@ bpobj_enqueue(bpobj_t *bpo, const blkptr_t *bp, dmu_tx_t *tx)
 	    offset < bpo->bpo_cached_dbuf->db_offset ||
 	    offset >= bpo->bpo_cached_dbuf->db_offset +
 	    bpo->bpo_cached_dbuf->db_size) {
+		int err;
+
 		if (bpo->bpo_cached_dbuf)
 			dmu_buf_rele(bpo->bpo_cached_dbuf, bpo);
-		VERIFY3U(0, ==, dmu_buf_hold(bpo->bpo_os, bpo->bpo_object,
-		    offset, bpo, &bpo->bpo_cached_dbuf, 0));
+		bpo->bpo_cached_dbuf = NULL;
+		err = dmu_buf_hold(bpo->bpo_os, bpo->bpo_object,
+		    offset, bpo, &bpo->bpo_cached_dbuf, 0);
+		if (err != 0) {
+			mutex_exit(&bpo->bpo_lock);
+			return (err);
+		}
 	}
 
 	dmu_buf_will_dirty(bpo->bpo_cached_dbuf, tx);
@@ -538,6 +550,7 @@ bpobj_enqueue(bpobj_t *bpo, const blkptr_t *bp, dmu_tx_t *tx)
 		bpo->bpo_phys->bpo_uncomp += BP_GET_UCSIZE(bp);
 	}
 	mutex_exit(&bpo->bpo_lock);
+	return (0);
 }
 
 struct space_range_arg {

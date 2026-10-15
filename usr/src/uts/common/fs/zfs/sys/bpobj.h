@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_BPOBJ_H
@@ -80,7 +81,7 @@ int bpobj_iterate(bpobj_t *bpo, bpobj_itor_t func, void *arg, dmu_tx_t *tx);
 int bpobj_iterate_nofree(bpobj_t *bpo, bpobj_itor_t func, void *, dmu_tx_t *);
 
 void bpobj_enqueue_subobj(bpobj_t *bpo, uint64_t subobj, dmu_tx_t *tx);
-void bpobj_enqueue(bpobj_t *bpo, const blkptr_t *bp, dmu_tx_t *tx);
+int bpobj_enqueue(bpobj_t *bpo, const blkptr_t *bp, dmu_tx_t *tx);
 
 int bpobj_space(bpobj_t *bpo,
     uint64_t *usedp, uint64_t *compp, uint64_t *uncompp);

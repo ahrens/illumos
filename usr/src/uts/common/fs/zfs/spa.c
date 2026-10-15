@@ -8174,7 +8174,7 @@ static int
 bpobj_enqueue_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 {
 	bpobj_t *bpo = arg;
-	bpobj_enqueue(bpo, bp, tx);
+	VERIFY0(bpobj_enqueue(bpo, bp, tx));
 	return (0);
 }
 
