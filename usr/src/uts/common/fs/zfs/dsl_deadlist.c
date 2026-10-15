@@ -102,19 +102,35 @@ dsl_deadlist_open(dsl_deadlist_t *dl, objset_t *os, uint64_t object)
 	dl->dl_object = object;
 	err = dmu_bonus_hold(os, object, dl, &dl->dl_dbuf);
 	if (err != 0)
-		return (err);
+		goto out;
 	dmu_object_info_from_db(dl->dl_dbuf, &doi);
 	if (doi.doi_type == DMU_OT_BPOBJ) {
 		dmu_buf_rele(dl->dl_dbuf, dl);
 		dl->dl_dbuf = NULL;
 		dl->dl_oldfmt = B_TRUE;
-		return (bpobj_open(&dl->dl_bpobj, os, object));
+		err = bpobj_open(&dl->dl_bpobj, os, object);
+		if (err != 0) {
+			dl->dl_oldfmt = B_FALSE;
+			goto out;
+		}
+		return (0);
 	}
 
 	dl->dl_oldfmt = B_FALSE;
 	dl->dl_phys = dl->dl_dbuf->db_data;
 	dl->dl_havetree = B_FALSE;
 	return (0);
+
+out:
+	/*
+	 * Leave the deadlist closed, so that dsl_deadlist_is_open() says so
+	 * and the caller's error path doesn't close it.
+	 */
+	mutex_destroy(&dl->dl_lock);
+	dl->dl_dbuf = NULL;
+	dl->dl_os = NULL;
+	dl->dl_object = 0;
+	return (err);
 }
 
 boolean_t

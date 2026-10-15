@@ -87,6 +87,8 @@ static void dsl_dataset_set_remap_deadlist_object(dsl_dataset_t *ds,
     uint64_t obj, dmu_tx_t *tx);
 static void dsl_dataset_unset_remap_deadlist_object(dsl_dataset_t *ds,
     dmu_tx_t *tx);
+static int dsl_dataset_lookup_remap_deadlist_object(dsl_dataset_t *ds,
+    uint64_t *objp);
 
 static void unload_zfeature(dsl_dataset_t *ds, spa_feature_t f);
 
@@ -611,7 +613,7 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 
 		if (err == 0 && ds->ds_dir->dd_crypto_obj != 0 &&
 		    ds->ds_is_snapshot &&
-		    zap_contains(mos, dsobj, DS_FIELD_IVSET_GUID) != 0) {
+		    zap_contains(mos, dsobj, DS_FIELD_IVSET_GUID) == ENOENT) {
 			dp->dp_spa->spa_errata =
 			    ZPOOL_ERRATA_ZOL_8308_ENCRYPTION;
 		}
@@ -621,9 +623,15 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, void *tag,
 			    mos, dsl_dataset_phys(ds)->ds_deadlist_obj);
 		}
 		if (err == 0) {
-			uint64_t remap_deadlist_obj =
-			    dsl_dataset_get_remap_deadlist_object(ds);
-			if (remap_deadlist_obj != 0) {
+			uint64_t remap_deadlist_obj;
+
+			/*
+			 * The lookup fails if the dataset's ZAP can't be
+			 * read, as on a failed pool when it isn't cached.
+			 */
+			err = dsl_dataset_lookup_remap_deadlist_object(ds,
+			    &remap_deadlist_obj);
+			if (err == 0 && remap_deadlist_obj != 0) {
 				err = dsl_deadlist_open(&ds->ds_remap_deadlist,
 				    mos, remap_deadlist_obj);
 			}
@@ -4366,25 +4374,36 @@ dsl_dataset_has_resume_receive_state(dsl_dataset_t *ds)
 	    ds->ds_object, DS_FIELD_RESUME_TOGUID) == 0);
 }
 
-uint64_t
-dsl_dataset_get_remap_deadlist_object(dsl_dataset_t *ds)
+/*
+ * Look up the dataset's remap deadlist object, or 0 if it has none.  This
+ * fails only if the dataset's ZAP can't be read.
+ */
+static int
+dsl_dataset_lookup_remap_deadlist_object(dsl_dataset_t *ds, uint64_t *objp)
 {
-	uint64_t remap_deadlist_obj;
 	int err;
 
+	*objp = 0;
 	if (!dsl_dataset_is_zapified(ds))
 		return (0);
 
 	err = zap_lookup(ds->ds_dir->dd_pool->dp_meta_objset, ds->ds_object,
-	    DS_FIELD_REMAP_DEADLIST, sizeof (remap_deadlist_obj), 1,
-	    &remap_deadlist_obj);
-
-	if (err != 0) {
-		VERIFY3S(err, ==, ENOENT);
+	    DS_FIELD_REMAP_DEADLIST, sizeof (*objp), 1, objp);
+	if (err == ENOENT) {
+		*objp = 0;
 		return (0);
 	}
+	ASSERT(err != 0 || *objp != 0);
+	return (err);
+}
 
-	ASSERT(remap_deadlist_obj != 0);
+uint64_t
+dsl_dataset_get_remap_deadlist_object(dsl_dataset_t *ds)
+{
+	uint64_t remap_deadlist_obj;
+
+	VERIFY0(dsl_dataset_lookup_remap_deadlist_object(ds,
+	    &remap_deadlist_obj));
 	return (remap_deadlist_obj);
 }
 
