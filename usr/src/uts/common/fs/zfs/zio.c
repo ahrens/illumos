@@ -3519,6 +3519,54 @@ zio_dva_unallocate(zio_t *zio, zio_gang_node_t *gn, blkptr_t *bp)
 }
 
 /*
+ * Free the blocks of a write that failed in the txg it was allocated in,
+ * rather than now.  The write's block pointer may already be referenced
+ * from the intent log: the ZIL writes a log block once the dmu_sync()
+ * writes of its WR_INDIRECT records are ready, not once they are done, so
+ * the log block can reach the disk while the data write fails.  If the
+ * space were reused at once by another block born in the same txg (e.g. a
+ * log block of another dataset), and the pool then crashed or failed
+ * before that txg synced, the import would claim both blocks: two block
+ * pointers with the same DVA and birth, which the ARC can't tell apart.
+ * Freed in its txg, the space is reused only once the txg has synced, and
+ * then the record is older than the log claims.
+ *
+ * Only writes that may fail come here (those that may not are re-executed),
+ * other than dedup child writes, whose parent shares their block pointer.
+ * They are dmu_sync()'s, which finish before their txg's frees are
+ * processed: until dmu_sync_done() runs, syncing the txg waits for the
+ * dbuf (in dbuf_sync_leaf()), or the late arrival's tx holds it open.
+ * A gang block's header and children are freed as the DVAs they are,
+ * without reading the header, which may never have been written.
+ */
+static void
+zio_dva_free_failed(zio_t *zio, zio_gang_node_t *gn, blkptr_t *bp)
+{
+	spa_t *spa = zio->io_spa;
+
+	ASSERT(bp->blk_birth == zio->io_txg || BP_IS_HOLE(bp));
+	ASSERT(zio->io_bp_override == NULL);
+	ASSERT3U(zio->io_txg, >=, spa_syncing_txg(spa));
+
+	if (!BP_IS_HOLE(bp) && !spa_failed(spa)) {
+		blkptr_t fbp = *bp;
+
+		for (int d = 0; d < BP_GET_NDVAS(&fbp); d++)
+			DVA_SET_GANG(&fbp.blk_dva[d], 0);
+		BP_SET_DEDUP(&fbp, 0);
+		bplist_append(&spa->spa_free_bplist[zio->io_txg & TXG_MASK],
+		    &fbp);
+	}
+
+	if (gn != NULL) {
+		for (int g = 0; g < SPA_GBH_NBLKPTRS; g++) {
+			zio_dva_free_failed(zio, gn->gn_child[g],
+			    &gn->gn_gbh->zg_blkptr[g]);
+		}
+	}
+}
+
+/*
  * Try to allocate an intent log block.  Return 0 on success, errno on failure.
  */
 int
@@ -4699,8 +4747,12 @@ zio_done(zio_t *zio)
 
 	if ((zio->io_error || zio->io_reexecute) &&
 	    IO_IS_ALLOCATING(zio) && zio->io_gang_leader == zio &&
-	    !(zio->io_flags & (ZIO_FLAG_IO_REWRITE | ZIO_FLAG_NOPWRITE)))
-		zio_dva_unallocate(zio, zio->io_gang_tree, bp);
+	    !(zio->io_flags & (ZIO_FLAG_IO_REWRITE | ZIO_FLAG_NOPWRITE))) {
+		if (zio->io_reexecute || (zio->io_flags & ZIO_FLAG_DDT_CHILD))
+			zio_dva_unallocate(zio, zio->io_gang_tree, bp);
+		else
+			zio_dva_free_failed(zio, zio->io_gang_tree, bp);
+	}
 
 	zio_gang_tree_free(&zio->io_gang_tree);
 
