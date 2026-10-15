@@ -2545,6 +2545,7 @@ file path=opt/zfs-tests/tests/functional/failmode/forced_export_busy_fs_death \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_cold_cache \
     mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_detach mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_ereports \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_fence mode=0555
@@ -2552,6 +2553,8 @@ file path=opt/zfs-tests/tests/functional/failmode/forced_export_healthy \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_idle mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_idle_lofi \
+    mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_mount_races \
     mode=0555
 file \
     path=opt/zfs-tests/tests/functional/failmode/forced_export_namespace_sleeper \
