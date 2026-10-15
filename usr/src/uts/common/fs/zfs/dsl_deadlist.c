@@ -23,6 +23,7 @@
  * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dsl_dataset.h>
@@ -62,31 +63,74 @@ dsl_deadlist_compare(const void *arg1, const void *arg2)
 }
 
 static void
-dsl_deadlist_load_tree(dsl_deadlist_t *dl)
+dsl_deadlist_free_tree(dsl_deadlist_t *dl)
+{
+	void *cookie = NULL;
+	dsl_deadlist_entry_t *dle;
+
+	while ((dle = avl_destroy_nodes(&dl->dl_tree, &cookie)) != NULL) {
+		bpobj_close(&dle->dle_bpobj);
+		kmem_free(dle, sizeof (*dle));
+	}
+	avl_destroy(&dl->dl_tree);
+}
+
+/*
+ * If the deadlist's ZAP, or the bpobj of one of its entries, can't be read
+ * (its disks are failing), no tree is loaded, and the next call tries again:
+ * a tree missing some of its entries would put blocks in the wrong ones.
+ */
+static int
+dsl_deadlist_load_tree_impl(dsl_deadlist_t *dl)
 {
 	zap_cursor_t zc;
 	zap_attribute_t za;
+	int error;
 
 	ASSERT(MUTEX_HELD(&dl->dl_lock));
 
 	ASSERT(!dl->dl_oldfmt);
 	if (dl->dl_havetree)
-		return;
+		return (0);
 
 	avl_create(&dl->dl_tree, dsl_deadlist_compare,
 	    sizeof (dsl_deadlist_entry_t),
 	    offsetof(dsl_deadlist_entry_t, dle_node));
 	for (zap_cursor_init(&zc, dl->dl_os, dl->dl_object);
-	    zap_cursor_retrieve(&zc, &za) == 0;
+	    (error = zap_cursor_retrieve(&zc, &za)) == 0;
 	    zap_cursor_advance(&zc)) {
 		dsl_deadlist_entry_t *dle = kmem_alloc(sizeof (*dle), KM_SLEEP);
 		dle->dle_mintxg = zfs_strtonum(za.za_name, NULL);
-		VERIFY3U(0, ==, bpobj_open(&dle->dle_bpobj, dl->dl_os,
-		    za.za_first_integer));
+		error = bpobj_open(&dle->dle_bpobj, dl->dl_os,
+		    za.za_first_integer);
+		if (error != 0) {
+			/*
+			 * ENOENT from the cursor means the end of the ZAP;
+			 * from here (a bpobj whose dnode reads as zeros, as
+			 * a poisoned block on a failed pool does) it must
+			 * not, or we would keep a partial tree.
+			 */
+			if (error == ENOENT)
+				error = SET_ERROR(EIO);
+			kmem_free(dle, sizeof (*dle));
+			break;
+		}
 		avl_add(&dl->dl_tree, dle);
 	}
 	zap_cursor_fini(&zc);
+	if (error != ENOENT) {
+		ASSERT(error != 0);
+		dsl_deadlist_free_tree(dl);
+		return (error);
+	}
 	dl->dl_havetree = B_TRUE;
+	return (0);
+}
+
+static void
+dsl_deadlist_load_tree(dsl_deadlist_t *dl)
+{
+	VERIFY0(dsl_deadlist_load_tree_impl(dl));
 }
 
 int
@@ -142,9 +186,6 @@ dsl_deadlist_is_open(dsl_deadlist_t *dl)
 void
 dsl_deadlist_close(dsl_deadlist_t *dl)
 {
-	void *cookie = NULL;
-	dsl_deadlist_entry_t *dle;
-
 	ASSERT(dsl_deadlist_is_open(dl));
 
 	if (dl->dl_oldfmt) {
@@ -155,14 +196,8 @@ dsl_deadlist_close(dsl_deadlist_t *dl)
 		return;
 	}
 
-	if (dl->dl_havetree) {
-		while ((dle = avl_destroy_nodes(&dl->dl_tree, &cookie))
-		    != NULL) {
-			bpobj_close(&dle->dle_bpobj);
-			kmem_free(dle, sizeof (*dle));
-		}
-		avl_destroy(&dl->dl_tree);
-	}
+	if (dl->dl_havetree)
+		dsl_deadlist_free_tree(dl);
 	dmu_buf_rele(dl->dl_dbuf, dl);
 	mutex_destroy(&dl->dl_lock);
 	dl->dl_dbuf = NULL;
@@ -206,7 +241,11 @@ dsl_deadlist_free(objset_t *os, uint64_t dlobj, dmu_tx_t *tx)
 	VERIFY3U(0, ==, dmu_object_free(os, dlobj, tx));
 }
 
-static void
+/*
+ * Returns an error, and leaves the entry alone, if the entry's ZAP or bpobj
+ * can't be read.
+ */
+static int
 dle_enqueue(dsl_deadlist_t *dl, dsl_deadlist_entry_t *dle,
     const blkptr_t *bp, dmu_tx_t *tx)
 {
@@ -214,13 +253,17 @@ dle_enqueue(dsl_deadlist_t *dl, dsl_deadlist_entry_t *dle,
 	if (dle->dle_bpobj.bpo_object ==
 	    dmu_objset_pool(dl->dl_os)->dp_empty_bpobj) {
 		uint64_t obj = bpobj_alloc(dl->dl_os, SPA_OLD_MAXBLOCKSIZE, tx);
+		int err = zap_update_int_key(dl->dl_os, dl->dl_object,
+		    dle->dle_mintxg, obj, tx);
+		if (err != 0) {
+			VERIFY0(dmu_object_free(dl->dl_os, obj, tx));
+			return (err);
+		}
 		bpobj_close(&dle->dle_bpobj);
 		bpobj_decr_empty(dl->dl_os, tx);
 		VERIFY3U(0, ==, bpobj_open(&dle->dle_bpobj, dl->dl_os, obj));
-		VERIFY3U(0, ==, zap_update_int_key(dl->dl_os, dl->dl_object,
-		    dle->dle_mintxg, obj, tx));
 	}
-	bpobj_enqueue(&dle->dle_bpobj, bp, tx);
+	return (bpobj_enqueue(&dle->dle_bpobj, bp, tx));
 }
 
 static void
@@ -258,19 +301,24 @@ dsl_deadlist_insert(dsl_deadlist_t *dl, const blkptr_t *bp, dmu_tx_t *tx)
 	if (spa_failed(dmu_objset_spa(dl->dl_os)))
 		return;
 
+	/*
+	 * If the deadlist can't be read (its disks are failing), the block
+	 * isn't added to it, and so won't be freed when the snapshot that
+	 * still refers to it is destroyed: we leak it, rather than put it in
+	 * the wrong entry.  The same goes for a block with no entry to go in:
+	 * only a deadlist loaded as the pool failed can be missing one, from a
+	 * ZAP that was poisoned and so read as empty (see dbuf_poison()).
+	 */
 	if (dl->dl_oldfmt) {
-		bpobj_enqueue(&dl->dl_bpobj, bp, tx);
+		(void) bpobj_enqueue(&dl->dl_bpobj, bp, tx);
 		return;
 	}
 
 	mutex_enter(&dl->dl_lock);
-	dsl_deadlist_load_tree(dl);
-
-	dmu_buf_will_dirty(dl->dl_dbuf, tx);
-	dl->dl_phys->dl_used +=
-	    bp_get_dsize_sync(dmu_objset_spa(dl->dl_os), bp);
-	dl->dl_phys->dl_comp += BP_GET_PSIZE(bp);
-	dl->dl_phys->dl_uncomp += BP_GET_UCSIZE(bp);
+	if (dsl_deadlist_load_tree_impl(dl) != 0) {
+		mutex_exit(&dl->dl_lock);
+		return;
+	}
 
 	dle_tofind.dle_mintxg = bp->blk_birth;
 	dle = avl_find(&dl->dl_tree, &dle_tofind, &where);
@@ -278,7 +326,16 @@ dsl_deadlist_insert(dsl_deadlist_t *dl, const blkptr_t *bp, dmu_tx_t *tx)
 		dle = avl_nearest(&dl->dl_tree, where, AVL_BEFORE);
 	else
 		dle = AVL_PREV(&dl->dl_tree, dle);
-	dle_enqueue(dl, dle, bp, tx);
+	if (dle == NULL || dle_enqueue(dl, dle, bp, tx) != 0) {
+		mutex_exit(&dl->dl_lock);
+		return;
+	}
+
+	dmu_buf_will_dirty(dl->dl_dbuf, tx);
+	dl->dl_phys->dl_used +=
+	    bp_get_dsize_sync(dmu_objset_spa(dl->dl_os), bp);
+	dl->dl_phys->dl_comp += BP_GET_PSIZE(bp);
+	dl->dl_phys->dl_uncomp += BP_GET_UCSIZE(bp);
 	mutex_exit(&dl->dl_lock);
 }
 
@@ -439,7 +496,11 @@ dsl_deadlist_space_range(dsl_deadlist_t *dl, uint64_t mintxg, uint64_t maxtxg,
 	*usedp = *compp = *uncompp = 0;
 
 	mutex_enter(&dl->dl_lock);
-	dsl_deadlist_load_tree(dl);
+	/* A deadlist that can't be read counts as empty. */
+	if (dsl_deadlist_load_tree_impl(dl) != 0) {
+		mutex_exit(&dl->dl_lock);
+		return;
+	}
 	dle_tofind.dle_mintxg = mintxg;
 	dle = avl_find(&dl->dl_tree, &dle_tofind, &where);
 	/*
