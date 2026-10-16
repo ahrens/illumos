@@ -121,6 +121,7 @@
  *
  *		spa_namespace_lock	->	spa_namespace_avl_lock
  *		spa_namespace_avl_lock	->	spa_suspend_lock
+ *		spa_namespace_lock	->	spa_streams_lock
  *
  *	spa_namespace_avl_lock is a leaf lock, held only while adding a spa_t
  *	to or removing it from the namespace AVL tree, and by
@@ -677,6 +678,7 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	mutex_init(&spa->spa_flushed_ms_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa->spa_imp_kstat_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&spa->spa_activities_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&spa->spa_streams_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	cv_init(&spa->spa_async_cv, NULL, CV_DEFAULT, NULL);
 	cv_init(&spa->spa_evicting_os_cv, NULL, CV_DEFAULT, NULL);
@@ -800,6 +802,8 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 
 	list_create(&spa->spa_leaf_list, sizeof (vdev_t),
 	    offsetof(vdev_t, vdev_leaf_node));
+	list_create(&spa->spa_streams, sizeof (spa_stream_t),
+	    offsetof(spa_stream_t, ss_node));
 
 	return (spa);
 }
@@ -851,6 +855,7 @@ spa_remove(spa_t *spa)
 	list_destroy(&spa->spa_log_summary);
 	list_destroy(&spa->spa_config_list);
 	list_destroy(&spa->spa_leaf_list);
+	list_destroy(&spa->spa_streams);
 
 	nvlist_free(spa->spa_label_features);
 	nvlist_free(spa->spa_load_info);
@@ -897,6 +902,7 @@ spa_remove(spa_t *spa)
 	mutex_destroy(&spa->spa_iokstat_lock);
 	mutex_destroy(&spa->spa_imp_kstat_lock);
 	mutex_destroy(&spa->spa_activities_lock);
+	mutex_destroy(&spa->spa_streams_lock);
 
 	kmem_free(spa, sizeof (spa_t));
 }

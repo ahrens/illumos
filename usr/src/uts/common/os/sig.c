@@ -23,6 +23,7 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  * Copyright (c) 2014, Joyent, Inc.  All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
@@ -211,6 +212,37 @@ eat_signal(kthread_t *t, int sig)
 			rval = 1;
 		}
 	}
+
+	return (rval);
+}
+
+/*
+ * Abort the specified thread's interruptible sleep, if it is in one, without
+ * posting a signal: the sleep (cv_wait_sig(), sema_p_sig(), and the like)
+ * returns as if it had been interrupted, so the system call the thread is in
+ * usually fails with EINTR.  This is what /proc's PRSABORT does for a stopped
+ * lwp.  It doesn't depend on the process's signal dispositions or mask, and
+ * doesn't wake a thread that is stopped, running, or asleep uninterruptibly.
+ * Nor does it carry over to the thread's next sleep: the sleep primitives
+ * clear lwp_sysabort as they start.  The caller must keep the thread from
+ * exiting.  Returns 1 if the thread was woken.
+ */
+int
+thread_abort_sleep(kthread_t *t)
+{
+	klwp_t *lwp = ttolwp(t);
+	int rval = 0;
+
+	if (lwp == NULL)
+		return (0);
+
+	thread_lock(t);
+	if (ISWAKEABLE(t)) {
+		lwp->lwp_sysabort = 1;
+		setrun_locked(t);
+		rval = 1;
+	}
+	thread_unlock(t);
 
 	return (rval);
 }

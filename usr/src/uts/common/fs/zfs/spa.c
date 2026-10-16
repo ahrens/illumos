@@ -6391,7 +6391,8 @@ fail:
  * Wait for the references on a failed pool to go away, for up to
  * TXG_SIZE * zfs_txg_timeout seconds.  Its file systems have been unmounted
  * or detached (zfs_fail_mounts()), and threads that were waiting on it have
- * been woken up and are failing out.
+ * been woken up and are failing out.  Sends, receives and diffs are
+ * cancelled, even if they are blocked on their file descriptors.
  * Fault injection handlers, which also keep a pool from being exported, are
  * waited for too.  Called and returns with spa_namespace_lock held, which is
  * dropped while we wait.  Returns EBUSY if references remain, or EINTR.
@@ -6416,6 +6417,11 @@ spa_export_failed_wait(spa_t *spa)
 			    spa->spa_inject_ref);
 			return (SET_ERROR(EBUSY));
 		}
+		/*
+		 * A send, receive or diff may be blocked on its pipe rather
+		 * than on the pool; cancel it.
+		 */
+		spa_streams_cancel(spa);
 		/* Holders don't signal us when they let go, so poll. */
 		if (cv_timedwait_sig(&spa_namespace_cv, &spa_namespace_lock,
 		    MIN(deadline, now + hz)) == 0)

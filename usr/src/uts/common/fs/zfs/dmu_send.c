@@ -26,6 +26,7 @@
  * Copyright 2014 HybridCluster. All rights reserved.
  * Copyright 2016 RackTop Systems.
  * Copyright (c) 2014 Integros [integros.com]
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu.h>
@@ -116,6 +117,9 @@ dump_bytes(dmu_sendarg_t *dsp, void *buf, int len)
 	dsp->dsa_err = vn_rdwr(UIO_WRITE, dsp->dsa_vp,
 	    (caddr_t)buf, len,
 	    0, UIO_SYSSPACE, FAPPEND, RLIM64_INFINITY, CRED(), &resid);
+	/* An aborted write returns EINTR, or perhaps a short count. */
+	if (spa_stream_cancelled(&dsp->dsa_stream))
+		dsp->dsa_err = SET_ERROR(EIO);
 
 	mutex_enter(&ds->ds_sendstream_lock);
 	*dsp->dsa_off += len;
@@ -1092,6 +1096,15 @@ dmu_send_impl(void *tag, dsl_pool_t *dp, dsl_dataset_t *to_ds,
 
 	void *payload = NULL;
 	size_t payload_len = 0;
+
+	/*
+	 * Writing the stream can block for as long as its reader stops
+	 * reading; let the export of a failed pool cancel it.
+	 */
+	err = spa_stream_register(os->os_spa, &dsp->dsa_stream);
+	if (err != 0)
+		goto out;
+
 	/* handle features that require a DRR_BEGIN payload */
 	if (featureflags &
 	    (DMU_BACKUP_FEATURE_RESUMING | DMU_BACKUP_FEATURE_RAW)) {
@@ -1164,6 +1177,8 @@ dmu_send_impl(void *tag, dsl_pool_t *dp, dsl_dataset_t *to_ds,
 		to_data = get_next_record(&to_arg.q, to_data);
 		if (issig(JUSTLOOKING) && issig(FORREAL))
 			err = EINTR;
+		if (spa_stream_cancelled(&dsp->dsa_stream))
+			err = SET_ERROR(EIO);
 	}
 
 	if (err != 0) {
@@ -1200,6 +1215,10 @@ dmu_send_impl(void *tag, dsl_pool_t *dp, dsl_dataset_t *to_ds,
 	if (dump_record(dsp, NULL, 0) != 0)
 		err = dsp->dsa_err;
 out:
+	spa_stream_unregister(&dsp->dsa_stream);
+	if (err != 0 && spa_stream_cancelled(&dsp->dsa_stream))
+		err = SET_ERROR(EIO);
+
 	mutex_enter(&to_ds->ds_sendstream_lock);
 	list_remove(&to_ds->ds_sendstreams, dsp);
 	mutex_exit(&to_ds->ds_sendstream_lock);

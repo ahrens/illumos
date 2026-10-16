@@ -113,6 +113,21 @@
  * spa_unload() waits for the threads that fail the pool by name
  * (spa_exit_unload_wait()), and spa_activate() starts the next import of the
  * pool in SPA_EXIT_NONE.
+ *
+ * Streams
+ *
+ * A send, receive or diff holds its dataset while it writes or reads its
+ * file descriptor, usually a pipe, and the other end can stop for good: a
+ * send whose reader is stuck, or a receive whose writer is.  Such a stream
+ * would keep a failed pool from being exported.  Each one registers on the
+ * pool's spa_streams (spa_stream_register()) while it holds its dataset, and
+ * on each pass of its wait the export cancels them (spa_streams_cancel()):
+ * it marks each one cancelled and aborts its thread's sleep
+ * (thread_abort_sleep()), as /proc does, rather than signalling it.  The
+ * pipe read or write returns EINTR, or a short count, and the stream fails
+ * with EIO at its next check of spa_stream_cancelled().  A stream that isn't
+ * blocked stops at its next record.  A stream that is stopped, or sleeps
+ * uninterruptibly, isn't woken, and the export returns EBUSY.
  */
 
 #include <sys/zfs_context.h>
@@ -123,6 +138,7 @@
 #include <sys/fm/fs/zfs.h>
 #ifdef _KERNEL
 #include <sys/callb.h>
+#include <sys/proc.h>
 #endif
 
 static kcondvar_t spa_exit_hold_cv;
@@ -378,6 +394,89 @@ spa_exit_poisoned_read(spa_t *spa, const struct zbookmark_phys *zb)
 	    spa_name(spa), (u_longlong_t)zb->zb_objset,
 	    (u_longlong_t)zb->zb_object, (longlong_t)zb->zb_level,
 	    (u_longlong_t)zb->zb_blkid);
+}
+
+/*
+ * Register a send, receive or diff on the pool, once it holds its dataset and
+ * before it reads or writes its file descriptor, so that the export of a
+ * failed pool can cancel it.  ss belongs to the calling thread, which reads
+ * or writes the stream.  Returns EIO if the pool has already failed; the
+ * stream must be unregistered (spa_stream_unregister()) in either case,
+ * before it releases its dataset.
+ */
+int
+spa_stream_register(spa_t *spa, spa_stream_t *ss)
+{
+	ss->ss_spa = spa;
+	ss->ss_thread = curthread;
+	ss->ss_cancelled = B_FALSE;
+
+	mutex_enter(&spa->spa_streams_lock);
+	list_insert_tail(&spa->spa_streams, ss);
+	mutex_exit(&spa->spa_streams_lock);
+
+	/*
+	 * A stream that registers after the pool failed may have missed a
+	 * pass of spa_streams_cancel().  It would be cancelled by the next
+	 * one, but it may as well not start.
+	 */
+	if (spa_failed(spa))
+		return (SET_ERROR(EIO));
+	return (0);
+}
+
+/*
+ * Unregister a stream, if it was registered.  Once this returns, the thread
+ * may exit: spa_streams_cancel() only touches the threads it finds on the
+ * list, with spa_streams_lock held.
+ */
+void
+spa_stream_unregister(spa_stream_t *ss)
+{
+	spa_t *spa = ss->ss_spa;
+
+	if (spa == NULL)
+		return;
+	mutex_enter(&spa->spa_streams_lock);
+	list_remove(&spa->spa_streams, ss);
+	mutex_exit(&spa->spa_streams_lock);
+	ss->ss_spa = NULL;
+}
+
+/*
+ * Has the export of the stream's failed pool cancelled it?  A stream checks
+ * this after each read or write of its file descriptor, and once per record,
+ * and fails with EIO if it has: an interrupted read or write may have
+ * returned a short count, or EINTR, and the stream failed because its pool
+ * did.
+ */
+boolean_t
+spa_stream_cancelled(spa_stream_t *ss)
+{
+	return (ss->ss_cancelled);
+}
+
+/*
+ * Cancel every stream on a failed pool, and wake the ones asleep in a read or
+ * write of their file descriptor.  An abort only wakes a thread that is
+ * asleep at the time, and the stream may be between sleeps, so
+ * spa_export_failed_wait() calls this on every pass until the streams are
+ * gone.
+ */
+void
+spa_streams_cancel(spa_t *spa)
+{
+	ASSERT(spa_failed(spa));
+
+	mutex_enter(&spa->spa_streams_lock);
+	for (spa_stream_t *ss = list_head(&spa->spa_streams); ss != NULL;
+	    ss = list_next(&spa->spa_streams, ss)) {
+		ss->ss_cancelled = B_TRUE;
+#ifdef _KERNEL
+		(void) thread_abort_sleep(ss->ss_thread);
+#endif
+	}
+	mutex_exit(&spa->spa_streams_lock);
 }
 
 #ifdef _KERNEL

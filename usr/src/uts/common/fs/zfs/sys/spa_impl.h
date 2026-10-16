@@ -371,6 +371,8 @@ struct spa {
 	uint64_t	spa_exit_offset;	/* next fake DVA offset */
 	uint_t		spa_exit_holds;		/* see spa_exit_hold() */
 	boolean_t	spa_exit_unloading;	/* no more spa_exit_hold()s */
+	kmutex_t	spa_streams_lock;	/* protects spa_streams */
+	list_t		spa_streams;		/* spa_stream_t's */
 	uint8_t		spa_claiming;		/* pool is doing zil_claim() */
 	boolean_t	spa_is_root;		/* pool is root */
 	int		spa_minref;		/* num refs when first opened */

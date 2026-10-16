@@ -26,6 +26,7 @@
  * Copyright 2014 HybridCluster. All rights reserved.
  * Copyright 2016 RackTop Systems.
  * Copyright (c) 2014 Integros [integros.com]
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu.h>
@@ -890,6 +891,7 @@ struct receive_arg {
 	uint64_t featureflags;
 	/* Sorted list of objects not to issue prefetches for. */
 	struct objlist ignore_objlist;
+	spa_stream_t stream;	/* see spa_stream_register() */
 };
 
 typedef struct guid_map_entry {
@@ -957,6 +959,12 @@ receive_read(struct receive_arg *ra, int len, void *buf)
 			 */
 			ra->err = SET_ERROR(ECKSUM);
 		}
+		/*
+		 * An aborted read may have returned a short count, EINTR, or
+		 * nothing, which would be reported as ECKSUM.
+		 */
+		if (spa_stream_cancelled(&ra->stream))
+			ra->err = SET_ERROR(EIO);
 		ra->voff += len - done - resid;
 		done = len - resid;
 		if (ra->err != 0)
@@ -2457,6 +2465,14 @@ dmu_recv_stream(dmu_recv_cookie_t *drc, vnode_t *vp, offset_t *voffp,
 		drc->drc_guid_to_ds_map = rwa.guid_to_ds_map;
 	}
 
+	/*
+	 * Reading the stream can block for as long as its writer stops
+	 * writing; let the export of a failed pool cancel it.
+	 */
+	err = spa_stream_register(dmu_objset_spa(ra.os), &ra.stream);
+	if (err != 0)
+		goto out;
+
 	uint32_t payloadlen = drc->drc_drr_begin->drr_payloadlen;
 	void *payload = NULL;
 	if (payloadlen != 0)
@@ -2547,6 +2563,10 @@ dmu_recv_stream(dmu_recv_cookie_t *drc, vnode_t *vp, offset_t *voffp,
 			err = SET_ERROR(EINTR);
 			break;
 		}
+		if (spa_stream_cancelled(&ra.stream)) {
+			err = SET_ERROR(EIO);
+			break;
+		}
 
 		ASSERT3P(ra.rrd, ==, NULL);
 		ra.rrd = ra.next_rrd;
@@ -2617,6 +2637,10 @@ dmu_recv_stream(dmu_recv_cookie_t *drc, vnode_t *vp, offset_t *voffp,
 		err = rwa.err;
 
 out:
+	spa_stream_unregister(&ra.stream);
+	if (err != 0 && spa_stream_cancelled(&ra.stream))
+		err = SET_ERROR(EIO);
+
 	/*
 	 * If we hit an error before we started the receive_writer_thread
 	 * we need to clean up the next_rrd we create by processing the

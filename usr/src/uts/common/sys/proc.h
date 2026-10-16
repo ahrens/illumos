@@ -652,6 +652,7 @@ extern void sigtoproc(proc_t *, kthread_t *, int);
 extern void trapsig(k_siginfo_t *, int);
 extern void realsigprof(int, int, int);
 extern int eat_signal(kthread_t *, int);
+extern int thread_abort_sleep(kthread_t *);
 extern int signal_is_blocked(kthread_t *, int);
 extern int sigcheck(proc_t *, kthread_t *);
 extern void sigdefault(proc_t *);
