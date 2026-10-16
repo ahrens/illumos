@@ -78,8 +78,7 @@ function pool_has_failed # pool
 
 #
 # Make every write to the vdev fail, so that the next txg sync that has
-# something to write fails the pool (failmode=death, or a pool armed by
-# "zpool export -F") or suspends it.
+# something to write fails the pool (failmode=death) or suspends it.
 #
 function failmode_break_vdev
 {

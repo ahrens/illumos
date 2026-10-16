@@ -1713,10 +1713,10 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	 * keep it from being exported, so fail the volumes (see zvol_fail())
 	 * and detach the file systems (see zfs_fail_mounts()) first.  If the
 	 * pool fails while we export it, they are still there, so try again
-	 * once.  Arming the pool first fails it now if it is suspended.
+	 * once.  A hardforce export fails the pool first, whatever its state.
 	 */
 	if (hardforce)
-		(void) spa_exit_arm_by_name(zc->zc_name);
+		(void) spa_exit_fail_by_name(zc->zc_name);
 	(void) zfs_fail_mounts(zc->zc_name);
 	(void) zvol_fail_minors(zc->zc_name);
 	error = spa_export(zc->zc_name, NULL, force, hardforce);
@@ -5516,14 +5516,15 @@ zfs_ioc_clear(zfs_cmd_t *zc)
  * inputs:
  * zc_name		name of the pool
  *
- * Arm the pool for forced exit ("zpool export -F"): it fails, dropping its
- * unsynced changes, if it is or becomes suspended.  This doesn't take
- * spa_namespace_lock, which may be held by a thread waiting on the pool.
+ * Fail the pool ("zpool export -F"), dropping its unsynced changes, whether
+ * it is suspended or healthy, so that it can be exported (see spa_fail()).
+ * This doesn't take spa_namespace_lock, which may be held by a thread
+ * waiting on the pool.
  */
 static int
 zfs_ioc_pool_force_exit(zfs_cmd_t *zc)
 {
-	return (spa_exit_arm_by_name(zc->zc_name));
+	return (spa_exit_fail_by_name(zc->zc_name));
 }
 
 static int

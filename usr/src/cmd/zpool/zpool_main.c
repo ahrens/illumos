@@ -1587,6 +1587,7 @@ typedef struct export_cbdata {
 	char *rootpool;
 	tpool_t *tpool;
 	pthread_mutex_t mnttab_lock;
+	boolean_t do_all;
 	boolean_t force;
 	boolean_t hardforce;
 	int retval;
@@ -1623,13 +1624,13 @@ root_pool_name(void)
 }
 
 /*
- * Arm every imported pool but the root pool for forced exit before "zpool
- * export -aF" lists them: listing the pools takes spa_namespace_lock, which a
- * command sleeping on a suspended pool can hold until the pool fails (see
- * zpool_do_export()).  The kernel keeps an I/O kstat, zfs:0:<pool>, for each
- * pool, whose name we can read without that lock.  A kstat name is cut off at
- * KSTAT_STRLEN - 1 characters, so a pool with a longer name isn't found, and
- * is armed only when zpool_export_one() gets to it.
+ * Fail every imported pool but the root pool before "zpool export -aF" lists
+ * them: listing the pools takes spa_namespace_lock, which a command sleeping
+ * on a suspended pool can hold until the pool fails (see zpool_do_export()).
+ * The kernel keeps an I/O kstat, zfs:0:<pool>, for each pool, whose name we
+ * can read without that lock.  A kstat name is cut off at KSTAT_STRLEN - 1
+ * characters, so a pool with a longer name isn't found, and fails only when
+ * zpool_export_one() gets to it.
  */
 static void
 zpool_force_exit_all(const char *rootpool)
@@ -1664,17 +1665,28 @@ zpool_export_one(zpool_handle_t *zhp, void *data)
 	 * It can't be exported, and trying would unmount every filesystem in
 	 * it that isn't busy.
 	 */
-	if (cb->rootpool != NULL &&
+	if (cb->do_all && cb->rootpool != NULL &&
 	    strcmp(zpool_get_name(zhp), cb->rootpool) == 0)
 		return (0);
 
 	/*
-	 * With -F, arm the pool before unmounting its file systems: if it is
-	 * suspended, unmounting would otherwise wait for it forever.  It fails
-	 * instead, and its unsynced changes are lost.
+	 * With -F, fail the pool before unmounting its file systems, whatever
+	 * its state: its unsynced changes are lost, and nothing waits for it.
+	 * A suspended pool's unmounts would otherwise wait for it forever, and
+	 * a healthy pool's would wait for it to sync.  The root pool can't be
+	 * exported, and failing it would take the system down with it.
 	 */
-	if (cb->hardforce && zpool_force_exit(zhp) != 0)
-		return (1);
+	if (cb->hardforce) {
+		if (cb->rootpool != NULL &&
+		    strcmp(zpool_get_name(zhp), cb->rootpool) == 0) {
+			(void) fprintf(stderr, gettext("cannot export '%s': "
+			    "pool holds the root file system\n"),
+			    zpool_get_name(zhp));
+			return (1);
+		}
+		if (zpool_force_exit(zhp) != 0)
+			return (1);
+	}
 
 	/*
 	 * Without -F, a suspended pool can't be exported (the kernel refuses
@@ -1827,6 +1839,7 @@ zpool_do_export(int argc, char **argv)
 	}
 
 	cb.rootpool = NULL;
+	cb.do_all = do_all;
 	cb.force = force;
 	cb.hardforce = hardforce;
 	cb.tpool = NULL;
@@ -1874,18 +1887,24 @@ zpool_do_export(int argc, char **argv)
 	}
 
 	/*
-	 * Arm the pools before opening them: a command sleeping on a
+	 * Fail the pools before opening them: a command sleeping on a
 	 * suspended pool can hold spa_namespace_lock, which opening a pool
-	 * needs, until the pool fails.  zpool_export_one() arms them again and
-	 * reports any error.
+	 * needs, until the pool fails.  zpool_export_one() fails them again
+	 * and reports any error.
 	 */
 	if (hardforce) {
-		for (int i = 0; i < argc; i++)
-			(void) zpool_force_exit_name(g_zfs, argv[i]);
+		cb.rootpool = root_pool_name();
+		for (int i = 0; i < argc; i++) {
+			if (cb.rootpool == NULL ||
+			    strcmp(argv[i], cb.rootpool) != 0)
+				(void) zpool_force_exit_name(g_zfs, argv[i]);
+		}
 	}
 
-	return (for_each_pool(argc, argv, B_TRUE, NULL, zpool_export_one,
-	    &cb));
+	ret = for_each_pool(argc, argv, B_TRUE, NULL, zpool_export_one, &cb);
+	free(cb.rootpool);
+
+	return (ret);
 }
 
 /*

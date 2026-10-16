@@ -7280,10 +7280,11 @@ ztest_force_exit_park_others(int secs)
 
 /*
  * Fail the pool at a random point, then export it, and import it again.
- * Every leaf vdev gets write errors, so the pool can't write.  The pool fails
- * either because it has failmode=death, or because it was armed for forced
- * exit (as by "zpool export -F") and then suspended.  Half the time, the ARC
- * is flushed first, so that syncing context finds nothing cached.
+ * Either every leaf vdev gets write errors, so the pool can't write, and it
+ * fails because it has failmode=death, or because it was armed for forced
+ * exit (as by a reboot) and then suspended; or the pool is healthy, and is
+ * failed outright, as by "zpool export -F".  Half the time, the ARC is
+ * flushed first, so that syncing context finds nothing cached.
  *
  * Usually (see -X) the other test threads keep running while the pool fails,
  * so it fails in the middle of whatever they are doing: ZIL commits, writes,
@@ -7293,10 +7294,11 @@ ztest_force_exit_park_others(int secs)
  * fails while it syncs whatever they left dirty.
  *
  * The pool must import at the last txg that synced before it failed: nothing
- * written after that can reach the disks.  Every ZIL record that a commit
- * acknowledged before the pool failed must be replayed when the datasets are
- * opened again (see ztest_dataset_open()).  The parent runs zdb on the pool
- * after the pass.
+ * written after that can reach the disks, except the uberblocks of a txg
+ * that the pool failed while committing (see spa_sync_rewrite_vdev_config()).
+ * Every ZIL record that a commit acknowledged before the pool failed must be
+ * replayed when the datasets are opened again (see ztest_dataset_open()).
+ * The parent runs zdb on the pool after the pass.
  */
 /* ARGSUSED */
 void
@@ -7304,10 +7306,13 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 {
 	ztest_shared_opts_t *zo = &ztest_opts;
 	int datasets = MIN(zo->zo_datasets, zo->zo_threads);
-	boolean_t death = ztest_random(2);
+	enum { FE_DEATH, FE_ARMED, FE_HEALTHY } how = ztest_random(3);
+	static const char *const how_name[] = {
+		"failmode=death", "armed", "export -F"
+	};
 	boolean_t flush = ztest_random(2);
 	boolean_t live = ztest_random(100) < zo->zo_force_exit_live;
-	int fh[2];
+	int fh[2] = { 0, 0 };
 	nvlist_t *config;
 	spa_t *spa;
 	uint64_t pool_guid, failmode, txg, birth, ondisk;
@@ -7346,21 +7351,26 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 
 	if (zo->zo_verbose >= 3) {
 		(void) printf("forced exit: failing %s (%s%s%s)\n",
-		    spa_name(spa), death ? "failmode=death" : "armed",
+		    spa_name(spa), how_name[how],
 		    flush ? ", ARC flushed" : "",
 		    live ? ", tests running" : "");
 	}
 
-	if (death) {
+	if (how == FE_DEATH) {
 		spa->spa_failmode = ZIO_FAILURE_MODE_DEATH;
 	} else {
 		spa->spa_failmode = ZIO_FAILURE_MODE_WAIT;
-		spa_exit_arm(spa);
+		if (how == FE_ARMED)
+			spa_exit_arm(spa);
 	}
 	if (flush)
 		arc_flush(spa, B_FALSE);
-	ztest_fe_faulting = B_TRUE;
-	ztest_force_exit_inject(spa, fh);
+	if (how == FE_HEALTHY) {
+		spa_fail(spa);
+	} else {
+		ztest_fe_faulting = B_TRUE;
+		ztest_force_exit_inject(spa, fh);
+	}
 
 	/*
 	 * Whatever the tests are doing, or left dirty, will fail the pool
@@ -7387,9 +7397,11 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 	 * Nothing reaches the disks now, injected or not.  The injection
 	 * handlers hold the pool, so they have to go before the export.
 	 */
-	VERIFY0(zio_clear_fault(fh[0]));
-	VERIFY0(zio_clear_fault(fh[1]));
-	ztest_fe_faulting = B_FALSE;
+	if (how != FE_HEALTHY) {
+		VERIFY0(zio_clear_fault(fh[0]));
+		VERIFY0(zio_clear_fault(fh[1]));
+		ztest_fe_faulting = B_FALSE;
+	}
 
 	/*
 	 * The last txg that synced, and the last one that changed anything
@@ -7424,10 +7436,12 @@ ztest_force_exit(ztest_ds_t *zd, uint64_t id)
 
 	/*
 	 * The disks held the pool as of the last txg that synced: nothing
-	 * written after it reached them, and nothing before it was lost.
+	 * written after it reached them, and nothing before it was lost.  If
+	 * the pool failed after the next txg's uberblocks reached the disks,
+	 * but before its odd labels did, that txg is on disk too.
 	 */
 	ondisk = spa_first_txg(spa) - 1;
-	if (ondisk < birth || ondisk > txg) {
+	if (ondisk < birth || ondisk > txg + 1) {
 		fatal(0, "forced exit: pool imported at txg %llu, but the "
 		    "last txg that synced before it failed was %llu (last "
 		    "changed in %llu)", (u_longlong_t)ondisk,

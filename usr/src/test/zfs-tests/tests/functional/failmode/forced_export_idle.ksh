@@ -20,8 +20,8 @@
 #
 # DESCRIPTION:
 #	"zpool export -F" of an idle pool whose device has stopped working
-#	finishes: the export's own sync can't write, so the pool suspends, and
-#	because it is armed, it fails, and the export goes on without it.
+#	finishes: it fails the pool, so the export doesn't try to sync, and
+#	nothing waits for the device.
 #
 
 log_assert "zpool export -F of an idle pool on a failed device finishes"

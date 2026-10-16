@@ -64,7 +64,7 @@ function fence_case # vdev...
 
 	#
 	# Dirty the pool with writes, and with administrative commands that
-	# wait for it.  The file systems stay mounted: "zpool export -F" arms
+	# wait for it.  The file systems stay mounted: "zpool export -F" fails
 	# the pool before it unmounts them, so that unmounting doesn't wait for
 	# the pool forever.
 	#

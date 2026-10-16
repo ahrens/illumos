@@ -19,18 +19,14 @@
 
 #
 # DESCRIPTION:
-# On illumos, zpool export -F of a healthy pool is an ordinary export: it
-# arms the pool, so that a write error from then on fails it, but it does
-# not cut off a running receive.  A healthy pool with a receive running is
-# busy.
+# A pool should be hardforce exportable, while a receive is running into it.
 #
 # STRATEGY:
 # 1. Initiate a send from one pool and receive to another pool.
 # 2. Slow the send using pv, so it blocks a normal pool export.
 # 3. Check that normal export fails.
-# 4. Check that zpool export -F fails too, and the receive keeps going.
-# 5. Stop the receive; zpool export -F now succeeds.
-# 6. Verify pool is no longer present in the list output.
+# 4. Forcibly export pool, which fails it: the receive gets EIO.
+# 5. Verify pool is no longer present in the list output.
 #
 
 verify_runnable "global"
@@ -51,7 +47,7 @@ function cleanup
 }
 log_onexit cleanup
 
-log_assert "zpool export -F of a healthy pool doesn't interrupt a receive."
+log_assert "Verify a pool can be forcibly exported while receiving."
 
 mkdir -p $TESTDIR
 dstsnap=$TESTPOOL/$TESTFS@$TESTSNAP
@@ -91,22 +87,38 @@ log_must kill -0 $sendpid
 log_must kill -0 $recvpid
 log_mustnot zpool export $TESTPOOL
 
-# Send should still be running; force export should yield too.
+# Send should still be running; now try force export.
 log_must kill -0 $sendpid
 log_must kill -0 $recvpid
-log_mustnot zpool export -F $TESTPOOL
-log_must kill -0 $sendpid
-log_must kill -0 $recvpid
+#
+# zpool export -F fails the pool, healthy as it is.  It then waits up to 20
+# seconds for the pool's users to let go before giving up with EBUSY; a
+# receive that is blocked on its pipe notices only when its next write
+# fails, so run it again, as sled-agent does, until it goes through.
+#
+typeset -i tries=0
+until zpool export -F $TESTPOOL; do
+	((++tries < 6)) || log_fail "zpool export -F still failing"
+	log_must pool_has_failed $TESTPOOL
+done
+log_note "zpool export -F succeeded after $tries retries"
 
-# Once the receive is gone, the export goes through.
-kill $sendpid $pvpid $recvpid
-wait $sendpid $pvpid $recvpid
-sendpid=
-pvpid=
+# Receive should have exited with non-zero.
+log_mustnot wait $recvpid
 recvpid=
-log_must zpool export -F $TESTPOOL
+
+# illumos poll(2) does not report POLLERR on the write end of a full FIFO
+# whose reader has gone away, so pv can wait forever without ever writing
+# and seeing EPIPE.  Stop it, so that zfs send sees EPIPE.
+kill $pvpid 2>/dev/null
+wait $pvpid
+pvpid=
+
+# Send should have exited with non-zero.
+log_mustnot wait $sendpid
+sendpid=
 
 poolexists $TESTPOOL && \
 	log_fail "$TESTPOOL unexpectedly found in 'zpool list' output."
 
-log_pass "zpool export -F of a healthy pool doesn't interrupt a receive."
+log_pass "Successfully forcibly exported a pool while receiving."

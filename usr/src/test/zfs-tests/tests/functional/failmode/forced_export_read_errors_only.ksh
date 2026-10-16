@@ -20,7 +20,7 @@
 #
 # DESCRIPTION:
 #	"zpool export -F" of a pool whose device fails only its reads, and
-#	that nothing is writing to, finishes.
+#	that nothing is writing to, fails it and finishes.
 #
 
 log_assert "zpool export -F of a pool that only gets read errors finishes"

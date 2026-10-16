@@ -1311,21 +1311,23 @@ This command will forcefully export the pool even if it has a shared spare that
 is currently being used.
 This may lead to potential data corruption.
 .It Fl F
-Export the pool even if it is suspended, discarding the changes that it has
-not yet written.
+Fail the pool and export it, whether it is suspended or healthy, discarding
+the changes that it has not yet written.
 Implies
 .Fl f .
 .Pp
-The pool is armed for forced exit before its datasets are unmounted: if it is
-suspended, or becomes suspended while it is being exported, it fails, as
-though it had
-.Sy failmode Ns = Ns Sy death ,
-rather than waiting for its devices to come back.
+The pool fails before its datasets are unmounted, as though it had
+.Sy failmode Ns = Ns Sy death
+and had been suspended, rather than waiting for its devices to come back or
+for its changes to be written.
 Operations that are waiting for it return
 .Er EIO ,
 open volumes are let go of, and nothing more is written to its devices, which
 remain at the last committed transaction group.
-A pool that does not suspend is exported as usual, and loses nothing.
+Changes that were not yet written are lost, even if the pool is healthy,
+except for synchronous writes, which are replayed from the intent log when the
+pool is imported again.
+The pool holding the root file system cannot be exported this way.
 .Pp
 If the export fails after the pool has failed, for example because a file
 system mounted on top of one of its datasets cannot be unmounted, the pool

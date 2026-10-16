@@ -19,10 +19,9 @@
 
 #
 # DESCRIPTION:
-#	"zpool export -F" of a pool that is healthy but slow waits for it to
-#	sync, as a normal export does.  If the pool suspends while the export
-#	is waiting, it fails at once (even though it has failmode=wait), and
-#	the export finishes.
+#	"zpool export -F" of a pool that is healthy but slow fails it at once
+#	(even though it has failmode=wait), rather than waiting for it to sync
+#	as a normal export does, and the export finishes.
 #
 
 typeset -i dirty_pid=0 export_pid=0
@@ -39,26 +38,28 @@ function cleanup
 	failmode_cleanup
 }
 
-log_assert "A pool armed by zpool export -F fails when it suspends"
+log_assert "zpool export -F of a slow pool doesn't wait for it to sync"
 log_onexit cleanup
 
 failmode_create_pool wait
 log_must zfs unmount $TESTPOOL/$TESTFS
 log_must zfs unmount $TESTPOOL
 
-# Slow the pool down, so that the export has to wait for it.
+# Slow the pool down, so that a normal export would have to wait for it.
 log_must zinject -d $FAILMODE_VDEV -D 1000:1 $TESTPOOL
 zfs set user:dirty=1 $TESTPOOL &
 dirty_pid=$!
+sleep 1
 zpool export -F $TESTPOOL &
 export_pid=$!
-sleep 3
-kill -0 $export_pid 2>/dev/null || log_fail "export didn't wait for the pool"
-log_mustnot pool_has_failed $TESTPOOL
 
-# Now break it.  It suspends, and fails.
-failmode_break_vdev
-failmode_wait_failed $TESTPOOL
+typeset -i tries=5
+until pool_has_failed $TESTPOOL; do
+	if ((tries-- == 0)); then
+		log_fail "zpool export -F didn't fail the slow pool at once"
+	fi
+	sleep 1
+done
 
 #
 # The injection handlers hold the pool, which keeps it from being exported;
@@ -83,4 +84,4 @@ log_must zpool scrub $TESTPOOL
 log_must wait_scrubbed $TESTPOOL
 log_must check_pool_status $TESTPOOL "errors" "No known data errors"
 
-log_pass "A pool armed by zpool export -F fails when it suspends"
+log_pass "zpool export -F of a slow pool doesn't wait for it to sync"

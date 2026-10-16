@@ -2535,7 +2535,6 @@ file \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_zil_flush_error \
     mode=0555
-file path=opt/zfs-tests/tests/functional/failmode/forced_export_armed mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_busy_fs \
     mode=0555
 file \
@@ -2575,6 +2574,7 @@ file path=opt/zfs-tests/tests/functional/failmode/forced_export_removal \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_retry mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_send mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_slow mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_continue \
     mode=0555

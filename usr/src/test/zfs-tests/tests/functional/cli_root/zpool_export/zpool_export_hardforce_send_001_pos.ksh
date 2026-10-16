@@ -19,17 +19,14 @@
 
 #
 # DESCRIPTION:
-# On illumos, zpool export -F of a healthy pool is an ordinary export: it
-# arms the pool, so that a write error from then on fails it, but it does
-# not cut off a running send.  A healthy pool with a send running is busy.
+# A pool should be hardforce exportable, while a send is running from it.
 #
 # STRATEGY:
 # 1. Initiate a send from pool to a file.
 # 2. Slow the send using pv, so it blocks a normal pool export.
 # 3. Check that normal export fails.
-# 4. Check that zpool export -F fails too, and the send keeps going.
-# 5. Stop the send; zpool export -F now succeeds.
-# 6. Verify pool is no longer present in the list output.
+# 4. Forcibly export pool, which fails it: the send gets EIO.
+# 5. Verify pool is no longer present in the list output.
 #
 
 verify_runnable "global"
@@ -48,7 +45,7 @@ function cleanup
 }
 log_onexit cleanup
 
-log_assert "zpool export -F of a healthy pool doesn't interrupt a send."
+log_assert "Verify a pool can be forcibly exported while sending."
 
 mkdir -p $TESTDIR
 snap=$TESTPOOL/$TESTFS@$TESTSNAP
@@ -59,6 +56,10 @@ log_must create_pool $TESTPOOL raidz $FEDISK0 $FEDISK1 $FEDISK2
 log_must zfs create $TESTPOOL/$TESTFS
 log_must dd if=/dev/urandom of=/$TESTPOOL/$TESTFS/$TESTFILE1 bs=1M count=128
 log_must zfs snapshot $snap
+
+# Start with nothing cached, so that the send has to read from the disks.
+log_must zpool export $TESTPOOL
+log_must zpool import $TESTPOOL
 
 # Create FIFOs for the send, so the processes can be controlled and
 # monitored individually.
@@ -75,21 +76,29 @@ log_must kill -0 $sendpid
 log_must kill -0 $pvpid
 log_mustnot zpool export $TESTPOOL
 
-# Send should still be running; force export should yield too.
+# Send should still be running; now try force export.
 log_must kill -0 $sendpid
 log_must kill -0 $pvpid
-log_mustnot zpool export -F $TESTPOOL
-log_must kill -0 $sendpid
-log_must kill -0 $pvpid
+#
+# zpool export -F fails the pool, healthy as it is.  It then waits up to 20
+# seconds for the pool's users to let go before giving up with EBUSY; a send
+# that is blocked on its pipe notices only at its next read that misses the
+# cache, so run it again, as sled-agent does, until it goes through.
+#
+typeset -i tries=0
+until zpool export -F $TESTPOOL; do
+	((++tries < 6)) || log_fail "zpool export -F still failing"
+	log_must pool_has_failed $TESTPOOL
+done
+log_note "zpool export -F succeeded after $tries retries"
 
-# Once the send is gone, the export goes through.
-kill $sendpid $pvpid
-wait $sendpid $pvpid
+# Send should have exited with non-zero.
+log_mustnot wait $sendpid
+log_must wait $pvpid
 sendpid=
 pvpid=
-log_must zpool export -F $TESTPOOL
 
 poolexists $TESTPOOL && \
 	log_fail "$TESTPOOL unexpectedly found in 'zpool list' output."
 
-log_pass "zpool export -F of a healthy pool doesn't interrupt a send."
+log_pass "Successfully forcibly exported a pool while sending."
