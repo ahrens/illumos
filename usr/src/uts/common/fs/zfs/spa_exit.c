@@ -37,13 +37,19 @@
  * syncing context can't free any while it is suspended, since that takes a txg.
  * A pool on another failmode fails when it is armed and suspends; unlike the
  * failmode, arming can't be undone, and lasts until the pool is exported.
- * Arming fails a pool that is already suspended.  "zpool export -F" arms
- * the pool, through ZFS_IOC_POOL_FORCE_EXIT (spa_exit_arm_by_name()) before it
- * unmounts anything, and again in spa_export_common().  So does a reboot
- * (spa_shutdown_callb()), so that a suspended pool's unmounts don't hang it.
- * The arming ioctl finds the pool without spa_namespace_lock, which a thread
- * waiting on the pool may hold for good; spa_exit_hold() keeps the pool loaded
- * until it is armed.
+ * Arming fails a pool that is already suspended.  A reboot arms every
+ * pool (spa_shutdown_callb()), so that a suspended pool's unmounts don't hang
+ * it, while a healthy pool syncs as usual.
+ *
+ * "zpool export -F" fails the pool outright, whatever its state, healthy or
+ * not: it never tries a normal export first, so nothing waits for the pool to
+ * sync, and the outcome doesn't depend on whether it would have.  Whatever
+ * hadn't synced is lost, except what the intent log replays at the next
+ * import.  It fails the pool through ZFS_IOC_POOL_FORCE_EXIT
+ * (spa_exit_fail_by_name()) before it unmounts anything, and again in
+ * spa_export_common().  The ioctl finds the pool without spa_namespace_lock,
+ * which a thread waiting on the pool may hold for good; spa_exit_hold() keeps
+ * the pool loaded until it has failed.
  *
  * The fence
  *
@@ -104,8 +110,9 @@
  * be relied on: it races with the mounts and receives that the failure woke
  * up, and closing their logs waits for writes that may never finish.  The
  * intent logs are closed without committing anything (zil_failed_close()).
- * spa_unload() waits for the arming threads (spa_exit_unload_wait()), and
- * spa_activate() starts the next import of the pool in SPA_EXIT_NONE.
+ * spa_unload() waits for the threads that fail the pool by name
+ * (spa_exit_unload_wait()), and spa_activate() starts the next import of the
+ * pool in SPA_EXIT_NONE.
  */
 
 #include <sys/zfs_context.h>
@@ -135,16 +142,19 @@ spa_failed(spa_t *spa)
  * zio_vdev_io_start()), so the disks stay at the last synced txg, and every
  * wait on the pool returns rather than blocking.  The sync thread drains the
  * remaining dirty data into the void, and the pool waits to be exported.
- * Called when a failmode=death pool would otherwise suspend, and when an
- * armed pool suspends.
+ * Called when a failmode=death pool would otherwise suspend, when an armed
+ * pool suspends, and by "zpool export -F" (see spa_exit_fail_by_name()).
+ * With suspended_only, fails the pool only if it is suspended, atomically
+ * with zio_resume().
  */
-void
-spa_fail(spa_t *spa)
+static void
+spa_fail_impl(spa_t *spa, boolean_t suspended_only)
 {
 	zio_t *pio;
 
 	mutex_enter(&spa->spa_suspend_lock);
-	if (spa->spa_exit == SPA_EXIT_FAILED) {
+	if (spa->spa_exit == SPA_EXIT_FAILED ||
+	    (suspended_only && !spa_suspended(spa))) {
 		mutex_exit(&spa->spa_suspend_lock);
 		return;
 	}
@@ -172,6 +182,12 @@ spa_fail(spa_t *spa)
 		zio_exit_reexecute(pio);
 }
 
+void
+spa_fail(spa_t *spa)
+{
+	spa_fail_impl(spa, B_FALSE);
+}
+
 /*
  * Arm the pool for forced exit: it fails now if it is suspended, or instead
  * of suspending later (see zio_suspend()).  An armed pool that never
@@ -180,26 +196,22 @@ spa_fail(spa_t *spa)
 void
 spa_exit_arm(spa_t *spa)
 {
-	boolean_t fail;
-
 	mutex_enter(&spa->spa_suspend_lock);
 	if (spa->spa_exit == SPA_EXIT_NONE)
 		spa->spa_exit = SPA_EXIT_ARMED;
-	fail = (spa->spa_exit == SPA_EXIT_ARMED && spa_suspended(spa));
 	mutex_exit(&spa->spa_suspend_lock);
 
-	if (fail)
-		spa_fail(spa);
+	spa_fail_impl(spa, B_TRUE);
 }
 
 /*
  * Hold a pool found in spa_namespace_avl without spa_namespace_lock, so that
- * it can be armed (see spa_exit_arm()) once spa_namespace_avl_lock is
- * dropped: arming a suspended pool fails it, which posts an ereport and
- * dispatches I/O, too much to do under a leaf lock.  The hold keeps the pool
- * from being unloaded (see spa_exit_unload_wait()), and so from being removed
- * and freed.  Returns B_FALSE if there is nothing to arm: the pool isn't
- * loaded, is being unloaded, or is read-only, and can't suspend.
+ * it can be failed (see spa_fail()) once spa_namespace_avl_lock is dropped:
+ * failing a pool posts an ereport and dispatches I/O, too much to do under a
+ * leaf lock.  The hold keeps the pool from being unloaded (see
+ * spa_exit_unload_wait()), and so from being removed and freed.  Returns
+ * B_FALSE if there is nothing to fail: the pool isn't loaded, is being
+ * unloaded, or is read-only, and has nothing to lose.
  */
 static boolean_t
 spa_exit_hold(spa_t *spa)
@@ -225,8 +237,8 @@ spa_exit_rele(spa_t *spa)
 
 /*
  * Called by spa_unload() before it closes the DSL pool: wait for the threads
- * arming the pool to let go of it, and keep new ones away until the pool is
- * activated again.
+ * failing the pool by name to let go of it, and keep new ones away until the
+ * pool is activated again.
  */
 void
 spa_exit_unload_wait(spa_t *spa)
@@ -260,14 +272,22 @@ spa_exit_find(const char *name)
 }
 
 /*
- * Arm the named pool for forced exit (see spa_exit_arm()) without taking
- * spa_namespace_lock, which may be held indefinitely by a thread sleeping on
- * that very pool.  spa_exit_hold() keeps the pool while we arm it.  A pool
- * that has nothing to arm (see spa_exit_hold()) is exported as usual, so that
- * isn't an error.
+ * Fail the named pool ("zpool export -F") without taking spa_namespace_lock,
+ * which may be held indefinitely by a thread sleeping on that very pool.
+ * spa_exit_hold() keeps the pool while we fail it.  A pool that has nothing
+ * to lose (see spa_exit_hold()) is exported as usual, so that isn't an error.
+ *
+ * A pool whose import hasn't started syncing yet is left alone: the export
+ * waits for the import (see spa_lookup()), and fails the pool once it is
+ * done (see zfs_ioc_pool_export()).  If the import's own sync suspends, it
+ * hangs, as it does without forced exit; a failmode=death pool fails
+ * instead, by itself.
+ *
+ * The root pool can't be failed: the system needs it, and it can't be
+ * exported.
  */
 int
-spa_exit_arm_by_name(const char *name)
+spa_exit_fail_by_name(const char *name)
 {
 	mutex_enter(&spa_namespace_avl_lock);
 	spa_t *spa = spa_exit_find(name);
@@ -275,17 +295,43 @@ spa_exit_arm_by_name(const char *name)
 		mutex_exit(&spa_namespace_avl_lock);
 		return (SET_ERROR(ENOENT));
 	}
+	if (spa_is_root(spa)) {
+		mutex_exit(&spa_namespace_avl_lock);
+		return (SET_ERROR(EBUSY));
+	}
 	boolean_t held = spa_exit_hold(spa);
 	mutex_exit(&spa_namespace_avl_lock);
 
 	if (held) {
-		spa_exit_arm(spa);
+		if (spa->spa_sync_on)
+			spa_fail(spa);
 		mutex_enter(&spa_namespace_avl_lock);
 		spa_exit_rele(spa);
 		mutex_exit(&spa_namespace_avl_lock);
 	}
 
 	return (0);
+}
+
+/*
+ * The names of the pools whose names start with prefix, found without
+ * spa_namespace_lock (see spa_exit_find()), as the names of an nvlist.
+ */
+nvlist_t *
+spa_exit_names(const char *prefix)
+{
+	nvlist_t *names = fnvlist_alloc();
+	size_t len = strlen(prefix);
+
+	mutex_enter(&spa_namespace_avl_lock);
+	for (spa_t *spa = avl_first(&spa_namespace_avl); spa != NULL;
+	    spa = AVL_NEXT(&spa_namespace_avl, spa)) {
+		if (strncmp(spa->spa_name, prefix, len) == 0)
+			fnvlist_add_boolean(names, spa->spa_name);
+	}
+	mutex_exit(&spa_namespace_avl_lock);
+
+	return (names);
 }
 
 /*
@@ -304,7 +350,7 @@ spa_exit_deadline(void)
 
 /*
  * Has the named pool failed (see spa_failed())?  Like
- * spa_exit_arm_by_name(), this doesn't take spa_namespace_lock.
+ * spa_exit_fail_by_name(), this doesn't take spa_namespace_lock.
  */
 boolean_t
 spa_failed_by_name(const char *name)

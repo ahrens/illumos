@@ -1652,10 +1652,10 @@ zpool_export_force(zpool_handle_t *zhp, const char *log_str)
 }
 
 /*
- * Arm the pool for forced exit: if it is suspended, or becomes suspended, it
- * fails rather than waiting to be resumed, and can then be exported.  This
- * goes straight to the kernel, without waiting for the pool or for an import
- * or export in progress.
+ * Fail the pool ("zpool export -F"), whether it is suspended or healthy: its
+ * unsynced changes are dropped, nothing waits for it any more, and it can
+ * then be exported.  This goes straight to the kernel, without waiting for
+ * the pool or for an import or export in progress.
  */
 int
 zpool_force_exit(zpool_handle_t *zhp)
@@ -1666,7 +1666,13 @@ zpool_force_exit(zpool_handle_t *zhp)
 	(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
 	    "cannot force '%s' to exit"), zhp->zpool_name);
 
-	error = zpool_force_exit_name(zhp->zpool_hdl, zhp->zpool_name);
+	error = zpool_force_exit_name(zhp->zpool_hdl, zhp->zpool_name, B_FALSE);
+	if (error == EBUSY) {
+		zfs_error_aux(zhp->zpool_hdl, dgettext(TEXT_DOMAIN,
+		    "pool holds the root file system, or a volume in use as a "
+		    "dump or swap device or by COMSTAR"));
+		return (zfs_error(zhp->zpool_hdl, EZFS_BUSY, msg));
+	}
 	if (error != 0)
 		return (zpool_standard_error_fmt(zhp->zpool_hdl, error, msg));
 
@@ -1676,15 +1682,18 @@ zpool_force_exit(zpool_handle_t *zhp)
 /*
  * zpool_force_exit() of a pool that hasn't been opened.  Opening a pool needs
  * spa_namespace_lock, which a command waiting on the pool may hold until the
- * pool exits, so "zpool export -F" arms its pools by name first.  Returns an
- * errno, and reports nothing.
+ * pool exits, so "zpool export -F" fails its pools by name first.  With
+ * prefix, fails every pool whose name starts with pool.  Returns an errno,
+ * and reports nothing.
  */
 int
-zpool_force_exit_name(libzfs_handle_t *hdl, const char *pool)
+zpool_force_exit_name(libzfs_handle_t *hdl, const char *pool,
+    boolean_t prefix)
 {
 	zfs_cmd_t zc = { 0 };
 
 	(void) strlcpy(zc.zc_name, pool, sizeof (zc.zc_name));
+	zc.zc_cookie = prefix;
 	if (zfs_ioctl(hdl, ZFS_IOC_POOL_FORCE_EXIT, &zc) != 0)
 		return (errno);
 

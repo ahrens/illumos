@@ -124,9 +124,9 @@
  *
  *	spa_namespace_avl_lock is a leaf lock, held only while adding a spa_t
  *	to or removing it from the namespace AVL tree, and by
- *	spa_exit_arm_by_name(), which has to find a pool to fail even while
+ *	spa_exit_fail_by_name(), which has to find a pool to fail even while
  *	a thread sleeps holding spa_namespace_lock.  It holds the pool with
- *	spa_exit_hold(), and arms it after dropping the lock.
+ *	spa_exit_hold(), and fails it after dropping the lock.
  *
  *
  * The spa_namespace_lock can be acquired directly and is globally visible.

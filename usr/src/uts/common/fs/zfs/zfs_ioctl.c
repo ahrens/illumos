@@ -1706,6 +1706,20 @@ zfs_ioc_pool_import(zfs_cmd_t *zc)
 	return (error);
 }
 
+/*
+ * Fail the named pool (see spa_exit_fail_by_name()), unless it is the root
+ * pool, or failing it couldn't let go of one of its volumes (see
+ * zvol_pinned_minors()): the pool would be left failed, unwritable and
+ * still imported.
+ */
+static int
+zfs_pool_fail(const char *name)
+{
+	if (zvol_pinned_minors(name))
+		return (SET_ERROR(EBUSY));
+	return (spa_exit_fail_by_name(name));
+}
+
 static int
 zfs_ioc_pool_export(zfs_cmd_t *zc)
 {
@@ -1720,12 +1734,12 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	 * keep it from being exported, so fail the volumes (see zvol_fail())
 	 * and detach the file systems (see zfs_fail_mounts()) first.  If the
 	 * pool fails while we export it, they are still there, so try again
-	 * once.  Arming the pool first fails it now if it is suspended.  All
-	 * of this waits for the pool's users to let go of it until one
-	 * deadline.
+	 * once.  A hardforce export fails the pool first, whatever its state,
+	 * unless it is the root pool.  All of this waits for the pool's users
+	 * to let go of it until one deadline.
 	 */
-	if (hardforce)
-		(void) spa_exit_arm_by_name(zc->zc_name);
+	if (hardforce && zfs_pool_fail(zc->zc_name) == EBUSY)
+		return (SET_ERROR(EBUSY));
 	clock_t deadline = spa_exit_deadline();
 	(void) zfs_fail_mounts(zc->zc_name, deadline);
 	(void) zvol_fail_minors(zc->zc_name, deadline);
@@ -5547,15 +5561,28 @@ zfs_ioc_clear(zfs_cmd_t *zc)
 /*
  * inputs:
  * zc_name		name of the pool
+ * zc_cookie		fail every pool whose name starts with zc_name
  *
- * Arm the pool for forced exit ("zpool export -F"): it fails, dropping its
- * unsynced changes, if it is or becomes suspended.  This doesn't take
- * spa_namespace_lock, which may be held by a thread waiting on the pool.
+ * Fail the pool ("zpool export -F"), dropping its unsynced changes, whether
+ * it is suspended or healthy, so that it can be exported (see spa_fail()).
+ * This doesn't take spa_namespace_lock, which may be held by a thread
+ * waiting on the pool.  "zpool export -aF" may know a pool only by the start
+ * of its name (see zpool_force_exit_all()), and fails every pool that
+ * matches; the pools that can't be failed (see zfs_pool_fail()) are left
+ * alone.
  */
 static int
 zfs_ioc_pool_force_exit(zfs_cmd_t *zc)
 {
-	return (spa_exit_arm_by_name(zc->zc_name));
+	if (zc->zc_cookie == 0)
+		return (zfs_pool_fail(zc->zc_name));
+
+	nvlist_t *names = spa_exit_names(zc->zc_name);
+	for (nvpair_t *pair = nvlist_next_nvpair(names, NULL); pair != NULL;
+	    pair = nvlist_next_nvpair(names, pair))
+		(void) zfs_pool_fail(nvpair_name(pair));
+	fnvlist_free(names);
+	return (0);
 }
 
 static int

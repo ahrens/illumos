@@ -92,6 +92,8 @@
 #include <sys/dkioc_free_util.h>
 #include <sys/zfs_rlock.h>
 #include <sys/metaslab.h>
+#include <sys/swap.h>
+#include <vm/anon.h>
 
 #include "zfs_namecheck.h"
 
@@ -1329,6 +1331,50 @@ zvol_fail(zvol_state_t *zv, clock_t deadline)
 }
 
 /*
+ * Does the named pool have a volume that failing the pool can't let go of
+ * (see zvol_fail()), or that the system can't do without?  COMSTAR holds
+ * pointers into a volume it uses (ZVOL_EXTERNAL), and dump and swap devices
+ * would get EIO.
+ */
+boolean_t
+zvol_pinned_minors(const char *name)
+{
+	size_t len = strlen(name);
+	major_t major = ddi_driver_major(zfs_dip);
+	boolean_t pinned = B_FALSE;
+
+	mutex_enter(&zfsdev_state_lock);
+	for (minor_t minor = 1; minor <= ZFSDEV_MAX_MINOR && !pinned;
+	    minor++) {
+		zvol_state_t *zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
+
+		if (zv == NULL || zv->zv_total_opens == 0 ||
+		    strncmp(name, zv->zv_name, len) != 0 ||
+		    (zv->zv_name[len] != '/' && zv->zv_name[len] != '@'))
+			continue;
+		if (zv->zv_flags & (ZVOL_EXTERNAL | ZVOL_DUMPIFIED)) {
+			pinned = B_TRUE;
+			break;
+		}
+		dev_t dev = makedevice(major, minor);
+		mutex_enter(&swapinfo_lock);
+		for (struct swapinfo *sip = swapinfo; sip != NULL;
+		    sip = sip->si_next) {
+			vnode_t *vp = sip->si_vp;
+			if ((vp->v_type == VBLK || vp->v_type == VCHR) &&
+			    vp->v_rdev == dev) {
+				pinned = B_TRUE;
+				break;
+			}
+		}
+		mutex_exit(&swapinfo_lock);
+	}
+	mutex_exit(&zfsdev_state_lock);
+
+	return (pinned);
+}
+
+/*
  * If the named pool has failed, fail (see zvol_fail()) its open volumes, and
  * remove the minors of the others.  Returns the number failed.
  */
@@ -2443,7 +2489,8 @@ zvol_get_volume_params(minor_t minor, uint64_t *blksize,
 	 * zv_state_lock keeps it from starting meanwhile.
 	 */
 	mutex_enter(&zv->zv_state_lock);
-	if (zv->zv_flags & (ZVOL_DUMPIFIED | ZVOL_FAILED | ZVOL_FAILING)) {
+	if ((zv->zv_flags & (ZVOL_DUMPIFIED | ZVOL_FAILED | ZVOL_FAILING)) ||
+	    spa_failed(dmu_objset_spa(zv->zv_objset))) {
 		mutex_exit(&zv->zv_state_lock);
 		return (SET_ERROR(ENXIO));
 	}
