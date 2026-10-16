@@ -6119,9 +6119,9 @@ spa_export_sync(spa_t *spa)
  * update the pool state and sync all the labels to disk, removing the
  * configuration from the cache afterwards.
  *
- * If the 'hardforce' flag is set, the pool is armed for forced exit (see
- * spa_exit_arm()): if it is or becomes suspended, it fails, dropping its
- * unsynced changes, and a failed pool doesn't sync its labels.
+ * If the 'hardforce' flag is set, the pool fails (see spa_fail()), whether it
+ * is suspended or healthy: its unsynced changes are dropped, and a failed
+ * pool doesn't sync its labels.
  *
  * If spa_export_skip_update is set (for testing), an export neither updates
  * the labels nor removes the pool from the cache file, leaving the pool on
@@ -6181,18 +6181,19 @@ spa_export_common(char *pool, int new_state, nvlist_t **oldconfig,
 	/*
 	 * A failed pool (see spa_fail()) is exported whatever its state: it
 	 * writes nothing more, so its labels and final txgs are left alone.
-	 * Arming a pool for forced exit makes it fail now if it is suspended,
-	 * or as soon as it suspends while we wait for it below.
+	 * A hardforce export fails the pool, rather than waiting for it to
+	 * sync.
 	 */
 	if (active && hardforce)
-		spa_exit_arm(spa);
+		spa_fail(spa);
 
 	/*
 	 * Objsets may be open only because they're dirty, so we have to force
 	 * it to sync before checking spa_refcnt.  First let the pool sync
 	 * without holding spa_namespace_lock, which would block administration
 	 * of every other pool if this one is slow.  If it is or becomes
-	 * suspended, give up, unless we armed it.  A failed pool drains
+	 * suspended, give up, unless it is armed (see spa_exit_arm()), in
+	 * which case it fails.  A failed pool drains
 	 * without writing anything.
 	 */
 	if (active && !spa_failed(spa)) {
@@ -8953,7 +8954,10 @@ discard:
  * (see spa_vdev_add() for a complete description). If there *are* dirty
  * vdevs, sync the uberblock to all vdevs.
  *
- * Returns B_FALSE if the pool has failed, and the txg was not committed.
+ * Returns B_FALSE if the pool has failed, and the txg was not committed.  A
+ * pool that fails after the txg's uberblocks reached its disks, but before its
+ * odd labels did, has the txg on disk all the same, though we report it as not
+ * committed: its waiters get EIO, which tells them only that it may be lost.
  */
 static boolean_t
 spa_sync_rewrite_vdev_config(spa_t *spa, dmu_tx_t *tx)

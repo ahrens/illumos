@@ -973,7 +973,7 @@ extern boolean_t spa_suspended(spa_t *spa);
 extern boolean_t spa_failed(spa_t *spa);
 extern void spa_fail(spa_t *spa);
 extern void spa_exit_arm(spa_t *spa);
-extern int spa_exit_arm_by_name(const char *name);
+extern int spa_exit_fail_by_name(const char *name);
 extern spa_t *spa_failed_by_name(const char *name);
 extern void spa_exit_init(void);
 extern void spa_exit_fini(void);
