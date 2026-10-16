@@ -2571,6 +2571,8 @@ file \
     path=opt/zfs-tests/tests/functional/failmode/forced_export_read_errors_only \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_recv mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_removal \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_retry mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_send mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol mode=0555

@@ -593,7 +593,8 @@ tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
     'forced_export_idle_lofi', 'failmode_write_errors_probe_ok',
     'failmode_transient_no_errlog', 'forced_export_pinned_sync',
     'forced_export_pinned_zil', 'forced_export_send', 'forced_export_recv',
-    'forced_export_detach', 'forced_export_mount_races']
+    'forced_export_detach', 'forced_export_mount_races',
+    'forced_export_removal']
 tags = ['functional', 'failmode']
 
 [tests/functional/fault]
