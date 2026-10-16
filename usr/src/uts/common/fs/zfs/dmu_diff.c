@@ -22,6 +22,7 @@
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2019, loli10K <ezomori.nozomu@gmail.com>. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dmu.h>
@@ -46,6 +47,7 @@ struct diffarg {
 	offset_t *da_offp;
 	int da_err;			/* error that stopped diff search */
 	dmu_diff_record_t da_ddr;
+	spa_stream_t da_stream;		/* see spa_stream_register() */
 };
 
 static int
@@ -61,6 +63,9 @@ write_record(struct diffarg *da)
 	da->da_err = vn_rdwr(UIO_WRITE, da->da_vp, (caddr_t)&da->da_ddr,
 	    sizeof (da->da_ddr), 0, UIO_SYSSPACE, FAPPEND,
 	    RLIM64_INFINITY, CRED(), &resid);
+	/* An aborted write returns EINTR, or perhaps a short count. */
+	if (spa_stream_cancelled(&da->da_stream))
+		da->da_err = SET_ERROR(EIO);
 	*da->da_offp += sizeof (da->da_ddr);
 	return (da->da_err);
 }
@@ -115,6 +120,8 @@ diff_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 
 	if (issig(JUSTLOOKING) && issig(FORREAL))
 		return (SET_ERROR(EINTR));
+	if (spa_stream_cancelled(&da->da_stream))
+		return (SET_ERROR(EIO));
 
 	if (bp == NULL || zb->zb_object != DMU_META_DNODE_OBJECT)
 		return (0);
@@ -211,6 +218,13 @@ dmu_diff(const char *tosnap_name, const char *fromsnap_name,
 	da.da_err = 0;
 
 	/*
+	 * Writing the records can block for as long as their reader stops
+	 * reading; let the export of a failed pool cancel the diff.
+	 */
+	error = spa_stream_register(dsl_dataset_get_spa(tosnap),
+	    &da.da_stream);
+
+	/*
 	 * Since zfs diff only looks at dnodes which are stored in plaintext
 	 * (other than bonus buffers), we don't technically need to decrypt
 	 * the dataset to perform this operation. However, the command line
@@ -218,9 +232,11 @@ dmu_diff(const char *tosnap_name, const char *fromsnap_name,
 	 * dataset isn't mounted and because it will fail when it attempts to
 	 * call the ZFS_IOC_OBJ_TO_STATS ioctl.
 	 */
-	error = traverse_dataset(tosnap, fromtxg,
-	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA | TRAVERSE_NO_DECRYPT,
-	    diff_cb, &da);
+	if (error == 0) {
+		error = traverse_dataset(tosnap, fromtxg,
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+		    TRAVERSE_NO_DECRYPT, diff_cb, &da);
+	}
 
 	if (error != 0) {
 		da.da_err = error;
@@ -228,6 +244,10 @@ dmu_diff(const char *tosnap_name, const char *fromsnap_name,
 		/* we set the da.da_err we return as side-effect */
 		(void) write_record(&da);
 	}
+
+	spa_stream_unregister(&da.da_stream);
+	if (da.da_err != 0 && spa_stream_cancelled(&da.da_stream))
+		da.da_err = SET_ERROR(EIO);
 
 	dsl_dataset_long_rele(tosnap, FTAG);
 	dsl_dataset_rele(tosnap, FTAG);

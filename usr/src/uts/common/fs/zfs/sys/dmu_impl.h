@@ -26,6 +26,7 @@
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
  * Copyright (c) 2013, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2018 DilOS
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef _SYS_DMU_IMPL_H
@@ -289,6 +290,7 @@ typedef struct dmu_sendarg {
 	uint64_t dsa_resume_offset;
 	boolean_t dsa_sent_begin;
 	boolean_t dsa_sent_end;
+	spa_stream_t dsa_stream;	/* see spa_stream_register() */
 } dmu_sendarg_t;
 
 void dmu_object_zapify(objset_t *, uint64_t, dmu_object_type_t, dmu_tx_t *);

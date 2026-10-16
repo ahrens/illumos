@@ -981,6 +981,22 @@ extern void spa_exit_unload_wait(spa_t *spa);
 struct zbookmark_phys;
 extern void spa_exit_poisoned_read(spa_t *spa,
     const struct zbookmark_phys *zb);
+
+/*
+ * A send, receive or diff in progress on a pool, which the export of a failed
+ * pool cancels (see spa_streams_cancel()).
+ */
+typedef struct spa_stream {
+	list_node_t	ss_node;
+	spa_t		*ss_spa;
+	kthread_t	*ss_thread;	/* reads or writes the stream */
+	boolean_t	ss_cancelled;
+} spa_stream_t;
+
+extern int spa_stream_register(spa_t *spa, spa_stream_t *ss);
+extern void spa_stream_unregister(spa_stream_t *ss);
+extern boolean_t spa_stream_cancelled(spa_stream_t *ss);
+extern void spa_streams_cancel(spa_t *spa);
 extern uint64_t spa_bootfs(spa_t *spa);
 extern uint64_t spa_delegation(spa_t *spa);
 extern objset_t *spa_meta_objset(spa_t *spa);

@@ -22,16 +22,16 @@
 # DESCRIPTION:
 #	A send from a failmode=death pool that fails mid-stream fails with an
 #	error, and the pool exports.  If the reader has stopped, so that the
-#	send is blocked writing to it, "zpool export -f" returns EBUSY once
-#	it has waited 20 seconds for the send to let go of its dataset, and
-#	succeeds once the send is killed.
+#	send is blocked writing to it, "zpool export -f" wakes the send, which
+#	fails rather than being killed, and the pool exports with the reader
+#	still stopped.
 #
 # STRATEGY:
 #	1. Send a snapshot, with a cold cache, to a reader that takes 20MB/s.
 #	2. Fail the pool.  The send exits non-zero; export -f succeeds within
 #	   60 seconds.  Import, scrub, and send the snapshot again.
 #	3. Do it again with the reader stopped (SIGSTOP) before the failure.
-#	   export -f returns EBUSY; kill the send, and export -f succeeds.
+#	   export -f succeeds within 60 seconds, and the send exits 1.
 #
 
 typeset spid=""
@@ -96,13 +96,16 @@ start_send
 log_must pkill -STOP -f "[t]hrottle.py"
 sleep 2
 pin_fail_now
-log_must zinject -c all
-run_within 60 "zpool export -f with the send blocked" zpool export -f $TESTPOOL
-log_must test $within_rc -ne 0
-log_must poolexists $TESTPOOL
+pin_export_failed
+typeset -i t=30
+while [[ ! -s $PIN_DIR/send.rc ]]; do
+	((t-- == 0)) && log_fail "the send is still blocked"
+	sleep 1
+done
+[[ $(cat $PIN_DIR/send.rc) == 1 ]] || log_fail "the send exited" \
+    "$(cat $PIN_DIR/send.rc), not 1"
 log_must pkill -9 -f "[t]hrottle.py"
 wait_send
-pin_export_failed
 pin_reimport
 log_must eval "zfs send $TESTPOOL/$TESTFS@s >/dev/null"
 
