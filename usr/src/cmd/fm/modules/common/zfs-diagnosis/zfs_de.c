@@ -23,6 +23,7 @@
  * Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2019 Joyent, Inc.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <assert.h>
@@ -568,6 +569,7 @@ zfs_fm_recv(fmd_hdl_t *hdl, fmd_event_t *ep, nvlist_t *nvl, const char *class)
 	boolean_t pool_found = B_FALSE;
 	boolean_t isresource;
 	boolean_t is_inactive_spare, islog, iscache;
+	boolean_t pool_failed;
 	nvlist_t *vd_nvl = NULL;
 	char *fru, *type, *vdg;
 	find_cbdata_t cb;
@@ -952,6 +954,18 @@ zfs_fm_recv(fmd_hdl_t *hdl, fmd_event_t *ep, nvlist_t *nvl, const char *class)
 				zfs_case_solve(hdl, zcp,
 				    "fault.fs.zfs.vdev.checksum", B_FALSE);
 			}
+		} else if (fmd_nvl_class_match(hdl, nvl,
+		    ZFS_MAKE_EREPORT(FM_EREPORT_ZFS_IO_FAILURE)) &&
+		    nvlist_lookup_boolean_value(nvl,
+		    FM_EREPORT_PAYLOAD_ZFS_POOL_FAILED, &pool_failed) == 0 &&
+		    pool_failed) {
+			/*
+			 * The pool has failed (see spa_fail()): whatever its
+			 * failmode, it has stopped writing and can only be
+			 * exported.
+			 */
+			zfs_case_solve(hdl, zcp, "fault.fs.zfs.pool_failed",
+			    B_FALSE);
 		} else if (fmd_nvl_class_match(hdl, nvl,
 		    ZFS_MAKE_EREPORT(FM_EREPORT_ZFS_IO_FAILURE)) &&
 		    (nvlist_lookup_string(nvl,

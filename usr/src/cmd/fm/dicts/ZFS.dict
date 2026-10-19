@@ -1,6 +1,7 @@
 #
 # Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
+# Copyright 2026 Oxide Computer Company
 #
 # CDDL HEADER START
 #
@@ -46,3 +47,4 @@ fault.fs.zfs.vdev.checksum=15
 fault.fs.zfs.io_failure_wait=16
 fault.fs.zfs.io_failure_continue=17
 fault.fs.zfs.log_replay=18
+fault.fs.zfs.pool_failed=19

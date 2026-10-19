@@ -4570,12 +4570,25 @@ zio_done_report(zio_t *zio, uint64_t psize, boolean_t failed)
 
 	if (zio->io_error) {
 		/*
+		 * A failed write is retried right away, up to
+		 * zio_reexecute_max times (see below).  Report only its first
+		 * attempt and its last, after which the pool suspends or
+		 * fails: a disk that fails every write would otherwise post a
+		 * set of ereports per retry, and the storm can overflow fmd's
+		 * queue and lose the pool's io_failure ereport.
+		 */
+		boolean_t retry = (lio != NULL &&
+		    lio->io_reexecute_count > 0 &&
+		    lio->io_reexecute_count < zio_reexecute_max);
+
+		/*
 		 * If this I/O is attached to a particular vdev,
 		 * generate an error message describing the I/O failure
 		 * at the block level.  We ignore these errors if the
 		 * device is currently unavailable.
 		 */
-		if (zio->io_error != ECKSUM && vd != NULL && !vdev_is_dead(vd))
+		if (zio->io_error != ECKSUM && vd != NULL &&
+		    !vdev_is_dead(vd) && !retry)
 			(void) zfs_ereport_post(FM_EREPORT_ZFS_IO, spa, vd,
 			    &zio->io_bookmark, zio, 0, 0);
 
@@ -4588,8 +4601,10 @@ zio_done_report(zio_t *zio, uint64_t psize, boolean_t failed)
 			 * the zio will be reexecuted (see below).
 			 */
 			log_error = B_TRUE;
-			(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA, spa, NULL,
-			    &zio->io_bookmark, zio, 0, 0);
+			if (!retry) {
+				(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA,
+				    spa, NULL, &zio->io_bookmark, zio, 0, 0);
+			}
 		}
 	}
 

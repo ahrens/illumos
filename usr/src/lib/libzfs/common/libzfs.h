@@ -367,6 +367,7 @@ typedef enum {
 	ZPOOL_STATUS_IO_FAILURE_CONTINUE, /* failed I/O, failmode 'continue' */
 	ZPOOL_STATUS_IO_FAILURE_MMP,	/* failed MMP, failmode not 'panic' */
 	ZPOOL_STATUS_BAD_LOG,		/* cannot read log chain(s) */
+	ZPOOL_STATUS_FAILED,		/* pool failed (forced exit) */
 	ZPOOL_STATUS_ERRATA,		/* informational errata available */
 
 	/*
@@ -385,7 +386,6 @@ typedef enum {
 	 */
 	ZPOOL_STATUS_FAULTED_DEV_R,	/* faulted device with replicas */
 	ZPOOL_STATUS_FAULTED_DEV_NR,	/* faulted device with no replicas */
-	ZPOOL_STATUS_FAILED,		/* pool failed (forced exit) */
 
 	/*
 	 * The following are not faults per se, but still an error possibly

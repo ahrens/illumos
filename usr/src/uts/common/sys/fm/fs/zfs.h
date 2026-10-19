@@ -54,6 +54,7 @@ extern "C" {
 
 #define	FM_EREPORT_PAYLOAD_ZFS_POOL		"pool"
 #define	FM_EREPORT_PAYLOAD_ZFS_POOL_FAILMODE	"pool_failmode"
+#define	FM_EREPORT_PAYLOAD_ZFS_POOL_FAILED	"pool_failed"
 #define	FM_EREPORT_PAYLOAD_ZFS_POOL_GUID	"pool_guid"
 #define	FM_EREPORT_PAYLOAD_ZFS_POOL_CONTEXT	"pool_context"
 #define	FM_EREPORT_PAYLOAD_ZFS_VDEV_GUID	"vdev_guid"
