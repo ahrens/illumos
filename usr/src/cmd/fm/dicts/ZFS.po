@@ -1,6 +1,7 @@
 #
 # Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
+# Copyright 2026 Oxide Computer Company
 #
 # CDDL HEADER START
 #
@@ -312,4 +313,19 @@ msgid "ZFS-8000-K4.impact"
 msgstr "The intent log(s) cannot be replayed."
 msgid "ZFS-8000-K4.action"
 msgstr "Either restore the affected device(s) and run 'zpool online',\n	    or ignore the intent log records by running 'zpool clear'."
-
+#
+# code: ZFS-8000-LR
+# keys: fault.fs.zfs.pool_failed
+#
+msgid "ZFS-8000-LR.type"
+msgstr "Error"
+msgid "ZFS-8000-LR.severity"
+msgstr "Major"
+msgid "ZFS-8000-LR.description"
+msgstr "The ZFS pool has failed: it can no longer write to its devices.  Refer to %s for more information."
+msgid "ZFS-8000-LR.response"
+msgstr "The pool has stopped writing to its devices, and its unwritten changes have been discarded."
+msgid "ZFS-8000-LR.impact"
+msgstr "Changes that had not been written to the pool are lost.  The pool can only be exported."
+msgid "ZFS-8000-LR.action"
+msgstr "Export the pool, make sure its devices are working, then import it again."

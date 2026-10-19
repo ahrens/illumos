@@ -186,6 +186,17 @@ zfs_ereport_start(nvlist_t **ereport_out, nvlist_t **detector_out,
 		    spa_get_failmode(spa) == ZIO_FAILURE_MODE_DEATH ?
 		    FM_EREPORT_FAILMODE_DEATH : FM_EREPORT_FAILMODE_PANIC,
 		    NULL);
+
+		/*
+		 * A failed pool (see spa_fail()) has stopped writing, whatever
+		 * its failmode; zfs-diagnosis diagnoses its io_failure ereport
+		 * as fault.fs.zfs.pool_failed rather than by the failmode.
+		 */
+		if (spa_failed(spa)) {
+			fm_payload_set(ereport,
+			    FM_EREPORT_PAYLOAD_ZFS_POOL_FAILED,
+			    DATA_TYPE_BOOLEAN_VALUE, B_TRUE, NULL);
+		}
 	}
 
 	if (vd != NULL) {
