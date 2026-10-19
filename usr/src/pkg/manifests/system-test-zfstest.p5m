@@ -2909,6 +2909,7 @@ file path=opt/zfs-tests/tests/functional/removal/removal_with_export mode=0555
 file path=opt/zfs-tests/tests/functional/removal/removal_with_ganging mode=0555
 file path=opt/zfs-tests/tests/functional/removal/removal_with_remap mode=0555
 file path=opt/zfs-tests/tests/functional/removal/removal_with_remove mode=0555
+file path=opt/zfs-tests/tests/functional/removal/removal_with_resilver mode=0555
 file path=opt/zfs-tests/tests/functional/removal/removal_with_scrub mode=0555
 file path=opt/zfs-tests/tests/functional/removal/removal_with_send mode=0555
 file path=opt/zfs-tests/tests/functional/removal/removal_with_send_recv \
