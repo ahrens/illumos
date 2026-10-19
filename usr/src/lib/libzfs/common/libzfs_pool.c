@@ -3636,7 +3636,8 @@ zpool_vdev_remove(zpool_handle_t *zhp, const char *path)
 
 	case EBUSY:
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "Pool busy; removal may already be in progress"));
+		    "Pool busy; removal may already be in progress, "
+		    "or a device is still being resilvered"));
 		(void) zfs_error(hdl, EZFS_BUSY, msg);
 		break;
 
