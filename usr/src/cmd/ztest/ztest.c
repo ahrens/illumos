@@ -3228,6 +3228,24 @@ ztest_split_pool(ztest_ds_t *zd, uint64_t id)
 }
 
 /*
+ * Returns B_TRUE if a leaf of a log device under vd can't be written to, such
+ * as one that ztest_fault_inject() made unwriteable (see ztest_reguid()).
+ */
+static boolean_t
+ztest_log_cant_write(vdev_t *vd)
+{
+	if (vd->vdev_ops->vdev_op_leaf)
+		return (vd->vdev_top->vdev_islog && vdev_is_concrete(vd) &&
+		    !vdev_writeable(vd));
+
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		if (ztest_log_cant_write(vd->vdev_child[c]))
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
  * Returns B_TRUE if ztest_fault_inject() has made a leaf under vd
  * unreadable (vdev_cant_read, or its fd closed behind its back).  Such a
  * fault persists until the vdev is reopened.
@@ -6192,12 +6210,33 @@ ztest_reguid(ztest_ds_t *zd, uint64_t id)
 	if (ztest_opts.zo_mmp_test)
 		return;
 
+	/*
+	 * The new guid reaches the disks in the labels, which aren't written
+	 * to a leaf that can't be written to.  If none of a top-level vdev's
+	 * leaves get the new label, the pool suspends until ztest_resume()
+	 * clears the fault and the labels are written again, except for a log
+	 * device, whose labels are allowed to fail (see
+	 * vdev_label_sync_list()).  A log device that ztest_fault_inject()
+	 * made unwriteable keeps the old guid, and the pool can't be imported
+	 * again without dropping it.  Hold ztest_vdev_lock until the new guid
+	 * has synced, so that no fault is injected in the meantime.
+	 */
+	mutex_enter(&ztest_vdev_lock);
+	spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+	boolean_t log_cant_write = ztest_log_cant_write(spa->spa_root_vdev);
+	spa_config_exit(spa, SCL_STATE, FTAG);
+	if (log_cant_write) {
+		mutex_exit(&ztest_vdev_lock);
+		return;
+	}
+
 	orig = spa_guid(spa);
 	load = spa_load_guid(spa);
 
 	rw_enter(&ztest_name_lock, RW_WRITER);
 	error = spa_change_guid(spa);
 	rw_exit(&ztest_name_lock);
+	mutex_exit(&ztest_vdev_lock);
 
 	if (error != 0)
 		return;
