@@ -3277,6 +3277,25 @@ ztest_vdev_has_injected_fault(vdev_t *vd)
 }
 
 /*
+ * Returns B_TRUE if ztest_fault_inject() has made a leaf under vd that can
+ * still be read unwriteable (vdev_cant_write).  The kernel doesn't leave a
+ * disk in that state: a failed write probe faults it (see vdev_probe_done()
+ * and spa_async_probe()), so it is no longer read.
+ */
+static boolean_t
+ztest_vdev_readable_cant_write(vdev_t *vd)
+{
+	if (vd->vdev_ops->vdev_op_leaf)
+		return (vd->vdev_cant_write && vdev_readable(vd));
+
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		if (ztest_vdev_readable_cant_write(vd->vdev_child[c]))
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
  * Verify that we can attach and detach devices.
  */
 /* ARGSUSED */
@@ -3533,7 +3552,21 @@ ztest_device_removal(ztest_ds_t *zd, uint64_t id)
 	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
 	vd = vdev_lookup_top(spa, ztest_random_vdev_top(spa, B_FALSE));
 	guid = vd->vdev_guid;
+
+	/*
+	 * A child that ztest_fault_inject() made unwriteable is missing the
+	 * writes that failed on it, but vdev_resilver_needed() doesn't count
+	 * it, so the removal is allowed and the copy may read it.  The kernel
+	 * would have faulted such a child.  ztest_vdev_lock keeps
+	 * ztest_fault_inject() from making one until the removal has started,
+	 * after which nothing more is allocated on vd.
+	 */
+	boolean_t cant_write = ztest_vdev_readable_cant_write(vd);
 	spa_config_exit(spa, SCL_VDEV, FTAG);
+	if (cant_write) {
+		mutex_exit(&ztest_vdev_lock);
+		return;
+	}
 
 	error = spa_vdev_remove(spa, guid, B_FALSE);
 	if (error == 0) {
