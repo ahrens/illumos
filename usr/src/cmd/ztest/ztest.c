@@ -6285,8 +6285,7 @@ ztest_run_zdb(char *pool)
 	FILE *fp;
 
 	(void) snprintf(zdb, sizeof (zdb),
-	    "/usr/sbin/zdb -bcc%s%s -G -d -U %s "
-	    "-o zfs_reconstruct_indirect_combinations_max=65536 %s",
+	    "/usr/sbin/zdb -bcc%s%s -G -d -Y -U %s %s",
 	    ztest_opts.zo_verbose >= 3 ? "s" : "",
 	    ztest_opts.zo_verbose >= 4 ? "v" : "",
 	    spa_config_path,

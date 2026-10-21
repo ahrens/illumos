@@ -99,6 +99,8 @@ extern int zfs_vdev_async_read_max_active;
 extern int aok;
 extern boolean_t spa_load_verify_dryrun;
 extern int zfs_btree_verify_intensity;
+extern int zfs_reconstruct_indirect_combinations_max;
+extern int zfs_deadman_enabled;
 
 static const char cmdname[] = "zdb";
 uint8_t dump_opt[256];
@@ -133,7 +135,7 @@ static void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "Usage:\t%s [-AbcdDFGhikLMPsvX] [-e [-V] [-p <path> ...]] "
+	    "Usage:\t%s [-AbcdDFGhikLMPsvXY] [-e [-V] [-p <path> ...]] "
 	    "[-I <inflight I/Os>]\n"
 	    "\t\t[-o <var>=<value>]... [-t <txg>] [-U <cache>] [-x <dumpdir>]\n"
 	    "\t\t[<poolname> [<object> ...]]\n"
@@ -211,7 +213,9 @@ usage(void)
 	(void) fprintf(stderr, "        -x <dumpdir> -- "
 	    "dump all read blocks into specified directory\n");
 	(void) fprintf(stderr, "        -X attempt extreme rewind (does not "
-	    "work with dataset)\n\n");
+	    "work with dataset)\n");
+	(void) fprintf(stderr, "        -Y attempt all reconstruction "
+	    "combinations for split blocks\n\n");
 	(void) fprintf(stderr, "Specify an option more than once (e.g. -bb) "
 	    "to make only that option verbose\n");
 	(void) fprintf(stderr, "Default is to dump everything non-verbosely\n");
@@ -6292,7 +6296,7 @@ main(int argc, char **argv)
 	zfs_btree_verify_intensity = 3;
 
 	while ((c = getopt(argc, argv,
-	    "AbcCdDeEFGhiI:klLmMo:Op:PqRsSt:uU:vVx:X")) != -1) {
+	    "AbcCdDeEFGhiI:klLmMo:Op:PqRsSt:uU:vVx:XY")) != -1) {
 		switch (c) {
 		case 'b':
 		case 'c':
@@ -6323,6 +6327,10 @@ main(int argc, char **argv)
 		case 'q':
 		case 'X':
 			dump_opt[c]++;
+			break;
+		case 'Y':
+			zfs_reconstruct_indirect_combinations_max = INT_MAX;
+			zfs_deadman_enabled = 0;
 			break;
 		/* NB: Sort single match options below. */
 		case 'I':
