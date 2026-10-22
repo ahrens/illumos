@@ -212,6 +212,7 @@ extern boolean_t zfs_abd_scatter_enabled;
 extern int dmu_object_alloc_chunk_shift;
 extern boolean_t zfs_force_some_double_word_sm_entries;
 extern unsigned long zfs_reconstruct_indirect_damage_fraction;
+extern int zfs_reconstruct_indirect_combinations_max;
 
 static ztest_shared_opts_t *ztest_shared_opts;
 static ztest_shared_opts_t ztest_opts;
@@ -7526,6 +7527,16 @@ main(int argc, char **argv)
 	 * when reconstruction is known to be possible.
 	 */
 	zfs_reconstruct_indirect_damage_fraction = 4;
+
+	/*
+	 * ztest_scrub() fails if a scrub leaves any permanent errors.  After
+	 * a device removal, ztest_fault_inject() can damage one copy of so
+	 * many segments of a split block that the default number of attempts
+	 * is too few to find the good copies: n damaged segments give 2^n
+	 * combinations.  Try every combination for up to 20 damaged
+	 * segments, which takes about a minute and a half per block.
+	 */
+	zfs_reconstruct_indirect_combinations_max = 1 << 20;
 
 	ztest_fd_rand = open("/dev/urandom", O_RDONLY);
 	ASSERT3S(ztest_fd_rand, >=, 0);
