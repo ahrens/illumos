@@ -349,6 +349,7 @@ zfs-tests/cmd/mkbusy/mkbusy
 zfs-tests/cmd/mkfiles/mkfiles
 zfs-tests/cmd/mkholes/mkholes
 zfs-tests/cmd/mktree/mktree
+zfs-tests/cmd/mmap_dirty/mmap_dirty
 zfs-tests/cmd/mmapwrite/mmapwrite
 zfs-tests/cmd/randfree_file/randfree_file
 zfs-tests/cmd/randwritecomp/randwritecomp

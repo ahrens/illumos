@@ -4943,12 +4943,25 @@ zfs_inactive(vnode_t *vp, cred_t *cr, caller_context_t *ct)
 	}
 
 	/*
-	 * Attempt to push any data in the page cache.  If this fails
-	 * we will get kicked out later in zfs_zinactive().
+	 * Push any data in the page cache.  Nothing has the file open or
+	 * mapped any more, so if a page can't be written (say the file's
+	 * owner is over quota), there is nobody left to tell, or to try
+	 * again.  Throw such pages away, as a forced unmount does: otherwise
+	 * zfs_zinactive() would leave the znode with no holds, keeping the
+	 * file system busy until a forced unmount, where zfsvfs_teardown()
+	 * asserts that the znode is held.
 	 */
 	if (vn_has_cached_data(vp)) {
-		(void) pvn_vplist_dirty(vp, 0, zfs_putapage, B_INVAL|B_ASYNC,
+		error = pvn_vplist_dirty(vp, 0, zfs_putapage, B_INVAL|B_ASYNC,
 		    cr);
+		if (vn_has_cached_data(vp)) {
+			zfs_dbgmsg("zfs_inactive: dropping the pages of object "
+			    "%llu of objset %llu that couldn't be written "
+			    "(error %d)", (u_longlong_t)zp->z_id,
+			    (u_longlong_t)dmu_objset_id(zfsvfs->z_os), error);
+			(void) pvn_vplist_dirty(vp, 0, zfs_null_putapage,
+			    B_INVAL, cr);
+		}
 	}
 
 	if (zp->z_atime_dirty && zp->z_unlinked == 0) {

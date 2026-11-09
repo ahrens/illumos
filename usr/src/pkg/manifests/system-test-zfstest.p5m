@@ -46,6 +46,7 @@ file path=opt/zfs-tests/bin/mkbusy mode=0555
 file path=opt/zfs-tests/bin/mkfiles mode=0555
 file path=opt/zfs-tests/bin/mkholes mode=0555
 file path=opt/zfs-tests/bin/mktree mode=0555
+file path=opt/zfs-tests/bin/mmap_dirty mode=0555
 file path=opt/zfs-tests/bin/mmapwrite mode=0555
 file path=opt/zfs-tests/bin/randfree_file mode=0555
 file path=opt/zfs-tests/bin/randwritecomp mode=0555
@@ -2675,6 +2676,7 @@ file path=opt/zfs-tests/tests/functional/migration/setup mode=0555
 dir  path=opt/zfs-tests/tests/functional/mmap
 file path=opt/zfs-tests/tests/functional/mmap/cleanup mode=0555
 file path=opt/zfs-tests/tests/functional/mmap/mmap_read_001_pos mode=0555
+file path=opt/zfs-tests/tests/functional/mmap/mmap_unwritable_pages mode=0555
 file path=opt/zfs-tests/tests/functional/mmap/mmap_write_001_pos mode=0555
 file path=opt/zfs-tests/tests/functional/mmap/setup mode=0555
 dir  path=opt/zfs-tests/tests/functional/mmp
