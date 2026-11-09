@@ -3087,21 +3087,32 @@ function sha256digest
 }
 
 #
-# Return 0 if the given pool is suspended.  The status message ID is used
-# because 'zpool list -o health' does not report suspension.
+# Print the value of a field of the given pool's spa_t.  This asks the kernel
+# rather than "zpool status", which needs spa_namespace_lock: some tests park
+# a thread that holds that lock on a suspended pool.
 #
-function is_pool_suspended #pool
+function pool_spa_field # pool field
 {
-	#
-	# Read spa_suspended from the kernel rather than asking zpool status,
-	# which needs the spa_namespace_lock: some tests park a thread that
-	# holds that lock on the suspended pool.
-	#
-	echo "::walk spa | ::print spa_t spa_name spa_suspended" | \
-	    mdb -k 2>/dev/null | awk -v p="\"$1\"" '
-	    $1 == "spa_name" { cur = $4 }
-	    $1 == "spa_suspended" && cur == p && $3 != "0" { found = 1 }
-	    END { exit !found }'
+	print -r -- "::walk spa | ::printf \"%s %d\\n\" spa_t spa_name $2" |
+	    mdb -k 2>/dev/null | nawk -v pool=$1 '$1 == pool { print $2 }'
+}
+
+#
+# Return 0 if the given pool is suspended.
+#
+function pool_is_suspended # pool
+{
+	typeset susp=$(pool_spa_field $1 spa_suspended)
+	[[ -n $susp && $susp != 0 ]]
+}
+
+#
+# Return 0 if the given pool has failed (spa_exit is SPA_EXIT_FAILED; see
+# spa_fail() in the kernel).  A failed pool is not suspended.
+#
+function pool_has_failed # pool
+{
+	[[ $(pool_spa_field $1 spa_exit) == 2 ]]
 }
 
 #
@@ -3163,7 +3174,7 @@ function wait_pool_suspended
 	typeset -i tries=${2:-30}
 
 	log_note "waiting for pool ${pool} to suspend"
-	until is_pool_suspended $pool; do
+	until pool_is_suspended $pool; do
 		if ((tries-- == 0)); then
 			log_note "UNEXPECTED -- pool ${pool} did not suspend"
 			return 1

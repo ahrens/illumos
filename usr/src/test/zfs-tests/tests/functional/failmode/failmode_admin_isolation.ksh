@@ -42,29 +42,6 @@ function cleanup
 	failmode_cleanup
 }
 
-#
-# Run a command in the background and fail the test if it hasn't finished
-# within 30 seconds. Sets "bounded_rc" to the command's exit status.
-#
-function run_bounded # description command...
-{
-	typeset desc=$1
-	shift
-
-	"$@" >/dev/null 2>&1 &
-	typeset -i pid=$!
-	typeset -i tries=30
-	while kill -0 $pid 2>/dev/null; do
-		if ((tries-- == 0)); then
-			log_fail "$desc did not finish within 30s"
-		fi
-		sleep 1
-	done
-	wait $pid
-	bounded_rc=$?
-	log_note "$desc returned $bounded_rc"
-}
-
 log_assert "A suspended pool does not block administration of other pools"
 log_onexit cleanup
 
@@ -101,29 +78,29 @@ until pool_is_suspended $TESTPOOL; do
 done
 
 # Commands on the suspended pool return instead of hanging.
-run_bounded "zpool status of the suspended pool" zpool status $TESTPOOL
-run_bounded "zpool list of the suspended pool" zpool list $TESTPOOL
-run_bounded "zpool export of the suspended pool" zpool export $TESTPOOL
-log_must test $bounded_rc -ne 0
+run_within 30 "zpool status of the suspended pool" zpool status $TESTPOOL
+run_within 30 "zpool list of the suspended pool" zpool list $TESTPOOL
+run_within 30 "zpool export of the suspended pool" zpool export $TESTPOOL
+log_must test $within_rc -ne 0
 log_must poolexists $TESTPOOL
 
 # Administration of the other pool still works.
-run_bounded "zpool list" zpool list
-run_bounded "zpool status of another pool" zpool status $TESTPOOL1
-log_must test $bounded_rc -eq 0
-run_bounded "zpool get of another pool" zpool get all $TESTPOOL1
-log_must test $bounded_rc -eq 0
-run_bounded "zfs create in another pool" zfs create $TESTPOOL1/new
-log_must test $bounded_rc -eq 0
-run_bounded "zfs snapshot in another pool" zfs snapshot $TESTPOOL1/new@snap
-log_must test $bounded_rc -eq 0
-run_bounded "zfs destroy in another pool" zfs destroy -r $TESTPOOL1/new
-log_must test $bounded_rc -eq 0
-run_bounded "zpool export of another pool" zpool export $TESTPOOL1
-log_must test $bounded_rc -eq 0
-run_bounded "zpool import of another pool" \
+run_within 30 "zpool list" zpool list
+run_within 30 "zpool status of another pool" zpool status $TESTPOOL1
+log_must test $within_rc -eq 0
+run_within 30 "zpool get of another pool" zpool get all $TESTPOOL1
+log_must test $within_rc -eq 0
+run_within 30 "zfs create in another pool" zfs create $TESTPOOL1/new
+log_must test $within_rc -eq 0
+run_within 30 "zfs snapshot in another pool" zfs snapshot $TESTPOOL1/new@snap
+log_must test $within_rc -eq 0
+run_within 30 "zfs destroy in another pool" zfs destroy -r $TESTPOOL1/new
+log_must test $within_rc -eq 0
+run_within 30 "zpool export of another pool" zpool export $TESTPOOL1
+log_must test $within_rc -eq 0
+run_within 30 "zpool import of another pool" \
     zpool import -d $OTHER_DIR $TESTPOOL1
-log_must test $bounded_rc -eq 0
+log_must test $within_rc -eq 0
 
 failmode_resume_pool
 log_must wait $dirty_pid

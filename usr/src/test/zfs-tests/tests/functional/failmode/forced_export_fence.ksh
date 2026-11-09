@@ -92,14 +92,14 @@ function fence_case # vdev...
 	#
 	log_must zinject -c all
 	sleep 2
-	d1=$(for vdev in "$@"; do vdev_digest $vdev; done)
+	d1=$(for vdev in "$@"; do sha256digest $vdev; done)
 
 	run_within 60 "zpool export -F of the suspended pool" \
 	    zpool export -F $TESTPOOL
 	log_must test $within_rc -eq 0
 	log_mustnot poolexists $TESTPOOL
 
-	d2=$(for vdev in "$@"; do vdev_digest $vdev; done)
+	d2=$(for vdev in "$@"; do sha256digest $vdev; done)
 	[[ $d1 == $d2 ]] || log_fail "the failed pool wrote to its disks"
 
 	# Everything that was waiting on the pool has returned.

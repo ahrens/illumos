@@ -96,7 +96,7 @@ reguid_pid=$!
 # itself in trouble. We need to wait longer due to slowdown injections
 # are still active.
 sleep 20
-log_must is_pool_suspended $TESTPOOL
+log_must pool_is_suspended $TESTPOOL
 
 # Check our assumption of where the zpool reguid is.
 log_must pid_stack_has $reguid_pid txg_wait_synced

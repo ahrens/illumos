@@ -16,18 +16,6 @@
 . $STF_SUITE/tests/functional/cli_root/zpool_export/zpool_export.cfg
 
 #
-# Has the pool failed (see spa_fail() in the kernel)?  Ask the kernel, as
-# failmode/failmode.kshlib does.
-#
-function pool_has_failed # pool
-{
-	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_exit'
-	typeset state=$(print -r -- "::walk spa | $fmt" | mdb -k |
-	    nawk -v pool=$1 '$1 == pool { print $2 }')
-	[[ $state == 2 ]]
-}
-
-#
 # For cleanup: a failed pool can't be destroyed, since it can't write the
 # labels that would mark it destroyed, so export it and clear its disks'
 # labels instead.

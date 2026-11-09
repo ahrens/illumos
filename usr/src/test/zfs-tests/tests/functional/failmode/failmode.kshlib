@@ -33,19 +33,6 @@ function failmode_create_pool # failmode
 	log_must zfs create -o recordsize=128k $TESTPOOL/$TESTFS
 }
 
-#
-# Is the pool suspended?  This asks the kernel rather than "zpool status",
-# which needs spa_namespace_lock, and a command sleeping on the suspended pool
-# may hold that.
-#
-function pool_is_suspended # pool
-{
-	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_suspended'
-	typeset susp=$(print -r -- "::walk spa | $fmt" | mdb -k |
-	    nawk -v pool=$1 '$1 == pool { print $2 }')
-	[[ -n $susp && $susp != 0 ]]
-}
-
 function failmode_suspend_pool
 {
 	log_must zinject -d $FAILMODE_VDEV -e io -T write $TESTPOOL
@@ -54,26 +41,7 @@ function failmode_suspend_pool
 	# Dirty some data, so that the next txg sync has to write something.
 	log_must dd if=/dev/urandom of=/$TESTPOOL/$TESTFS/dirty bs=128k count=8
 
-	log_note "waiting for pool to suspend"
-	typeset -i tries=30
-	until pool_is_suspended $TESTPOOL; do
-		if ((tries-- == 0)); then
-			log_fail "pool didn't suspend"
-		fi
-		sleep 1
-	done
-}
-
-#
-# Has the pool failed (see spa_fail() in the kernel)?  A failed pool is not
-# suspended, so zpool status can't tell yet; ask the kernel.
-#
-function pool_has_failed # pool
-{
-	typeset fmt='::printf "%s %d\n" spa_t spa_name spa_exit'
-	typeset state=$(print -r -- "::walk spa | $fmt" | mdb -k |
-	    nawk -v pool=$1 '$1 == pool { print $2 }')
-	[[ $state == 2 ]]
+	wait_pool_suspended $TESTPOOL || log_fail "pool didn't suspend"
 }
 
 #
@@ -108,22 +76,7 @@ function failmode_wait_stopped # pool failmode
 		failmode_wait_failed $1
 		return
 	fi
-	log_note "waiting for $1 to suspend"
-	typeset -i tries=30
-	until pool_is_suspended $1; do
-		if ((tries-- == 0)); then
-			log_fail "$1 didn't suspend"
-		fi
-		sleep 1
-	done
-}
-
-#
-# Checksum of a vdev file, to tell whether anything was written to it.
-#
-function vdev_digest # file
-{
-	digest -a sha256 $1
+	wait_pool_suspended $1 || log_fail "$1 didn't suspend"
 }
 
 #
@@ -310,14 +263,8 @@ function failmode_sync_test
 	if [[ $failmode = "death" ]]; then
 		failmode_wait_failed $TESTPOOL
 	else
-		log_note "waiting for pool to suspend"
-		typeset -i tries=10
-		until pool_is_suspended $TESTPOOL; do
-			if ((tries-- == 0)); then
-				log_fail "pool didn't suspend"
-			fi
-			sleep 1
-		done
+		wait_pool_suspended $TESTPOOL 10 ||
+		    log_fail "pool didn't suspend"
 	fi
 
 	# give the sync op a moment to notice the suspend and return

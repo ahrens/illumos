@@ -85,7 +85,7 @@ log_must pool_has_failed $TESTPOOL
 
 # Let any writes that were already in flight when it failed land.
 sleep 2
-typeset d1=$(vdev_digest $FAILMODE_VDEV)
+typeset d1=$(sha256digest $FAILMODE_VDEV)
 
 # Writes, syncs and administration of the failed pool return.
 run_within 30 "write to the failed pool" \
@@ -112,7 +112,7 @@ log_must test $within_rc -eq 0
 
 # Nothing reached the failed pool's disk, even after more txgs.
 sleep 10
-typeset d2=$(vdev_digest $FAILMODE_VDEV)
+typeset d2=$(sha256digest $FAILMODE_VDEV)
 [[ $d1 == $d2 ]] || log_fail "the failed pool wrote to its disk"
 
 #
@@ -123,7 +123,7 @@ log_must zinject -c all
 run_within 60 "zpool export of the failed pool" zpool export $TESTPOOL
 log_must test $within_rc -eq 0
 log_mustnot poolexists $TESTPOOL
-typeset d3=$(vdev_digest $FAILMODE_VDEV)
+typeset d3=$(sha256digest $FAILMODE_VDEV)
 [[ $d1 == $d3 ]] || log_fail "exporting the failed pool wrote to its disk"
 
 # The disk holds the pool as of the last txg that synced.
