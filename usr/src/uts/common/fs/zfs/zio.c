@@ -3669,16 +3669,6 @@ zio_vdev_io_start(zio_t *zio)
 		if (zio->io_type == ZIO_TYPE_READ && vdev_cache_read(zio))
 			return (zio);
 
-		if (zio_handle_device_injection(vd, zio, ENOSYS) != 0) {
-			/*
-			 * "no-op" injections return success, but do no actual
-			 * work. Just skip the remaining vdev stages.
-			 */
-			zio_vdev_io_bypass(zio);
-			zio_interrupt(zio);
-			return (NULL);
-		}
-
 		if ((zio = vdev_queue_io(zio)) == NULL)
 			return (NULL);
 
@@ -3688,6 +3678,15 @@ zio_vdev_io_start(zio_t *zio)
 			return (NULL);
 		}
 		zio->io_delay = gethrtime();
+
+		if (zio_handle_device_injection(vd, zio, ENOSYS) != 0) {
+			/*
+			 * "no-op" injections return success, but do no actual
+			 * work. Just return it.
+			 */
+			zio_delay_interrupt(zio);
+			return (NULL);
+		}
 	}
 
 	vd->vdev_ops->vdev_op_io_start(zio);
