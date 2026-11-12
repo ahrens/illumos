@@ -241,7 +241,8 @@ usage(void)
 	    "\t\tlabel.  Label injection can either be 'nvlist', 'uber',\n "
 	    "\t\t'pad1', or 'pad2'.\n"
 	    "\t\t'errno' can be 'nxio' (the default), 'io', 'dtl',\n"
-	    "\t\t'corrupt' (bit flip), or 'noop' (successfully do nothing).\n"
+	    "\t\t'corrupt' (bit flip), 'io-prefail' (unsuccessfully do\n"
+	    "\t\tnothing) or 'noop' (successfully do nothing).\n"
 	    "\t\t'frequency' is a value between 0.0001 and 100.0 that limits\n"
 	    "\t\tdevice error injection to a percentage of the IOs.\n"
 	    "\n"
@@ -923,6 +924,8 @@ main(int argc, char **argv)
 				error = EILSEQ;
 			} else if (strcasecmp(optarg, "noop") == 0) {
 				error = ENOSYS;
+			} else if (strcasecmp(optarg, "io-prefail") == 0) {
+				error = EFAULT;
 			} else {
 				(void) fprintf(stderr, "invalid error type "
 				    "'%s': must be 'io', 'checksum' or "
