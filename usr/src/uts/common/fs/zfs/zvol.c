@@ -324,6 +324,10 @@ typedef struct zvol_dva_map {
 	uint64_t	zdm_ndvas;
 } zvol_dva_map_t;
 
+/*
+ * traverse_dataset() callback: fail with EOVERFLOW at the first gang block,
+ * and record each block's DVA in the zvol_dva_map_t, if arg isn't NULL.
+ */
 /*ARGSUSED*/
 static int
 zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
@@ -340,6 +344,8 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	/* Abort immediately if we have encountered gang blocks */
 	if (BP_IS_GANG(bp))
 		return (SET_ERROR(EOVERFLOW));
+	if (zdm == NULL)
+		return (0);
 
 	VERIFY3U(zb->zb_blkid, <, zdm->zdm_ndvas);
 	zdm->zdm_dvas[zb->zb_blkid] = bp->blk_dva[0];
@@ -405,23 +411,6 @@ zvol_get_dvas(zvol_state_t *zv)
 	mutex_enter(&zv->zv_state_lock);
 	if (err != 0) {
 		kmem_free(zdm.zdm_dvas, zdm.zdm_ndvas * sizeof (dva_t));
-		if (err == EOVERFLOW) {
-			zfs_dbgmsg("zv %p, encountered gang blocks, "
-			    "blocksize = %llu", zv, zv->zv_volblocksize);
-			zv->zv_flags &= ~ZVOL_PREALLOCED;
-			mutex_exit(&zv->zv_state_lock);
-			(void) dmu_free_long_range(os, ZVOL_OBJ, 0,
-			    DMU_OBJECT_END);
-			txg_wait_synced(dmu_objset_pool(os), 0);
-			mutex_enter(&zv->zv_state_lock);
-			/*
-			 * If we still see gang blocks and we're at our
-			 * minimum block size then stop trying and return
-			 * back an error the user.
-			 */
-			if (zv->zv_volblocksize == zv->zv_min_volblocksize)
-				err = EFRAGS;
-		}
 		return (err);
 	}
 
@@ -874,28 +863,26 @@ zvol_get_initialized_offset(objset_t *os)
 }
 
 static uint64_t
-zvol_raw_max_blocksize(zvol_state_t *zv)
+zvol_raw_max_blocksize(zvol_state_t *zv, uint64_t max_bs)
 {
 	spa_t *spa = dmu_objset_spa(zv->zv_objset);
 
-	uint64_t blocksize = metaslab_class_find_blocksize(
-	    spa_normal_class(spa), zv->zv_volsize);
+	uint64_t blocksize = MIN(max_bs, metaslab_class_find_blocksize(
+	    spa_normal_class(spa), zv->zv_volsize));
 
-	if (zv->zv_zero_error == EOVERFLOW) {
-		if (zv->zv_volblocksize > zv->zv_min_volblocksize) {
-			blocksize = MIN(blocksize, zv->zv_volblocksize >> 1);
-		} else {
-			blocksize = zv->zv_min_volblocksize;
-		}
-		zfs_dbgmsg("zv %p, current blocksize %llu, trying "
-		    "blocksize %llu", zv, zv->zv_volblocksize, blocksize);
-	}
-	VERIFY3U(blocksize, >=, zv->zv_min_volblocksize);
-	return (blocksize);
+	/*
+	 * The estimate can be smaller than the minimum when the pool has
+	 * less free space than the volume needs (e.g. after running out).
+	 */
+	return (MAX(blocksize, zv->zv_min_volblocksize));
 }
 
+/*
+ * Allocate and zero the volume.  For a raw zvol starting from the beginning,
+ * choose the block size, at most max_bs.
+ */
 static int
-zvol_zero(zvol_state_t *zv)
+zvol_zero(zvol_state_t *zv, uint64_t max_bs)
 {
 	objset_t *os = zv->zv_objset;
 	dmu_tx_t *tx;
@@ -927,7 +914,7 @@ zvol_zero(zvol_state_t *zv)
 		 * to maximize allocation size while avoiding fragmentation.
 		 */
 		if (zv->zv_zero_off == 0 && !(zv->zv_flags & ZVOL_DUMPIFIED)) {
-			blocksize = zvol_raw_max_blocksize(zv);
+			blocksize = zvol_raw_max_blocksize(zv, max_bs);
 		}
 		uint64_t bytes = MIN(resid, blocksize);
 
@@ -973,7 +960,7 @@ zvol_zero(zvol_state_t *zv)
 		txg_wait_synced(dmu_objset_pool(os), 0);
 		mutex_enter(&zv->zv_state_lock);
 
-		if (zv->zv_zero_exit_wanted) {
+		if (error == 0 && zv->zv_zero_exit_wanted) {
 			zfs_dbgmsg("zvol_zero shutting down: zv %p, flags %d, "
 			    "resid %llu, off %llu, bytes_zeroed %llu", zv,
 			    zv->zv_flags, resid, zv->zv_zero_off, bytes_zeroed);
@@ -981,9 +968,9 @@ zvol_zero(zvol_state_t *zv)
 		}
 	} else if (error == 0 && resid != 0) {
 		/*
-		 * Asked to stop before zeroing anything.  zvol_get_dvas()
+		 * Asked to stop before zeroing anything.  zvol_zero_retry()
 		 * drops zv_state_lock, so this can happen when it starts
-		 * the initialization over after finding gang blocks.
+		 * the initialization over.
 		 */
 		ASSERT(zv->zv_zero_exit_wanted);
 		zfs_dbgmsg("zvol_zero shutting down: zv %p, flags %d, "
@@ -1004,10 +991,64 @@ zvol_zero(zvol_state_t *zv)
 	return (error);
 }
 
+/*
+ * Initialization found gang blocks (EOVERFLOW), or ran out of space.  Free
+ * what it wrote, then return EOVERFLOW to start over with blocks of at most
+ * *max_bsp, or an error to give up.  Called by the zero thread with
+ * zv_state_lock held; see zvol_get_dvas() for why the lock is dropped while
+ * waiting for a txg.
+ *
+ * Gang blocks use more space than the data they hold, and zvol_get_dvas()
+ * only finds them once the whole volume is written, so running out of space
+ * may also mean that the block size is too large.  Retry after running out
+ * of space only if some of what was written is gang blocks; otherwise smaller
+ * blocks wouldn't help.  Give up at the minimum block size, or if the attempt
+ * failed before it could switch to a smaller one.  The space isn't kept for a
+ * later attempt to resume.
+ */
+static int
+zvol_zero_retry(zvol_state_t *zv, int error, uint64_t *max_bsp)
+{
+	objset_t *os = zv->zv_objset;
+	uint64_t blocksize = zv->zv_volblocksize;
+	boolean_t retry = (blocksize != zv->zv_min_volblocksize &&
+	    blocksize <= *max_bsp);
+	int gang_err = 0;
+	int err;
+
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	zv->zv_flags &= ~ZVOL_PREALLOCED;
+	mutex_exit(&zv->zv_state_lock);
+
+	if (error != EOVERFLOW && retry) {
+		/* zvol_zero() waited for what it wrote to be synced */
+		gang_err = traverse_dataset(dmu_objset_ds(os), 0,
+		    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA, zvol_map_block,
+		    NULL);
+		retry = (gang_err == EOVERFLOW);
+	}
+	zfs_dbgmsg("zv %p, %s, blocksize = %llu, gang search %d, retry %d",
+	    zv, error == EOVERFLOW ? "encountered gang blocks" :
+	    "out of space", blocksize, gang_err, retry);
+
+	err = dmu_free_long_range(os, ZVOL_OBJ, 0, DMU_OBJECT_END);
+	txg_wait_synced(dmu_objset_pool(os), 0);
+	mutex_enter(&zv->zv_state_lock);
+	if (err != 0)
+		return (err);
+	zv->zv_zero_off = 0;	/* for DKIOCRAWVOLSTATUS */
+
+	if (!retry)
+		return (error == EOVERFLOW ? SET_ERROR(EFRAGS) : error);
+	*max_bsp = blocksize >> 1;
+	return (SET_ERROR(EOVERFLOW));
+}
+
 static void
 zvol_zero_thread(void *arg)
 {
 	zvol_state_t *zv = arg;
+	uint64_t max_bs = SPA_MAXBLOCKSIZE;
 	int error = 0;
 
 	mutex_enter(&zv->zv_state_lock);
@@ -1020,9 +1061,12 @@ zvol_zero_thread(void *arg)
 	cv_broadcast(&zv->zv_state_cv);
 
 	do {
-		error = zvol_zero(zv);
+		error = zvol_zero(zv, max_bs);
 		if (error == 0)
 			error = zvol_get_dvas(zv);
+		if (error == EOVERFLOW || ((error == EDQUOT ||
+		    error == ENOSPC) && !(zv->zv_flags & ZVOL_DUMPIFIED)))
+			error = zvol_zero_retry(zv, error, &max_bs);
 
 		zfs_dbgmsg("zvol_zero done: zv %p, flags %d, opens %u, err %d",
 		    zv, zv->zv_flags, zv->zv_total_opens, error);
