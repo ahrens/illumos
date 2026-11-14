@@ -2613,26 +2613,26 @@ zfs_resume_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 	VERIFY3P(ds->ds_owner, ==, zfsvfs);
 	VERIFY(dsl_dataset_long_held(ds));
 	err = dmu_objset_from_ds(ds, &os);
+	if (err == 0)
+		err = zfsvfs_init(zfsvfs, os);
+	if (err == 0)
+		err = zfsvfs_setup(zfsvfs, B_FALSE);
 	if (err != 0) {
 		/*
-		 * We can't read the objset back: a failed pool can't read
-		 * the one that a receive has just swapped in.  Give the file
-		 * system up: release the dataset, and leave it with no
-		 * objset, so that its vops fail with EIO (ZFS_ENTER()), and
-		 * teardown and zfs_umount() skip the objset when we force
-		 * the unmount below.
+		 * We can't read the objset back: a failed pool can't read the
+		 * one that a receive has just swapped in, nor its properties,
+		 * unless they are cached.  Give the file system up: release the
+		 * dataset, and leave it with no objset, so that its vops fail
+		 * with EIO (ZFS_ENTER()) rather than run without a log, and
+		 * teardown and zfs_umount() skip the objset when we force the
+		 * unmount below.  zfsvfs_setup() fails before it opens the log
+		 * or sets the objset's user pointer.
 		 */
 		zfsvfs->z_os = NULL;
 		zfs_mounts_remove(zfsvfs, B_FALSE);
 		dsl_dataset_disown(ds, DS_HOLD_FLAG_DECRYPT, zfsvfs);
 		goto bail;
 	}
-
-	err = zfsvfs_init(zfsvfs, os);
-	if (err != 0)
-		goto bail;
-
-	VERIFY(zfsvfs_setup(zfsvfs, B_FALSE) == 0);
 
 	zfs_set_fuid_feature(zfsvfs);
 
