@@ -2180,13 +2180,10 @@ zfs_ioc_objset_stats_impl(zfs_cmd_t *zc, objset_t *os)
 		 * XXX reading with out owning
 		 */
 		if (!zc->zc_objset_stats.dds_inconsistent &&
-		    dmu_objset_type(os) == DMU_OST_ZVOL) {
+		    dmu_objset_type(os) == DMU_OST_ZVOL)
 			error = zvol_get_stats(os, nv);
-			if (error == EIO)
-				return (error);
-			VERIFY0(error);
-		}
-		error = put_nvlist(zc, nv);
+		if (error == 0)
+			error = put_nvlist(zc, nv);
 		nvlist_free(nv);
 	}
 
