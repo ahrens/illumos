@@ -83,6 +83,7 @@ typedef struct zfs_case {
 	id_t		zc_remove_timer;
 	char		*zc_fru;
 	er_timeval_t	zc_when;
+	er_timeval_t	zc_last;	/* latest ereport (0 when restored) */
 } zfs_case_t;
 
 #define	CASE_DATA			"data"
@@ -100,6 +101,7 @@ typedef struct zfs_de_stats {
 	fmd_stat_t	import_drops;
 	fmd_stat_t	resource_drops;
 	fmd_stat_t	pool_drops;
+	fmd_stat_t	old_cases;
 } zfs_de_stats_t;
 
 zfs_de_stats_t zfs_stats = {
@@ -109,6 +111,7 @@ zfs_de_stats_t zfs_stats = {
 	{ "import_drops", FMD_TYPE_UINT64, "ereports dropped (during import)" },
 	{ "resource_drops", FMD_TYPE_UINT64, "resource related ereports" },
 	{ "pool_drops", FMD_TYPE_UINT64, "ereports dropped (pool iter failed)"},
+	{ "old_cases", FMD_TYPE_UINT64, "cases closed (from before load)" },
 };
 
 static hrtime_t zfs_remove_timeout;
@@ -411,6 +414,38 @@ zfs_serd_name(char *buf, uint64_t pool_guid, uint64_t vdev_guid,
 	    vdev_guid, type);
 }
 
+static boolean_t
+timeval_earlier(er_timeval_t *a, er_timeval_t *b)
+{
+	return (a->ertv_sec < b->ertv_sec ||
+	    (a->ertv_sec == b->ertv_sec && a->ertv_nsec < b->ertv_nsec));
+}
+
+/*
+ * Did every ereport in this case arrive before its pool's current import?
+ * They then describe an earlier import, and mustn't be used to diagnose this
+ * one (see zfs_fm_recv()).
+ */
+static boolean_t
+zfs_case_predates_load(fmd_hdl_t *hdl, zfs_case_t *zcp)
+{
+	libzfs_handle_t *zhdl = fmd_hdl_getspecific(hdl);
+	er_timeval_t loaded;
+	struct load_time_arg la;
+
+	/* A case restored when fmd started has no ereport times. */
+	if (zhdl == NULL || zcp->zc_last.ertv_sec == 0)
+		return (B_FALSE);
+
+	la.lt_guid = zcp->zc_data.zc_pool_guid;
+	la.lt_time = &loaded;
+	la.lt_found = B_FALSE;
+	if (zpool_iter(zhdl, zpool_find_load_time, &la) != 0 || !la.lt_found)
+		return (B_FALSE);
+
+	return (timeval_earlier(&zcp->zc_last, &loaded));
+}
+
 /*
  * Solve a given ZFS case.  This first checks to make sure the diagnosis is
  * still valid, as well as cleaning up any pending timer associated with the
@@ -426,6 +461,18 @@ zfs_case_solve(fmd_hdl_t *hdl, zfs_case_t *zcp, const char *faultname,
 	nvlist_t *fmri, *fru;
 	topo_hdl_t *thp;
 	int err;
+
+	/*
+	 * Exporting a pool closes its cases (see zfs_purge_cases()), but we can
+	 * get to the export's event after the pool has been imported again, and
+	 * by then a remove timer or an ereport from before the export can solve
+	 * the case.
+	 */
+	if (zfs_case_predates_load(hdl, zcp)) {
+		zfs_stats.old_cases.fmds_value.ui64++;
+		fmd_case_close(hdl, zcp->zc_case);
+		return;
+	}
 
 	/*
 	 * Construct the detector from the case data.  The detector is in the
@@ -525,13 +572,6 @@ zfs_case_solve(fmd_hdl_t *hdl, zfs_case_t *zcp, const char *faultname,
  * loaded.
  */
 #define	FMD_EVN_TOD	"__tod"
-
-static boolean_t
-timeval_earlier(er_timeval_t *a, er_timeval_t *b)
-{
-	return (a->ertv_sec < b->ertv_sec ||
-	    (a->ertv_sec == b->ertv_sec && a->ertv_nsec < b->ertv_nsec));
-}
 
 /*ARGSUSED*/
 static void
@@ -823,6 +863,7 @@ zfs_fm_recv(fmd_hdl_t *hdl, fmd_event_t *ep, nvlist_t *nvl, const char *class)
 	 * Associate the ereport with this case.
 	 */
 	fmd_case_add_ereport(hdl, zcp->zc_case, ep);
+	zcp->zc_last = er_when;
 
 	/*
 	 * Don't do anything else if this case is already solved.
