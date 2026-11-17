@@ -1072,10 +1072,16 @@ dsl_dataset_deactivate_feature_impl(dsl_dataset_t *ds, spa_feature_t f,
 	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
 	objset_t *mos = dmu_tx_pool(tx)->dp_meta_objset;
 	uint64_t dsobj = ds->ds_object;
+	int err;
 
 	VERIFY(spa_feature_table[f].fi_flags & ZFEATURE_FLAG_PER_DATASET);
 
-	VERIFY0(zap_remove(mos, dsobj, spa_feature_table[f].fi_guid, tx));
+	/*
+	 * If the pool failed after this sync task started, the dataset's ZAP
+	 * reads as empty unless it is cached (see dbuf_poison()).
+	 */
+	err = zap_remove(mos, dsobj, spa_feature_table[f].fi_guid, tx);
+	VERIFY(err == 0 || spa_failed(spa));
 	spa_feature_decr(spa, f, tx);
 	ds->ds_feature[f] = NULL;
 }
@@ -1300,7 +1306,11 @@ dsl_dataset_recalc_head_uniq(dsl_dataset_t *ds)
 
 	dsl_deadlist_space(&ds->ds_deadlist, &dlused, &dlcomp, &dluncomp);
 
-	ASSERT3U(dlused, <=, mrs_used);
+	/*
+	 * A destroy that the pool failed under may not have been able to move
+	 * the deadlist's entries (see dsl_deadlist_move_bpobj()).
+	 */
+	ASSERT(dlused <= mrs_used || spa_failed(ds->ds_dir->dd_pool->dp_spa));
 	dsl_dataset_phys(ds)->ds_unique_bytes =
 	    dsl_dataset_phys(ds)->ds_referenced_bytes - (mrs_used - dlused);
 
@@ -1332,9 +1342,18 @@ dsl_dataset_remove_from_next_clones(dsl_dataset_t *ds, uint64_t obj,
 	 */
 	if (err != ENOENT)
 		VERIFY0(err);
-	ASSERT0(zap_count(mos, dsl_dataset_phys(ds)->ds_next_clones_obj,
-	    &count));
-	ASSERT3U(count, <=, dsl_dataset_phys(ds)->ds_num_children - 2);
+#ifdef ZFS_DEBUG
+	/*
+	 * If the pool failed after this sync task started, the ZAP's dnode
+	 * reads as free unless it is cached (see dbuf_poison()); the remove
+	 * above then got ENOENT.
+	 */
+	err = zap_count(mos, dsl_dataset_phys(ds)->ds_next_clones_obj,
+	    &count);
+	ASSERT(err == 0 || spa_failed(ds->ds_dir->dd_pool->dp_spa));
+	ASSERT(err != 0 ||
+	    count <= dsl_dataset_phys(ds)->ds_num_children - 2);
+#endif
 }
 
 

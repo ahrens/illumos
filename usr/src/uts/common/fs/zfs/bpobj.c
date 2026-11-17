@@ -100,16 +100,32 @@ bpobj_free(objset_t *os, uint64_t obj, dmu_tx_t *tx)
 	dmu_object_info_t doi;
 	int epb;
 	dmu_buf_t *dbuf = NULL;
+	int err;
 
 	ASSERT(obj != dmu_objset_pool(os)->dp_empty_bpobj);
-	VERIFY3U(0, ==, bpobj_open(&bpo, os, obj));
+
+	/*
+	 * Syncing context on a failed pool gets zeros for the blocks that it
+	 * can't read (see dbuf_poison()), so the bpobj or its list of subobjs
+	 * may read as free, and a block of the list as empty.  There is
+	 * nothing to free in them.
+	 */
+	err = bpobj_open(&bpo, os, obj);
+	if (err != 0) {
+		VERIFY(spa_failed(dmu_objset_spa(os)));
+		return;
+	}
 
 	mutex_enter(&bpo.bpo_lock);
 
 	if (!bpo.bpo_havesubobj || bpo.bpo_phys->bpo_subobjs == 0)
 		goto out;
 
-	VERIFY3U(0, ==, dmu_object_info(os, bpo.bpo_phys->bpo_subobjs, &doi));
+	err = dmu_object_info(os, bpo.bpo_phys->bpo_subobjs, &doi);
+	if (err != 0) {
+		VERIFY(spa_failed(dmu_objset_spa(os)));
+		goto out;
+	}
 	epb = doi.doi_data_block_size / sizeof (uint64_t);
 
 	for (i = bpo.bpo_phys->bpo_num_subobjs - 1; i >= 0; i--) {
@@ -130,6 +146,12 @@ bpobj_free(objset_t *os, uint64_t obj, dmu_tx_t *tx)
 		ASSERT3U(offset, <, dbuf->db_offset + dbuf->db_size);
 
 		objarray = dbuf->db_data;
+
+		/* See above. */
+		if (objarray[blkoff] == 0) {
+			VERIFY(spa_failed(dmu_objset_spa(os)));
+			continue;
+		}
 		bpobj_free(os, objarray[blkoff], tx);
 	}
 	if (dbuf) {
@@ -425,9 +447,14 @@ bpobj_enqueue_subobj(bpobj_t *bpo, uint64_t subobj, dmu_tx_t *tx)
 		    DMU_OT_NONE, 0, tx);
 	}
 
+#ifdef ZFS_DEBUG
+	/* A failed pool may not be able to read the list (see below). */
 	dmu_object_info_t doi;
-	ASSERT0(dmu_object_info(bpo->bpo_os, bpo->bpo_phys->bpo_subobjs, &doi));
-	ASSERT3U(doi.doi_type, ==, DMU_OT_BPOBJ_SUBOBJ);
+	int derr = dmu_object_info(bpo->bpo_os, bpo->bpo_phys->bpo_subobjs,
+	    &doi);
+	ASSERT(derr == 0 || spa_failed(dmu_objset_spa(bpo->bpo_os)));
+	ASSERT(derr != 0 || doi.doi_type == DMU_OT_BPOBJ_SUBOBJ);
+#endif
 
 	dmu_write(bpo->bpo_os, bpo->bpo_phys->bpo_subobjs,
 	    bpo->bpo_phys->bpo_num_subobjs * sizeof (subobj),
@@ -442,9 +469,15 @@ bpobj_enqueue_subobj(bpobj_t *bpo, uint64_t subobj, dmu_tx_t *tx)
 	subsubobjs = subbpo.bpo_phys->bpo_subobjs;
 	if (subsubobjs != 0) {
 		dmu_object_info_t doi;
+		int err;
 
-		VERIFY3U(0, ==, dmu_object_info(bpo->bpo_os, subsubobjs, &doi));
-		if (doi.doi_max_offset == doi.doi_data_block_size) {
+		/*
+		 * A failed pool may not be able to read subobj's list (see
+		 * bpobj_free()); then it stays where it is.
+		 */
+		err = dmu_object_info(bpo->bpo_os, subsubobjs, &doi);
+		VERIFY(err == 0 || spa_failed(dmu_objset_spa(bpo->bpo_os)));
+		if (err == 0 && doi.doi_max_offset == doi.doi_data_block_size) {
 			dmu_buf_t *subdb;
 			uint64_t numsubsub = subbpo.bpo_phys->bpo_num_subobjs;
 

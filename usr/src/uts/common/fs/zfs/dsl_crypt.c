@@ -2616,10 +2616,19 @@ dsl_crypto_key_destroy_sync(uint64_t dckobj, dmu_tx_t *tx)
 {
 	objset_t *mos = tx->tx_pool->dp_meta_objset;
 	uint64_t refcnt;
+	int err;
 
-	/* Decrement the refcount, destroy if this is the last reference */
-	VERIFY0(zap_lookup(mos, dckobj, DSL_CRYPTO_KEY_REFCOUNT,
-	    sizeof (uint64_t), 1, &refcnt));
+	/*
+	 * Decrement the refcount, destroy if this is the last reference.  If
+	 * the pool failed after this sync task started, the key's ZAP reads
+	 * as empty unless it is cached (see dbuf_poison()); leave it alone.
+	 */
+	err = zap_lookup(mos, dckobj, DSL_CRYPTO_KEY_REFCOUNT,
+	    sizeof (uint64_t), 1, &refcnt);
+	if (err != 0) {
+		VERIFY(spa_failed(tx->tx_pool->dp_spa));
+		return;
+	}
 
 	if (refcnt != 1) {
 		VERIFY0(zap_increment(mos, dckobj, DSL_CRYPTO_KEY_REFCOUNT,

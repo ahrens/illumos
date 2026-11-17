@@ -22,6 +22,7 @@
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2013, 2017 by Delphix. All rights reserved.
  * Copyright 2014 HybridCluster. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/dbuf.h>
@@ -326,6 +327,15 @@ dmu_object_free(objset_t *os, uint64_t object, dmu_tx_t *tx)
 
 	err = dnode_hold_impl(os, object, DNODE_MUST_BE_ALLOCATED, 0,
 	    FTAG, &dn);
+
+	/*
+	 * Syncing context on a failed pool gets zeros for a block of dnodes
+	 * that it can't read (see dbuf_poison()), so the object reads as
+	 * free.  There is nothing to free, and nothing would reach the disks.
+	 */
+	if (err == ENOENT && dmu_tx_is_syncing(tx) &&
+	    spa_failed(dmu_objset_spa(os)))
+		return (0);
 	if (err)
 		return (err);
 

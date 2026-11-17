@@ -397,6 +397,7 @@ dsl_deadlist_remove_key(dsl_deadlist_t *dl, uint64_t mintxg, dmu_tx_t *tx)
 {
 	dsl_deadlist_entry_t dle_tofind;
 	dsl_deadlist_entry_t *dle, *dle_prev;
+	int err;
 
 	if (dl->dl_oldfmt)
 		return;
@@ -418,7 +419,12 @@ dsl_deadlist_remove_key(dsl_deadlist_t *dl, uint64_t mintxg, dmu_tx_t *tx)
 	bpobj_close(&dle->dle_bpobj);
 	kmem_free(dle, sizeof (*dle));
 
-	VERIFY3U(0, ==, zap_remove_int(dl->dl_os, dl->dl_object, mintxg, tx));
+	/*
+	 * If the pool failed after the tree was loaded, the ZAP reads as
+	 * empty unless it is still cached (see dbuf_poison()).
+	 */
+	err = zap_remove_int(dl->dl_os, dl->dl_object, mintxg, tx);
+	VERIFY(err == 0 || spa_failed(dmu_objset_spa(dl->dl_os)));
 	mutex_exit(&dl->dl_lock);
 }
 
@@ -665,6 +671,7 @@ dsl_deadlist_move_bpobj(dsl_deadlist_t *dl, bpobj_t *bpo, uint64_t mintxg,
 	while (dle) {
 		uint64_t used, comp, uncomp;
 		dsl_deadlist_entry_t *dle_next;
+		int err;
 
 		bpobj_enqueue_subobj(bpo, dle->dle_bpobj.bpo_object, tx);
 
@@ -677,8 +684,10 @@ dsl_deadlist_move_bpobj(dsl_deadlist_t *dl, bpobj_t *bpo, uint64_t mintxg,
 		dl->dl_phys->dl_comp -= comp;
 		dl->dl_phys->dl_uncomp -= uncomp;
 
-		VERIFY3U(0, ==, zap_remove_int(dl->dl_os, dl->dl_object,
-		    dle->dle_mintxg, tx));
+		/* See dsl_deadlist_remove_key(). */
+		err = zap_remove_int(dl->dl_os, dl->dl_object,
+		    dle->dle_mintxg, tx);
+		VERIFY(err == 0 || spa_failed(dmu_objset_spa(dl->dl_os)));
 
 		dle_next = AVL_NEXT(&dl->dl_tree, dle);
 		avl_remove(&dl->dl_tree, dle);

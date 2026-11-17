@@ -24,6 +24,7 @@
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
  * Copyright (c) 2013 by Joyent, Inc. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -199,9 +200,19 @@ dsl_dataset_remove_clones_key(dsl_dataset_t *ds, uint64_t mintxg, dmu_tx_t *tx)
 	    zap_cursor_retrieve(&zc, &za) == 0;
 	    zap_cursor_advance(&zc)) {
 		dsl_dataset_t *clone;
+		int err;
 
-		VERIFY0(dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
-		    za.za_first_integer, FTAG, &clone));
+		/*
+		 * If the pool failed after this destroy started, a clone that
+		 * isn't cached can't be held (see
+		 * dsl_destroy_snapshot_sync_impl()).
+		 */
+		err = dsl_dataset_hold_obj(ds->ds_dir->dd_pool,
+		    za.za_first_integer, FTAG, &clone);
+		if (err != 0) {
+			VERIFY(spa_failed(ds->ds_dir->dd_pool->dp_spa));
+			continue;
+		}
 		if (clone->ds_dir->dd_origin_txg > mintxg) {
 			dsl_deadlist_remove_key(&clone->ds_deadlist,
 			    mintxg, tx);
@@ -290,8 +301,19 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 	}
 	if (dsl_dataset_phys(ds)->ds_prev_snap_obj != 0) {
 		ASSERT3P(ds->ds_prev, ==, NULL);
-		VERIFY0(dsl_dataset_hold_obj(dp,
-		    dsl_dataset_phys(ds)->ds_prev_snap_obj, FTAG, &ds_prev));
+
+		/*
+		 * If the pool failed after this destroy started, a snapshot
+		 * that isn't cached can't be held, since its dnode reads as
+		 * zeros (see dbuf_poison()).  Leave the rest of the destroy
+		 * undone: none of it would reach the disks.
+		 */
+		err = dsl_dataset_hold_obj(dp,
+		    dsl_dataset_phys(ds)->ds_prev_snap_obj, FTAG, &ds_prev);
+		if (err != 0) {
+			VERIFY(spa_failed(dp->dp_spa));
+			return;
+		}
 		after_branch_point =
 		    (dsl_dataset_phys(ds_prev)->ds_next_snap_obj != obj);
 
@@ -300,11 +322,13 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 		    dsl_dataset_phys(ds_prev)->ds_next_clones_obj != 0) {
 			dsl_dataset_remove_from_next_clones(ds_prev, obj, tx);
 			if (dsl_dataset_phys(ds)->ds_next_snap_obj != 0) {
-				VERIFY0(zap_add_int(mos,
+				/* See dsl_dataset_remove_from_next_clones(). */
+				err = zap_add_int(mos,
 				    dsl_dataset_phys(ds_prev)->
 				    ds_next_clones_obj,
 				    dsl_dataset_phys(ds)->ds_next_snap_obj,
-				    tx));
+				    tx);
+				VERIFY(err == 0 || spa_failed(dp->dp_spa));
 			}
 		}
 		if (!after_branch_point) {
@@ -317,8 +341,15 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 	uint64_t old_unique;
 	uint64_t used = 0, comp = 0, uncomp = 0;
 
-	VERIFY0(dsl_dataset_hold_obj(dp,
-	    dsl_dataset_phys(ds)->ds_next_snap_obj, FTAG, &ds_next));
+	/* See the hold of ds_prev above. */
+	err = dsl_dataset_hold_obj(dp,
+	    dsl_dataset_phys(ds)->ds_next_snap_obj, FTAG, &ds_next);
+	if (err != 0) {
+		VERIFY(spa_failed(dp->dp_spa));
+		if (ds_prev != NULL)
+			dsl_dataset_rele(ds_prev, FTAG);
+		return;
+	}
 	ASSERT3U(dsl_dataset_phys(ds_next)->ds_prev_snap_obj, ==, obj);
 
 	old_unique = dsl_dataset_phys(ds_next)->ds_unique_bytes;
@@ -385,29 +416,44 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 		 * died after the next snap and before the one
 		 * after that (ie. be on the snap after next's
 		 * deadlist).
+		 *
+		 * A failed pool may not be able to hold the snapshot after
+		 * next (see the hold of ds_prev above); then next's unique
+		 * space is left as it is.
 		 */
-		VERIFY0(dsl_dataset_hold_obj(dp,
+		err = dsl_dataset_hold_obj(dp,
 		    dsl_dataset_phys(ds_next)->ds_next_snap_obj,
-		    FTAG, &ds_nextnext));
-		dsl_deadlist_space_range(&ds_nextnext->ds_deadlist,
-		    dsl_dataset_phys(ds)->ds_prev_snap_txg,
-		    dsl_dataset_phys(ds)->ds_creation_txg,
-		    &used, &comp, &uncomp);
-		dsl_dataset_phys(ds_next)->ds_unique_bytes += used;
-		dsl_dataset_rele(ds_nextnext, FTAG);
+		    FTAG, &ds_nextnext);
+		VERIFY(err == 0 || spa_failed(dp->dp_spa));
+		if (err == 0) {
+			dsl_deadlist_space_range(&ds_nextnext->ds_deadlist,
+			    dsl_dataset_phys(ds)->ds_prev_snap_txg,
+			    dsl_dataset_phys(ds)->ds_creation_txg,
+			    &used, &comp, &uncomp);
+			dsl_dataset_phys(ds_next)->ds_unique_bytes += used;
+			dsl_dataset_rele(ds_nextnext, FTAG);
+		}
 		ASSERT3P(ds_next->ds_prev, ==, NULL);
 
-		/* Collapse range in this head. */
+		/*
+		 * Collapse range in this head.  The head is often the
+		 * snapshot after next, which a failed pool may not be able
+		 * to hold either.
+		 */
 		dsl_dataset_t *hds;
-		VERIFY0(dsl_dataset_hold_obj(dp,
-		    dsl_dir_phys(ds->ds_dir)->dd_head_dataset_obj, FTAG, &hds));
-		dsl_deadlist_remove_key(&hds->ds_deadlist,
-		    dsl_dataset_phys(ds)->ds_creation_txg, tx);
-		if (dsl_dataset_remap_deadlist_exists(hds)) {
-			dsl_deadlist_remove_key(&hds->ds_remap_deadlist,
+		err = dsl_dataset_hold_obj(dp,
+		    dsl_dir_phys(ds->ds_dir)->dd_head_dataset_obj, FTAG, &hds);
+		VERIFY(err == 0 || spa_failed(dp->dp_spa));
+		if (err == 0) {
+			dsl_deadlist_remove_key(&hds->ds_deadlist,
 			    dsl_dataset_phys(ds)->ds_creation_txg, tx);
+			if (dsl_dataset_remap_deadlist_exists(hds)) {
+				dsl_deadlist_remove_key(
+				    &hds->ds_remap_deadlist,
+				    dsl_dataset_phys(ds)->ds_creation_txg, tx);
+			}
+			dsl_dataset_rele(hds, FTAG);
 		}
-		dsl_dataset_rele(hds, FTAG);
 
 	} else {
 		ASSERT3P(ds_next->ds_prev, ==, ds);
@@ -431,8 +477,15 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 			uint64_t new_unique =
 			    dsl_dataset_phys(ds_next)->ds_unique_bytes;
 
-			ASSERT(old_unique <= new_unique);
-			mrsdelta = MIN(new_unique - old_unique,
+			/*
+			 * If the pool failed after this destroy started, our
+			 * deadlist may have read as empty and not been merged
+			 * into next's, leaving next's unique space too small.
+			 */
+			ASSERT(old_unique <= new_unique ||
+			    spa_failed(dp->dp_spa));
+			mrsdelta = MIN(new_unique > old_unique ?
+			    new_unique - old_unique : 0,
 			    ds_next->ds_reserved - old_unique);
 			dsl_dir_diduse_space(ds->ds_dir,
 			    DD_USED_REFRSRV, -mrsdelta, 0, 0, tx);
@@ -449,24 +502,33 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 		ds->ds_objset = NULL;
 	}
 
-	/* remove from snapshot namespace */
+	/*
+	 * Remove from snapshot namespace.  If the pool failed after this
+	 * destroy started, the head may not be held (see the collapse
+	 * above), and its snapshot names read as empty unless they are
+	 * cached (see dbuf_poison()).
+	 */
 	dsl_dataset_t *ds_head;
 	ASSERT(dsl_dataset_phys(ds)->ds_snapnames_zapobj == 0);
-	VERIFY0(dsl_dataset_hold_obj(dp,
-	    dsl_dir_phys(ds->ds_dir)->dd_head_dataset_obj, FTAG, &ds_head));
-	VERIFY0(dsl_dataset_get_snapname(ds));
+	err = dsl_dataset_hold_obj(dp,
+	    dsl_dir_phys(ds->ds_dir)->dd_head_dataset_obj, FTAG, &ds_head);
+	VERIFY(err == 0 || spa_failed(dp->dp_spa));
+	if (err == 0) {
+		err = dsl_dataset_get_snapname(ds);
+		if (err == 0) {
 #ifdef ZFS_DEBUG
-	{
-		uint64_t val;
+			uint64_t val;
 
-		err = dsl_dataset_snap_lookup(ds_head,
-		    ds->ds_snapname, &val);
-		ASSERT0(err);
-		ASSERT3U(val, ==, obj);
-	}
+			err = dsl_dataset_snap_lookup(ds_head,
+			    ds->ds_snapname, &val);
+			ASSERT(err != 0 || val == obj);
 #endif
-	VERIFY0(dsl_dataset_snap_remove(ds_head, ds->ds_snapname, tx, B_TRUE));
-	dsl_dataset_rele(ds_head, FTAG);
+			err = dsl_dataset_snap_remove(ds_head,
+			    ds->ds_snapname, tx, B_TRUE);
+		}
+		VERIFY(err == 0 || spa_failed(dp->dp_spa));
+		dsl_dataset_rele(ds_head, FTAG);
+	}
 
 	if (ds_prev != NULL)
 		dsl_dataset_rele(ds_prev, FTAG);
@@ -474,10 +536,14 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 	spa_prop_clear_bootfs(dp->dp_spa, ds->ds_object, tx);
 
 	if (dsl_dataset_phys(ds)->ds_next_clones_obj != 0) {
+#ifdef ZFS_DEBUG
 		uint64_t count;
-		ASSERT0(zap_count(mos,
-		    dsl_dataset_phys(ds)->ds_next_clones_obj, &count) &&
-		    count == 0);
+
+		/* See dsl_dataset_remove_from_next_clones(). */
+		err = zap_count(mos,
+		    dsl_dataset_phys(ds)->ds_next_clones_obj, &count);
+		ASSERT(err == 0 || spa_failed(dp->dp_spa));
+#endif
 		VERIFY0(dmu_object_free(mos,
 		    dsl_dataset_phys(ds)->ds_next_clones_obj, tx));
 	}
@@ -811,6 +877,7 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 	objset_t *mos = dp->dp_meta_objset;
 	uint64_t obj, ddobj, prevobj = 0;
 	boolean_t rmorigin;
+	int err;
 
 	ASSERT3U(dsl_dataset_phys(ds)->ds_num_children, <=, 1);
 	ASSERT(ds->ds_prev == NULL ||
@@ -876,9 +943,6 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 	if (dsl_dataset_remap_deadlist_exists(ds))
 		dsl_dataset_destroy_remap_deadlist(ds, tx);
 
-	objset_t *os;
-	VERIFY0(dmu_objset_from_ds(ds, &os));
-
 	if (!spa_feature_is_enabled(dp->dp_spa, SPA_FEATURE_ASYNC_DESTROY)) {
 		old_synchronous_dataset_destroy(ds, tx);
 	} else {
@@ -887,8 +951,17 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 		 * clean up and update space accounting information.
 		 */
 		uint64_t used, comp, uncomp;
+		objset_t *os;
 
-		zil_destroy_sync(dmu_objset_zil(os), tx);
+		/*
+		 * If the pool failed after this destroy started, the objset
+		 * can't be read unless it is cached (see zio_vdev_io_fence()).
+		 * Its intent log is dropped with the rest of the txg.
+		 */
+		err = dmu_objset_from_ds(ds, &os);
+		VERIFY(err == 0 || spa_failed(dp->dp_spa));
+		if (err == 0)
+			zil_destroy_sync(dmu_objset_zil(os), tx);
 
 		if (!spa_feature_is_active(dp->dp_spa,
 		    SPA_FEATURE_ASYNC_DESTROY)) {
@@ -925,9 +998,15 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 
 	if (ds->ds_prev != NULL) {
 		if (spa_version(dp->dp_spa) >= SPA_VERSION_DIR_CLONES) {
-			VERIFY0(zap_remove_int(mos,
+			/*
+			 * If the pool failed after this destroy started, a
+			 * ZAP that isn't cached reads as empty (see
+			 * dbuf_poison()).
+			 */
+			err = zap_remove_int(mos,
 			    dsl_dir_phys(ds->ds_prev->ds_dir)->dd_clones,
-			    ds->ds_object, tx));
+			    ds->ds_object, tx);
+			VERIFY(err == 0 || spa_failed(dp->dp_spa));
 		}
 		prevobj = ds->ds_prev->ds_object;
 		dsl_dataset_rele(ds->ds_prev, ds);
