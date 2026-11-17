@@ -2267,6 +2267,7 @@ static int
 zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 {
 	znode_t	*zp;
+	zilog_t	*zilog;
 
 	zfs_unlinked_drain_stop_wait(zfsvfs);
 
@@ -2283,12 +2284,21 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	}
 
 	/*
-	 * Close the zil. NB: Can't close the zil while zfs_inactive
-	 * threads are blocked as zil_close can call zfs_inactive.
+	 * Close the zil.  zfs_inactive() writes out a file's dirty pages, and
+	 * logs them (zfs_putapage()), without z_teardown_lock, so take the
+	 * log away under z_teardown_inactive_lock first: a page write already
+	 * under way is logged before the zil is closed, and later ones aren't
+	 * logged at all (we wait for them to sync below).  NB: Don't hold
+	 * z_teardown_inactive_lock across zil_close(): the vnodes that it
+	 * looks up go inactive in the pool's vnrele taskq (zfs_get_done()),
+	 * which would block on the lock.
 	 */
-	if (zfsvfs->z_log) {
-		zil_close(zfsvfs->z_log);
+	zilog = zfsvfs->z_log;
+	if (zilog != NULL) {
+		rw_enter(&zfsvfs->z_teardown_inactive_lock, RW_WRITER);
 		zfsvfs->z_log = NULL;
+		rw_exit(&zfsvfs->z_teardown_inactive_lock);
+		zil_close(zilog);
 	}
 
 	rw_enter(&zfsvfs->z_teardown_inactive_lock, RW_WRITER);

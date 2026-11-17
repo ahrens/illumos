@@ -4791,8 +4791,15 @@ zfs_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp,
 		    B_TRUE);
 		err = sa_bulk_update(zp->z_sa_hdl, bulk, count, tx);
 		ASSERT0(err);
-		zfs_log_write(zfsvfs->z_log, tx, TX_WRITE, zp, off, len,
-		    B_FALSE);
+
+		/*
+		 * zfs_inactive() can write pages after zfsvfs_teardown() has
+		 * taken the log away; the teardown waits for them to sync.
+		 */
+		if (zfsvfs->z_log != NULL) {
+			zfs_log_write(zfsvfs->z_log, tx, TX_WRITE, zp, off, len,
+			    B_FALSE);
+		}
 	}
 	dmu_tx_commit(tx);
 
