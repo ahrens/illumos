@@ -2485,6 +2485,7 @@ file path=opt/zfs-tests/tests/functional/fault/suspend_resume_reexecute \
 file path=opt/zfs-tests/tests/functional/fault/write_error_throttle mode=0555
 file path=opt/zfs-tests/tests/functional/fault/write_indirect_read_error \
     mode=0555
+file path=opt/zfs-tests/tests/functional/fault/zfs_create_prop_error mode=0555
 file path=opt/zfs-tests/tests/functional/fault/zil_get_data_error mode=0555
 file path=opt/zfs-tests/tests/functional/fault/zpool_status_-s mode=0555
 dir  path=opt/zfs-tests/tests/functional/features
