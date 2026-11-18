@@ -1,0 +1,103 @@
+#pragma D option quiet
+#pragma D option bufsize=16m
+#pragma D option switchrate=20hz
+inline string pool = "POOL";
+int n_send, n_recv, n_commit, n_dsync, n_zvol, failed;
+kthread_t *syncer;
+string phase;
+BEGIN { printf("ready\n"); }
+fbt::dmu_send_impl:entry { self->s = 1; n_send++; }
+fbt::dmu_send_impl:return /self->s/ { self->s = 0; n_send--; }
+fbt::dmu_recv_stream:entry { self->r = 1; n_recv++; }
+fbt::dmu_recv_stream:return /self->r/ { self->r = 0; n_recv--; }
+fbt::zil_commit:entry { self->c = 1; n_commit++; }
+fbt::zil_commit:return /self->c && strstr(execname, "python") != NULL/ { printf("zc %d %d %d\n", pid, timestamp, arg1); }
+fbt::dmu_sync_done:entry /args[0]->io_error/ { printf("dmu_sync_done err %d %d\n", args[0]->io_error, timestamp); }
+fbt::zil_lwb_flush_vdevs_done:entry /args[0]->io_error/ { printf("lwb_flush_done err %d %d\n", args[0]->io_error, timestamp); }
+fbt::zil_lwb_write_done:entry /args[0]->io_error/ { printf("lwb_write_done err %d %d\n", args[0]->io_error, timestamp); }
+fbt::zil_commit:return /self->c/ { self->c = 0; n_commit--; }
+fbt::dmu_sync:entry { n_dsync++; }
+fbt::dmu_sync_done:entry { n_dsync--; }
+fbt::zvol_strategy:entry,fbt::zvol_write:entry { self->z++; n_zvol++; }
+fbt::zvol_strategy:return,fbt::zvol_write:return /self->z/ { self->z--; n_zvol--; }
+fbt::spa_sync:entry /stringof(args[0]->spa_name) == pool/ { syncer = curthread; phase = "sync-start"; }
+fbt::spa_sync:return /curthread == syncer/ { phase = "between-txgs"; }
+fbt::dsl_pool_sync:entry /curthread == syncer/ { phase = strjoin("dsl_pool_sync-pass", lltostr(args[0]->dp_spa->spa_sync_pass)); }
+fbt::dsl_pool_sync_mos:entry /curthread == syncer/ { phase = "mos"; }
+fbt::dsl_sync_task_sync:entry /curthread == syncer/ { phase = "sync_task"; }
+fbt::spa_sync_frees:entry /curthread == syncer/ { phase = "frees"; }
+fbt::spa_sync_deferred_frees:entry /curthread == syncer/ { phase = "deferred_frees"; }
+fbt::vdev_sync:entry /curthread == syncer/ { phase = "vdev_sync"; }
+fbt::spa_flush_metaslabs:entry /curthread == syncer/ { phase = "log_flush"; }
+fbt::vdev_config_sync:entry /curthread == syncer/ { phase = "labels"; }
+fbt::dsl_scan_sync:entry /curthread == syncer/ { phase = "scan"; }
+fbt::zio_alloc_zil:entry { self->zil = 1; }
+fbt::zio_alloc_zil:return { self->zil = 0; }
+fbt::zio_dva_allocate:entry { self->za = 1; }
+fbt::zio_dva_allocate:return { self->za = 0; }
+fbt::metaslab_alloc_dva:entry
+/stringof(args[0]->spa_name) == pool/
+{
+	self->dva = &args[3][args[4]]; self->txg = args[6];
+}
+fbt::metaslab_alloc_dva:return
+/self->dva && arg1 == 0/
+{
+	printf("A %d %s txg %d %d:%x:%x\n", timestamp,
+	    self->zil ? "zil" : self->za ? "zio" : "other", self->txg,
+	    self->dva->dva_word[0] >> 32,
+	    (self->dva->dva_word[1] & 0x7fffffffffffffff) << 9,
+	    (self->dva->dva_word[0] & 0xffffff) << 9);
+}
+fbt::metaslab_alloc_dva:return { self->dva = 0; }
+fbt::metaslab_free_dva:entry
+/stringof(args[0]->spa_name) == pool/
+{
+	printf("F %d txg %d %d:%x:%x %a\n", timestamp, args[0]->spa_syncing_txg,
+	    args[1]->dva_word[0] >> 32,
+	    (args[1]->dva_word[1] & 0x7fffffffffffffff) << 9,
+	    (args[1]->dva_word[0] & 0xffffff) << 9, caller);
+}
+fbt::metaslab_unalloc_dva:entry
+/stringof(args[0]->spa_name) == pool/
+{
+	printf("U %d txg %d %d:%x:%x sync %d\n", timestamp, args[2],
+	    args[1]->dva_word[0] >> 32,
+	    (args[1]->dva_word[1] & 0x7fffffffffffffff) << 9,
+	    (args[1]->dva_word[0] & 0xffffff) << 9, args[0]->spa_syncing_txg);
+	stack(14);
+}
+fbt::spa_fail:entry
+/!failed && stringof(args[0]->spa_name) == pool/
+{
+	failed = 1;
+	printf("spa_fail %d %s\n", timestamp, probefunc);
+	printf("UBSYNC %d\n", args[0]->spa_ubsync.ub_txg);
+	printf("BUCKETS phase=%s send=%d recv=%d zil_commit=%d dmu_sync=%d zvol=%d\n",
+	    phase, n_send > 0, n_recv > 0, n_commit > 0, n_dsync > 0, n_zvol > 0);
+}
+
+/*
+ * The fence: once the pool has failed, no I/O that starts down the vdev
+ * pipeline may reach a leaf vdev's io_start.  An I/O that passed
+ * zio_vdev_io_start() before the failure may still get there.
+ */
+fbt::zio_vdev_io_start:entry
+/args[0]->io_vd != NULL && args[0]->io_vd->vdev_ops->vdev_op_leaf &&
+    args[0]->io_spa->spa_exit == 2 && stringof(args[0]->io_spa->spa_name) == pool/
+{
+	fenced[arg0] = 1;
+}
+fbt::vdev_file_io_start:entry,fbt::vdev_disk_io_start:entry
+/fenced[arg0]/
+{
+	printf("FENCE %d %s type %d off %x size %x flags %x\n", timestamp,
+	    probefunc, args[0]->io_type, args[0]->io_offset, args[0]->io_size,
+	    args[0]->io_flags);
+	stack(12);
+}
+fbt::zio_done:entry
+/fenced[arg0]/
+{
+	fenced[arg0] = 0;
+}
