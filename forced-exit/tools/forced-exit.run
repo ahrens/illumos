@@ -1,0 +1,177 @@
+#
+# forced-exit.run: the ZTS tests that the forced-exit branch adds or changes
+# (suspension, failmode=death, "zpool export -F", and the prerequisite
+# fixes), and the existing groups whose tests exercise the code the branch
+# changes.  Every test listed here is also in common.run.  See the Testing
+# section of forced-exit/DESIGN.md for what each test shows.
+#
+# Run it on a disposable test system that has the branch's kernel and
+# zfs-tests package installed, as a user who is not root and can sudo without
+# a password, with at least three scratch disks:
+#
+#	DISKS="c2t1d0 c3t1d0 c4t1d0" /opt/zfs-tests/bin/zfstest \
+#	    -c /path/to/forced-exit.run
+#
+# ("zfstest -a" uses every disk that isn't in a pool instead of $DISKS.)
+# Results go to /var/tmp/test_results/<timestamp>.  The groups run in sorted
+# order of their section names.  failmode_failed_fma and
+# forced_export_ereports need fmd online (they report themselves unsupported
+# otherwise), and failmode_failed_fma needs it not backlogged: on a system
+# that has just run a chaos campaign, reset fmd's state first.  The
+# zpool_export_hardforce send and receive tests need /usr/bin/pv, and report
+# themselves unsupported without it.  mmp_reset_interval reports itself
+# unsupported on illumos.
+#
+
+[DEFAULT]
+pre = setup
+quiet = False
+pre_user = root
+user = root
+timeout = 1800
+post_user = root
+post = cleanup
+outputdir = /var/tmp/test_results
+tags = ['functional']
+
+# The port of OpenZFS 64bdf63f5c and 13d454c6ca (split block reconstruction)
+# makes zdb -Y valid, so zdb_001_neg no longer lists it as an invalid option.
+[tests/functional/cli_root/zdb]
+tests = ['zdb_001_neg']
+tags = ['functional', 'cli_root', 'zdb']
+pre =
+post =
+
+# No test changed here; the group exercises zfs_mount(), zfs_domount(),
+# zfs_umount() and zfsvfs_teardown(), which the branch changes.
+[tests/functional/cli_root/zfs_mount]
+tests = ['zfs_mount_001_pos', 'zfs_mount_002_pos', 'zfs_mount_003_pos',
+    'zfs_mount_004_pos', 'zfs_mount_005_pos', 'zfs_mount_006_pos',
+    'zfs_mount_007_pos', 'zfs_mount_008_pos', 'zfs_mount_009_neg',
+    'zfs_mount_010_neg', 'zfs_mount_011_neg', 'zfs_mount_012_neg',
+    'zfs_mount_all_001_pos', 'zfs_mount_all_fail', 'zfs_mount_all_mountpoints',
+    'zfs_mount_encrypted']
+tags = ['functional', 'cli_root', 'zfs_mount']
+
+# No test changed here; the group exercises dmu_recv.c (receive_read(),
+# dmu_recv_end(), ...) and zfs_resume_fs(), which the branch changes.
+[tests/functional/cli_root/zfs_receive]
+tests = ['zfs_receive_001_pos', 'zfs_receive_002_pos', 'zfs_receive_003_pos',
+    'zfs_receive_005_neg', 'zfs_receive_006_pos',
+    'zfs_receive_007_neg', 'zfs_receive_008_pos', 'zfs_receive_009_neg',
+    'zfs_receive_010_pos', 'zfs_receive_011_pos', 'zfs_receive_012_pos',
+    'zfs_receive_013_pos', 'zfs_receive_014_pos', 'zfs_receive_015_pos',
+    'receive-o-x_props_override', 'zfs_receive_from_encrypted',
+    'zfs_receive_to_encrypted', 'zfs_receive_raw',
+    'zfs_receive_raw_incremental']
+tags = ['functional', 'cli_root', 'zfs_receive']
+
+# No test changed here; a rollback of a mounted file system goes through
+# zfs_resume_fs(), which the branch changes.
+[tests/functional/cli_root/zfs_rollback]
+tests = ['zfs_rollback_001_pos', 'zfs_rollback_002_pos',
+    'zfs_rollback_003_neg', 'zfs_rollback_004_neg']
+tags = ['functional', 'cli_root', 'zfs_rollback']
+
+# No test changed here; the group exercises zfs_umount(), zfsvfs_teardown()
+# and zfs unmount's libzfs path, which the branch changes.
+[tests/functional/cli_root/zfs_unmount]
+tests = ['zfs_unmount_001_pos', 'zfs_unmount_002_pos', 'zfs_unmount_003_pos',
+    'zfs_unmount_004_pos', 'zfs_unmount_005_pos', 'zfs_unmount_006_pos',
+    'zfs_unmount_007_neg', 'zfs_unmount_008_neg', 'zfs_unmount_009_pos',
+    'zfs_unmount_all_001_pos']
+tags = ['functional', 'cli_root', 'zfs_unmount']
+
+# The branch adds the hardforce and parallel export tests; the first four
+# are existing tests of the export path, which the branch changes.
+[tests/functional/cli_root/zpool_export]
+tests = ['zpool_export_001_pos', 'zpool_export_002_pos',
+    'zpool_export_003_neg', 'zpool_export_004_pos',
+    'zpool_export_hardforce_001_pos', 'zpool_export_hardforce_002_pos',
+    'zpool_export_hardforce_003_pos', 'zpool_export_hardforce_004_pos',
+    'zpool_export_hardforce_005_pos', 'zpool_export_hardforce_006_pos',
+    'zpool_export_hardforce_receive_001_pos',
+    'zpool_export_hardforce_receive_002_pos',
+    'zpool_export_hardforce_send_001_pos',
+    'zpool_export_hardforce_send_002_pos',
+    'zpool_export_parallel_admin', 'zpool_export_parallel_pos']
+tags = ['functional', 'cli_root', 'zpool_export']
+
+# The parallel import tests come with the port of OpenZFS c183d164aa.
+[tests/functional/cli_root/zpool_import]
+tests = ['zpool_import_parallel_admin', 'zpool_import_parallel_neg',
+    'zpool_import_parallel_pos']
+tags = ['functional', 'cli_root', 'zpool_import']
+
+[tests/functional/failmode]
+tests = ['failmode_dmu_tx_wait', 'failmode_dmu_tx_continue',
+    'failmode_nowait_wait', 'failmode_nowait_continue',
+    'failmode_admin_isolation', 'failmode_status_resilver',
+    'failmode_zil_flush_error', 'failmode_death_fails_alone',
+    'failmode_death_enospc', 'failmode_death_props',
+    'failmode_death_recoverable_errors',
+    'failmode_death_cold_metadata', 'forced_export_fence',
+    'forced_export_slow',
+    'forced_export_healthy', 'forced_export_cold_cache',
+    'forced_export_destroy', 'forced_export_busy_fs', 'forced_export_zvol',
+    'forced_export_namespace_sleeper', 'forced_export_retry',
+    'forced_export_zvol_first_open', 'forced_export_failed_swap',
+    'forced_export_idle', 'forced_export_read_errors_only',
+    'export_suspended_eagain', 'forced_export_ereports',
+    'failmode_death_export_f', 'forced_export_other_pools',
+    'failmode_fsync_wait', 'failmode_msync_wait', 'failmode_osync_wait',
+    'failmode_syncalways_wait', 'failmode_fsync_death', 'failmode_msync_death',
+    'failmode_osync_death', 'failmode_syncalways_death',
+    'failmode_vdev_state_death',
+    'forced_export_busy_fs_continue', 'forced_export_busy_fs_death',
+    'forced_export_zvol_continue', 'forced_export_zvol_death',
+    'forced_export_zvol_closing', 'forced_export_zvol_closing_continue',
+    'forced_export_idle_lofi', 'failmode_write_errors_probe_ok',
+    'failmode_death_enospc_reexecute', 'forced_export_import',
+    'failmode_transient_no_errlog', 'forced_export_pinned_sync',
+    'forced_export_log_writes',
+    'forced_export_pinned_zil', 'forced_export_send', 'forced_export_recv',
+    'forced_export_detach', 'forced_export_mount_races',
+    'forced_export_log_removal', 'forced_export_stuck_vop',
+    'forced_export_removal', 'forced_export_blocked_streams',
+    'failmode_failed_fma', 'forced_export_dirty_pages']
+tags = ['functional', 'failmode']
+
+# The branch adds zfs_create_prop_error and mount_root_read_error and changes
+# flush_error; the other tests here exercise read-error, write-error and
+# suspend/resume paths that the branch changes (zio reexecution, deadlist and
+# dataset holds, ZIL get_data, loaned buffer assignment).
+[tests/functional/fault]
+tests = ['zpool_status_-s', 'auto_spare_sorted_001_pos',
+    'objset_open_prop_error', 'zil_get_data_error', 'write_error_throttle',
+    'deadlist_read_error', 'suspend_resume_reexecute', 'flush_error',
+    'write_indirect_read_error', 'zfs_create_prop_error',
+    'mount_root_read_error']
+tags = ['functional', 'fault']
+
+# libzfs_input_check knows about the new ZFS_IOC_POOL_FORCE_EXIT ioctl.
+[tests/functional/libzfs]
+tests = ['libzfs_input']
+tags = ['functional', 'libzfs']
+
+# The branch adds mmap_unwritable_pages; the other two exercise
+# zfs_putapage() and zfs_inactive(), which the branch changes.
+[tests/functional/mmap]
+tests = ['mmap_read_001_pos', 'mmap_unwritable_pages', 'mmap_write_001_pos']
+tags = ['functional', 'mmap']
+
+# These now leave the pool on disk with export_pool_skip_update (the
+# spa_export_skip_update tunable) rather than "zpool export -F", which now
+# fails the pool.
+[tests/functional/mmp]
+tests = ['mmp_inactive_import', 'mmp_reset_interval']
+tags = ['functional', 'mmp']
+
+[tests/functional/removal]
+pre =
+tests = ['removal_with_resilver']
+tags = ['functional', 'removal']
+
+[tests/functional/zvol/zvol_misc]
+tests = ['zvol_last_close_stall']
+tags = ['functional', 'zvol', 'zvol_misc']
