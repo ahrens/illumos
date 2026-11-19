@@ -2327,11 +2327,10 @@ zpool_initialize_impl(zpool_handle_t *zhp, pool_initialize_func_t cmd_type,
 	    vdev_guids, &errlist);
 
 	if (err != 0) {
-		if (errlist != NULL) {
-			vd_errlist = fnvlist_lookup_nvlist(errlist,
-			    ZPOOL_INITIALIZE_VDEVS);
+		/* An error for the pool as a whole comes without the list. */
+		if (errlist != NULL && nvlist_lookup_nvlist(errlist,
+		    ZPOOL_INITIALIZE_VDEVS, &vd_errlist) == 0)
 			goto list_errors;
-		}
 		(void) zpool_standard_error(zhp->zpool_hdl, err,
 		    dgettext(TEXT_DOMAIN, "operation failed"));
 		goto out;
@@ -2442,9 +2441,10 @@ zpool_trim(zpool_handle_t *zhp, pool_trim_func_t cmd_type, nvlist_t *vds,
 			return (0);
 		}
 
+		/* An error for the pool as a whole comes without the list. */
 		if (errlist != NULL) {
-			vd_errlist = fnvlist_lookup_nvlist(errlist,
-			    ZPOOL_TRIM_VDEVS);
+			(void) nvlist_lookup_nvlist(errlist, ZPOOL_TRIM_VDEVS,
+			    &vd_errlist);
 		}
 
 		(void) snprintf(msg, sizeof (msg),

@@ -8163,6 +8163,20 @@ spa_async_thread(void *arg)
 	mutex_exit(&spa->spa_async_lock);
 
 	/*
+	 * A failed pool's devices and config stay as they are, and it writes
+	 * nothing more: drop the tasks that would change them.  Each would
+	 * wait as a writer of SCL_STATE or of every lock, some holding
+	 * spa_namespace_lock, for the I/O still in flight, and probing the
+	 * devices would post a probe failure for each leaf (see
+	 * pool_open_devices() in zfs_ioctl.c).  The pool can only be exported.
+	 */
+	if (spa_failed(spa)) {
+		tasks &= ~(SPA_ASYNC_CONFIG_UPDATE | SPA_ASYNC_REMOVE |
+		    SPA_ASYNC_AUTOEXPAND | SPA_ASYNC_PROBE |
+		    SPA_ASYNC_RESILVER_DONE);
+	}
+
+	/*
 	 * See if the config needs to be updated.
 	 */
 	if (tasks & SPA_ASYNC_CONFIG_UPDATE) {

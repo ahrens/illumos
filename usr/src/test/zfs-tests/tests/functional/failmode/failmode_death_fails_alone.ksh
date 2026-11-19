@@ -21,8 +21,10 @@
 # DESCRIPTION:
 #	A failmode=death pool whose writes fail fails instead of suspending,
 #	and nothing else is affected:
-#	- the pool is not suspended, "zpool clear" can't revive it, and
-#	  "zpool destroy" refuses it, saying to use "zpool export -f"
+#	- the pool is not suspended, "zpool clear" can't revive it, its
+#	  devices can't be brought online, reopened, scrubbed, initialized
+#	  or trimmed, and "zpool destroy" refuses it, saying to use "zpool
+#	  export -f"
 #	- writes, syncs and administrative commands on it return
 #	- other pools carry on as usual
 #	- nothing more reaches its disks, so they stay at the last txg that
@@ -71,6 +73,11 @@ health=$(zpool get -H -o value health $TESTPOOL)
 zpool status $TESTPOOL | grep -q "^ *state: FAILED" ||
     log_fail "zpool status doesn't show the pool as FAILED"
 log_mustnot zpool clear $TESTPOOL
+log_mustnot zpool online $TESTPOOL $FAILMODE_VDEV
+log_mustnot zpool reopen $TESTPOOL
+log_mustnot zpool scrub $TESTPOOL
+log_mustnot zpool initialize $TESTPOOL
+log_mustnot zpool trim $TESTPOOL
 log_must pool_has_failed $TESTPOOL
 
 # It can't be destroyed either, and zpool destroy says what to do instead.

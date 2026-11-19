@@ -1842,6 +1842,34 @@ zfs_ioc_pool_tryimport(zfs_cmd_t *zc)
 }
 
 /*
+ * Open the named pool for a command that changes its devices or its config,
+ * or that scans, initializes or trims it.  A failed pool can only be
+ * exported, so refuse one with EIO, as "zpool clear" does.  Such a command
+ * would wait for whatever I/O the pool still has in flight, which can take a
+ * while on a device that is going away: as a writer of SCL_STATE and SCL_ZIO,
+ * or of every lock while holding spa_namespace_lock (spa_vdev_enter()), or
+ * for a txg while holding spa_namespace_lock.  A "zpool status" that holds
+ * spa_namespace_lock would queue behind the writer, and every pool command
+ * behind the lock.  A scrub or resilver also reopens the devices
+ * (dsl_scan()), which posts a probe failure for each leaf, which FMA would
+ * diagnose as a fault of every disk.  zfs-retire's faults of a failed pool's
+ * disks, and its hot spare attaches, end here.
+ */
+static int
+pool_open_devices(const char *name, spa_t **spap, void *tag)
+{
+	int error;
+
+	if ((error = spa_open(name, spap, tag)) != 0)
+		return (error);
+	if (spa_failed(*spap)) {
+		spa_close(*spap, tag);
+		return (SET_ERROR(EIO));
+	}
+	return (0);
+}
+
+/*
  * inputs:
  * zc_name              name of the pool
  * zc_cookie            scan func (pool_scan_func_t)
@@ -1853,7 +1881,7 @@ zfs_ioc_pool_scan(zfs_cmd_t *zc)
 	spa_t *spa;
 	int error;
 
-	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
+	if ((error = pool_open_devices(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
 
 	if (zc->zc_flags >= POOL_SCRUB_FLAGS_END)
@@ -1891,7 +1919,7 @@ zfs_ioc_pool_upgrade(zfs_cmd_t *zc)
 	spa_t *spa;
 	int error;
 
-	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
+	if ((error = pool_open_devices(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
 
 	if (zc->zc_cookie < spa_version(spa) ||
@@ -1944,7 +1972,7 @@ zfs_ioc_pool_reguid(zfs_cmd_t *zc)
 	spa_t *spa;
 	int error;
 
-	error = spa_open(zc->zc_name, &spa, FTAG);
+	error = pool_open_devices(zc->zc_name, &spa, FTAG);
 	if (error == 0) {
 		error = spa_change_guid(spa);
 		spa_close(spa, FTAG);
@@ -2024,7 +2052,7 @@ zfs_ioc_vdev_add(zfs_cmd_t *zc)
 	int error;
 	nvlist_t *config;
 
-	error = spa_open(zc->zc_name, &spa, FTAG);
+	error = pool_open_devices(zc->zc_name, &spa, FTAG);
 	if (error != 0)
 		return (error);
 
@@ -2051,7 +2079,7 @@ zfs_ioc_vdev_remove(zfs_cmd_t *zc)
 	spa_t *spa;
 	int error;
 
-	error = spa_open(zc->zc_name, &spa, FTAG);
+	error = pool_open_devices(zc->zc_name, &spa, FTAG);
 	if (error != 0)
 		return (error);
 	if (zc->zc_cookie != 0) {
@@ -2070,8 +2098,9 @@ zfs_ioc_vdev_set_state(zfs_cmd_t *zc)
 	int error;
 	vdev_state_t newstate = VDEV_STATE_UNKNOWN;
 
-	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
+	if ((error = pool_open_devices(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
+
 	switch (zc->zc_cookie) {
 	case VDEV_STATE_ONLINE:
 		error = vdev_online(spa, zc->zc_guid, zc->zc_obj, &newstate);
@@ -2113,7 +2142,7 @@ zfs_ioc_vdev_attach(zfs_cmd_t *zc)
 	nvlist_t *config;
 	int error;
 
-	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
+	if ((error = pool_open_devices(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
 
 	if ((error = get_nvlist(zc->zc_nvlist_conf, zc->zc_nvlist_conf_size,
@@ -2132,7 +2161,7 @@ zfs_ioc_vdev_detach(zfs_cmd_t *zc)
 	spa_t *spa;
 	int error;
 
-	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
+	if ((error = pool_open_devices(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
 
 	error = spa_vdev_detach(spa, zc->zc_guid, 0, B_FALSE);
@@ -2149,7 +2178,7 @@ zfs_ioc_vdev_split(zfs_cmd_t *zc)
 	int error;
 	boolean_t exp = !!(zc->zc_cookie & ZPOOL_EXPORT_AFTER_SPLIT);
 
-	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
+	if ((error = pool_open_devices(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
 
 	if (error = get_nvlist(zc->zc_nvlist_conf, zc->zc_nvlist_conf_size,
@@ -2184,7 +2213,7 @@ zfs_ioc_vdev_setpath(zfs_cmd_t *zc)
 	uint64_t guid = zc->zc_guid;
 	int error;
 
-	error = spa_open(zc->zc_name, &spa, FTAG);
+	error = pool_open_devices(zc->zc_name, &spa, FTAG);
 	if (error != 0)
 		return (error);
 
@@ -2201,7 +2230,7 @@ zfs_ioc_vdev_setfru(zfs_cmd_t *zc)
 	uint64_t guid = zc->zc_guid;
 	int error;
 
-	error = spa_open(zc->zc_name, &spa, FTAG);
+	error = pool_open_devices(zc->zc_name, &spa, FTAG);
 	if (error != 0)
 		return (error);
 
@@ -4116,7 +4145,7 @@ zfs_ioc_pool_initialize(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 	}
 
 	spa_t *spa;
-	int error = spa_open(poolname, &spa, FTAG);
+	int error = pool_open_devices(poolname, &spa, FTAG);
 	if (error != 0)
 		return (error);
 
@@ -4202,7 +4231,7 @@ zfs_ioc_pool_trim(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
 	}
 
 	spa_t *spa;
-	int error = spa_open(poolname, &spa, FTAG);
+	int error = pool_open_devices(poolname, &spa, FTAG);
 	if (error != 0)
 		return (error);
 
@@ -5601,7 +5630,7 @@ zfs_ioc_pool_reopen(zfs_cmd_t *zc)
 	spa_t *spa;
 	int error;
 
-	error = spa_open(zc->zc_name, &spa, FTAG);
+	error = pool_open_devices(zc->zc_name, &spa, FTAG);
 	if (error != 0)
 		return (error);
 
