@@ -24,6 +24,7 @@
  */
 /*
  * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/refcount.h>
@@ -227,6 +228,43 @@ rrw_enter_write(rrwlock_t *rrl)
 	mutex_exit(&rrl->rr_lock);
 }
 
+/*
+ * Like rrw_enter_write(), but give up at the deadline (in lbolt ticks, as for
+ * cv_timedwait()), for a caller that mustn't wait without bound for a reader
+ * that may never let go.  Returns B_TRUE with the lock held as writer, or
+ * B_FALSE without it.
+ */
+boolean_t
+rrw_enter_write_deadline(rrwlock_t *rrl, clock_t deadline)
+{
+	mutex_enter(&rrl->rr_lock);
+	ASSERT(rrl->rr_writer != curthread);
+
+	while (zfs_refcount_count(&rrl->rr_anon_rcount) > 0 ||
+	    zfs_refcount_count(&rrl->rr_linked_rcount) > 0 ||
+	    rrl->rr_writer != NULL) {
+		if (ddi_get_lbolt() >= deadline) {
+			/*
+			 * Stop holding up new readers, and wake those that
+			 * are waiting for us.  A reader that entered while we
+			 * waited stays linked, and exits as such.  Another
+			 * writer that is waiting sets rr_writer_wanted again
+			 * when it wakes up.
+			 */
+			rrl->rr_writer_wanted = B_FALSE;
+			cv_broadcast(&rrl->rr_cv);
+			mutex_exit(&rrl->rr_lock);
+			return (B_FALSE);
+		}
+		rrl->rr_writer_wanted = B_TRUE;
+		(void) cv_timedwait(&rrl->rr_cv, &rrl->rr_lock, deadline);
+	}
+	rrl->rr_writer_wanted = B_FALSE;
+	rrl->rr_writer = curthread;
+	mutex_exit(&rrl->rr_lock);
+	return (B_TRUE);
+}
+
 void
 rrw_enter(rrwlock_t *rrl, krw_t rw, void *tag)
 {
@@ -370,6 +408,27 @@ rrm_enter_write(rrmlock_t *rrl)
 
 	for (i = 0; i < RRM_NUM_LOCKS; i++)
 		rrw_enter_write(&rrl->locks[i]);
+}
+
+/*
+ * Like rrm_enter_write(), but give up at the deadline (see
+ * rrw_enter_write_deadline()).  Returns B_TRUE with the lock held as writer,
+ * or B_FALSE without it.
+ */
+boolean_t
+rrm_enter_write_deadline(rrmlock_t *rrl, clock_t deadline)
+{
+	int i;
+
+	for (i = 0; i < RRM_NUM_LOCKS; i++) {
+		if (!rrw_enter_write_deadline(&rrl->locks[i], deadline)) {
+			/* Let the readers of the locks we took go ahead. */
+			while (--i >= 0)
+				rrw_exit(&rrl->locks[i], FTAG);
+			return (B_FALSE);
+		}
+	}
+	return (B_TRUE);
 }
 
 void

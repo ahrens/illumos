@@ -24,6 +24,7 @@
  */
 /*
  * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #ifndef	_SYS_RR_RW_LOCK_H
@@ -72,6 +73,7 @@ void rrw_enter(rrwlock_t *rrl, krw_t rw, void *tag);
 void rrw_enter_read(rrwlock_t *rrl, void *tag);
 void rrw_enter_read_prio(rrwlock_t *rrl, void *tag);
 void rrw_enter_write(rrwlock_t *rrl);
+boolean_t rrw_enter_write_deadline(rrwlock_t *rrl, clock_t deadline);
 void rrw_exit(rrwlock_t *rrl, void *tag);
 boolean_t rrw_held(rrwlock_t *rrl, krw_t rw);
 void rrw_tsd_destroy(void *arg);
@@ -98,6 +100,7 @@ void rrm_destroy(rrmlock_t *rrl);
 void rrm_enter(rrmlock_t *rrl, krw_t rw, void *tag);
 void rrm_enter_read(rrmlock_t *rrl, void *tag);
 void rrm_enter_write(rrmlock_t *rrl);
+boolean_t rrm_enter_write_deadline(rrmlock_t *rrl, clock_t deadline);
 void rrm_exit(rrmlock_t *rrl, void *tag);
 boolean_t rrm_held(rrmlock_t *rrl, krw_t rw);
 

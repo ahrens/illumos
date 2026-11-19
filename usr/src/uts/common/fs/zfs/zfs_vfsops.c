@@ -125,7 +125,8 @@ static kmutex_t zfs_mounts_lock;
 static kcondvar_t zfs_mounts_cv;
 static uint64_t zfs_mounts_gen;
 
-static int zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting);
+static int zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting,
+    clock_t deadline);
 
 /*
  * Take a file system off zfs_mounts, if it is on it: it is about to release
@@ -1555,7 +1556,7 @@ teardown:
 	 * Give the file system up as an unmount would: zfsvfs_setup() opened
 	 * the log and registered the property callbacks.
 	 */
-	VERIFY0(zfsvfs_teardown(zfsvfs, B_TRUE));
+	VERIFY0(zfsvfs_teardown(zfsvfs, B_TRUE, 0));
 	mutex_enter(&zfsvfs->z_os->os_user_ptr_lock);
 	dmu_objset_set_user(zfsvfs->z_os, NULL);
 	mutex_exit(&zfsvfs->z_os->os_user_ptr_lock);
@@ -2262,16 +2263,33 @@ zfs_root(vfs_t *vfsp, vnode_t **vpp)
  *
  * Note, if 'unmounting' is FALSE, we return with the 'z_teardown_lock'
  * and 'z_teardown_inactive_lock' held.
+ *
+ * Given a deadline (in lbolt ticks; 0 for none), return EBUSY, with neither
+ * lock held, if 'z_teardown_lock' is still held then, by a vnode operation,
+ * say: the export of a failed pool mustn't wait without bound for one asleep
+ * outside the pool (see zfsvfs_detach()).
  */
 static int
-zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
+zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting, clock_t deadline)
 {
 	znode_t	*zp;
 	zilog_t	*zilog;
 
 	zfs_unlinked_drain_stop_wait(zfsvfs);
 
-	rrm_enter(&zfsvfs->z_teardown_lock, RW_WRITER, FTAG);
+	/*
+	 * Vnode operations hold z_teardown_lock as reader from ZFS_ENTER() to
+	 * ZFS_EXIT(), including across uiomove(), which can sleep in a page
+	 * fault for as long as the paged file's device takes.  Giving up
+	 * leaves the unlinked drain stopped, which is harmless on the failed
+	 * pool that the deadline is for.
+	 */
+	if (deadline == 0) {
+		rrm_enter(&zfsvfs->z_teardown_lock, RW_WRITER, FTAG);
+	} else if (!rrm_enter_write_deadline(&zfsvfs->z_teardown_lock,
+	    deadline)) {
+		return (SET_ERROR(EBUSY));
+	}
 
 	if (!unmounting) {
 		/*
@@ -2381,25 +2399,49 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 }
 
 /*
- * Before tearing down a file system on a failed pool, wait for its log
- * writes in flight, and for its dirty data to drain, but only until the
- * deadline (see zil_failed_wait()).  Writes that reached a device before the
- * pool failed may never finish, and the teardown would wait for them with no
- * deadline and the file system locked out: in zil_close(), in waiting for
- * the dirty data, and in taking z_teardown_lock as writer behind a thread in
- * fsync() that waits for them holding it as reader.  Returns EBUSY if some
- * are still in flight at the deadline, and 0 otherwise, as on a pool that
- * hasn't failed.
+ * Before tearing down a file system on a failed pool, wait for its vnode
+ * operations in progress, for its log writes in flight, and for its dirty
+ * data to drain, but only until the deadline (see zil_failed_wait()).  Writes
+ * that reached a device before the pool failed may never finish, and the
+ * teardown would wait for them with no deadline and the file system locked
+ * out: in zil_close(), in waiting for the dirty data, and in taking
+ * z_teardown_lock as writer behind a thread in fsync() that waits for them
+ * holding it as reader.  Returns EBUSY if any are still in progress at the
+ * deadline, and 0 otherwise, as on a pool that hasn't failed.  (A page that
+ * zfs_inactive() was writing out when the pool failed, holding only
+ * z_teardown_inactive_lock, can still dirty the file system afterwards, and
+ * the teardown then waits for that with no deadline.)
  */
 static int
 zfsvfs_failed_log_wait(zfsvfs_t *zfsvfs, clock_t deadline)
 {
+	boolean_t failed;
 	int error = 0;
 
-	/* z_teardown_lock keeps the log, and so the objset, from going away. */
-	rrm_enter_read(&zfsvfs->z_teardown_lock, FTAG);
-	if (zfsvfs->z_log != NULL &&
-	    spa_failed(dmu_objset_spa(zfsvfs->z_os))) {
+	/* z_spa is valid while the file system is on zfs_mounts. */
+	mutex_enter(&zfs_mounts_lock);
+	failed = list_link_active(&zfsvfs->z_mounts_node) &&
+	    spa_failed(zfsvfs->z_spa);
+	mutex_exit(&zfs_mounts_lock);
+	if (!failed)
+		return (0);
+
+	/*
+	 * Take z_teardown_lock as writer, until the deadline: the vnode
+	 * operations in progress may be waiting for the log writes, or adding
+	 * to the dirty data, and a rollback that began to suspend the file
+	 * system before the pool failed may be waiting for them too.  Wait
+	 * for at least a tick, even past the deadline, as in the export's
+	 * second round: an fsync() that the last log writes woke may not have
+	 * returned yet.  Later operations can do
+	 * neither, since a failed pool's tx assignments and commits fail at
+	 * once.  The lock also keeps the log, and so the objset, from going
+	 * away.
+	 */
+	if (!rrm_enter_write_deadline(&zfsvfs->z_teardown_lock,
+	    MAX(deadline, ddi_get_lbolt() + 1)))
+		return (SET_ERROR(EBUSY));
+	if (zfsvfs->z_log != NULL) {
 		error = zil_failed_wait(zfsvfs->z_log,
 		    MAX(deadline - ddi_get_lbolt(), 1));
 		/*
@@ -2499,9 +2541,10 @@ zfs_umount(vfs_t *vfsp, int fflag, cred_t *cr)
 
 	/*
 	 * On a failed pool, give up at an export's deadline rather than wait
-	 * for log writes that may never finish: the file system stays
-	 * mounted, and keeps the pool busy.  (The unlinked drain stays
-	 * stopped, which doesn't matter on a failed pool.)
+	 * for log writes that may never finish, or for vnode operations
+	 * waiting for them: the file system stays mounted, and keeps the pool
+	 * busy.  (The unlinked drain stays stopped, which doesn't matter on a
+	 * failed pool.)
 	 */
 	if ((ret = zfsvfs_failed_log_wait(zfsvfs, spa_exit_deadline())) != 0)
 		return (ret);
@@ -2509,7 +2552,7 @@ zfs_umount(vfs_t *vfsp, int fflag, cred_t *cr)
 	vfsp->vfs_flag |= VFS_UNMOUNTED;
 
 	zfs_mounts_remove(zfsvfs, B_TRUE);
-	VERIFY(zfsvfs_teardown(zfsvfs, B_TRUE) == 0);
+	VERIFY(zfsvfs_teardown(zfsvfs, B_TRUE, 0) == 0);
 	os = zfsvfs->z_os;
 
 	/*
@@ -2658,7 +2701,7 @@ zfs_suspend_fs(zfsvfs_t *zfsvfs)
 	if (failed)
 		return (SET_ERROR(EIO));
 
-	if ((error = zfsvfs_teardown(zfsvfs, B_FALSE)) != 0)
+	if ((error = zfsvfs_teardown(zfsvfs, B_FALSE, 0)) != 0)
 		return (error);
 
 	return (0);
@@ -2755,9 +2798,10 @@ bail:
  * its log, release the dbufs of its znodes and its dataset, and leave it
  * with no objset, so that its vnode operations fail with EIO (ZFS_ENTER()).
  * Like a file system whose resume failed, it stays mounted until it is
- * unmounted, which then always succeeds.  Returns EBUSY if its log still has
- * writes in flight at the deadline, and EIO if it has already released its
- * dataset.
+ * unmounted, which then always succeeds.  Returns EBUSY if, at the deadline,
+ * its log still has writes in flight or a vnode operation still holds it
+ * (asleep outside the pool, say, faulting on a page of a file whose device
+ * hung), and EIO if it has already released its dataset.
  */
 static int
 zfsvfs_detach(zfsvfs_t *zfsvfs, clock_t deadline)
@@ -2766,20 +2810,28 @@ zfsvfs_detach(zfsvfs_t *zfsvfs, clock_t deadline)
 	int error;
 
 	/*
-	 * Wait for the log writes in flight here, until the deadline, rather
-	 * than in the teardown with the file system locked out.  A receive or
-	 * rollback doesn't suspend a failed pool's file system (see
-	 * zfs_suspend_fs()); one that suspended it before the pool failed
-	 * holds z_teardown_lock until it resumes, which it does at once
-	 * unless its teardown waits for log writes that reached a device
+	 * Wait for the vnode operations, log writes and dirty data in
+	 * progress here, until the deadline, rather than in the teardown with
+	 * no deadline.  A receive or rollback doesn't suspend a failed pool's
+	 * file system (see zfs_suspend_fs()); one that suspended it before the
+	 * pool failed holds z_teardown_lock until it resumes, which it does at
+	 * once unless its teardown waits for log writes that reached a device
 	 * before the failure.
 	 */
 	error = zfsvfs_failed_log_wait(zfsvfs, deadline);
 	if (error != 0)
 		return (error);
 
-	/* Suspend it as for a rollback (zfs_suspend_fs()), then let go. */
-	error = zfsvfs_teardown(zfsvfs, B_FALSE);
+	/*
+	 * Suspend it as for a rollback (zfs_suspend_fs()), then let go.  The
+	 * teardown waits for the vnode operations that started since
+	 * zfsvfs_failed_log_wait() let go of z_teardown_lock, until the
+	 * deadline at most, but for at least a tick: they fail at once on a
+	 * failed pool, but may not have returned yet, and the export's second
+	 * round runs past the deadline.
+	 */
+	error = zfsvfs_teardown(zfsvfs, B_FALSE,
+	    MAX(deadline, ddi_get_lbolt() + 1));
 	if (error != 0)
 		return (error);
 	os = zfsvfs->z_os;
@@ -2806,9 +2858,10 @@ zfsvfs_detach(zfsvfs_t *zfsvfs, clock_t deadline)
  * with the mounts and receives that the failing pool wakes up.  "zpool
  * export" unmounts them once the pool is gone (zpool_unmount_detached()).
  * Mounts in progress are waited for: they fail (see zfs_domount()).  A file
- * system whose log writes are still in flight at the deadline is left
- * alone, and keeps the pool busy.  Waits until the deadline at most (see
- * spa_exit_deadline()).  Returns the number of file systems detached.
+ * system whose log writes or vnode operations are still in progress at the
+ * deadline is left alone, and keeps the pool busy.  Waits until the deadline
+ * at most (see spa_exit_deadline()).  Returns the number of file systems
+ * detached.
  */
 int
 zfs_fail_mounts(const char *pool, clock_t deadline)
@@ -2856,7 +2909,8 @@ zfs_fail_mounts(const char *pool, clock_t deadline)
 			detached++;
 		} else if (error == EBUSY) {
 			zfs_dbgmsg("pool '%s' failed: file system %p still "
-			    "has log writes in flight", pool, zfsvfs);
+			    "has log writes or vnode operations in progress",
+			    pool, zfsvfs);
 		}
 
 		mutex_enter(&zfs_mounts_lock);
