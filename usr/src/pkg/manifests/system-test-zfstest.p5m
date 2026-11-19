@@ -2592,6 +2592,9 @@ file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_continue \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_death \
     mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_first_open \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/setup mode=0555
 dir  path=opt/zfs-tests/tests/functional/fault
 file path=opt/zfs-tests/tests/functional/fault/auto_spare_sorted_001_pos \

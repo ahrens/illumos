@@ -112,6 +112,17 @@ kmutex_t zfsdev_state_lock;
 static uint32_t zvol_minors;
 
 /*
+ * Every volume, from zvol_create_minor() to zvol_remove_zv(), for
+ * zvol_pinned_minors().  "zpool export -F" calls that before it fails the
+ * pool, so it mustn't wait for zfsdev_state_lock: a volume's first open,
+ * among others, holds that lock while it waits for the pool, which, if the
+ * pool is suspended, may be until the pool fails.  zvol_list_lock comes
+ * after zfsdev_state_lock, and only swapinfo_lock is taken under it.
+ */
+static list_t zvol_list;
+static kmutex_t zvol_list_lock;
+
+/*
  * zvol specific flags
  * Some of the flags indicate attributes of the zvol and others
  * are used to describe state. In the future, we may want to separate
@@ -205,6 +216,7 @@ typedef struct zvol_state {
 	 * zvol_fail() while it takes them away.
 	 */
 	krwlock_t	zv_io_lock;
+	list_node_t	zv_list_node;	/* on zvol_list */
 } zvol_state_t;
 
 /*
@@ -669,6 +681,18 @@ zvol_create_minor(const char *name)
 		return (error);
 	}
 
+	/*
+	 * Get the block size before anything we would have to undo: this
+	 * fails if the pool has failed, as it may have while we waited for
+	 * it, and the volume's dnode isn't cached.
+	 */
+	error = dmu_object_info(os, ZVOL_OBJ, &doi);
+	if (error) {
+		dmu_objset_disown(os, 1, FTAG);
+		mutex_exit(&zfsdev_state_lock);
+		return (error);
+	}
+
 	if ((minor = zfsdev_minor_alloc()) == 0) {
 		dmu_objset_disown(os, 1, FTAG);
 		mutex_exit(&zfsdev_state_lock);
@@ -724,9 +748,7 @@ zvol_create_minor(const char *name)
 	cv_init(&zv->zv_state_cv, NULL, CV_DEFAULT, NULL);
 	rw_init(&zv->zv_io_lock, NULL, RW_DEFAULT, NULL);
 
-	/* get and cache the blocksize */
-	error = dmu_object_info(os, ZVOL_OBJ, &doi);
-	ASSERT(error == 0);
+	/* cache the blocksize */
 	zv->zv_volblocksize = doi.doi_data_block_size;
 	if (zap_lookup(zv->zv_objset, ZVOL_ZAP_OBJ,
 	    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE), 8, 1,
@@ -744,6 +766,9 @@ zvol_create_minor(const char *name)
 	dmu_objset_disown(os, 1, FTAG);
 	zv->zv_objset = NULL;
 
+	mutex_enter(&zvol_list_lock);
+	list_insert_tail(&zvol_list, zv);
+	mutex_exit(&zvol_list_lock);
 	zvol_minors++;
 
 	mutex_exit(&zfsdev_state_lock);
@@ -775,6 +800,10 @@ zvol_remove_zv(zvol_state_t *zv)
 	/* zvol_last_close() should have cleaned these up already */
 	ASSERT(zv->zv_objset == NULL);
 	ASSERT(zv->zv_dvas == NULL);
+
+	mutex_enter(&zvol_list_lock);
+	list_remove(&zvol_list, zv);
+	mutex_exit(&zvol_list_lock);
 
 	(void) snprintf(nmbuf, sizeof (nmbuf), "%u,raw", minor);
 	ddi_remove_minor_node(zfs_dip, nmbuf);
@@ -827,6 +856,17 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	if (error)
 		return (error);
 
+	/*
+	 * Read this before anything we would have to undo: it fails if the
+	 * pool has failed, as it may have while we waited for it, and the
+	 * property isn't cached.
+	 */
+	error = dsl_prop_get_integer(zv->zv_name, "readonly", &readonly, NULL);
+	if (error) {
+		dmu_objset_disown(os, 1, zv);
+		return (error);
+	}
+
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &volsize);
 	if (error) {
 		dmu_objset_disown(os, 1, zv);
@@ -876,8 +916,6 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 
 	zv->zv_zilog = zil_open(os, zvol_get_data);
 
-	VERIFY(dsl_prop_get_integer(zv->zv_name, "readonly", &readonly,
-	    NULL) == 0);
 	if (readonly || dmu_objset_is_snapshot(os) ||
 	    !spa_writeable(dmu_objset_spa(os)))
 		zv->zv_flags |= ZVOL_RDONLY;
@@ -1334,7 +1372,8 @@ zvol_fail(zvol_state_t *zv, clock_t deadline)
  * Does the named pool have a volume that failing the pool can't let go of
  * (see zvol_fail()), or that the system can't do without?  COMSTAR holds
  * pointers into a volume it uses (ZVOL_EXTERNAL), and dump and swap devices
- * would get EIO.
+ * would get EIO.  Asked before the pool is failed (see zfs_pool_fail()), so
+ * it doesn't wait for the pool.
  */
 boolean_t
 zvol_pinned_minors(const char *name)
@@ -1343,12 +1382,16 @@ zvol_pinned_minors(const char *name)
 	major_t major = ddi_driver_major(zfs_dip);
 	boolean_t pinned = B_FALSE;
 
-	mutex_enter(&zfsdev_state_lock);
-	for (minor_t minor = 1; minor <= ZFSDEV_MAX_MINOR && !pinned;
-	    minor++) {
-		zvol_state_t *zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
-
-		if (zv == NULL || zv->zv_total_opens == 0 ||
+	/*
+	 * Not zfsdev_state_lock (see zvol_list), nor zv_state_lock, which a
+	 * first open also holds while it opens the pool.  So a volume can be
+	 * opened, closed or pinned as we look at it, as it can once we
+	 * return, before the pool is failed.
+	 */
+	mutex_enter(&zvol_list_lock);
+	for (zvol_state_t *zv = list_head(&zvol_list); zv != NULL && !pinned;
+	    zv = list_next(&zvol_list, zv)) {
+		if (zv->zv_total_opens == 0 ||
 		    strncmp(name, zv->zv_name, len) != 0 ||
 		    (zv->zv_name[len] != '/' && zv->zv_name[len] != '@'))
 			continue;
@@ -1356,7 +1399,7 @@ zvol_pinned_minors(const char *name)
 			pinned = B_TRUE;
 			break;
 		}
-		dev_t dev = makedevice(major, minor);
+		dev_t dev = makedevice(major, zv->zv_minor);
 		mutex_enter(&swapinfo_lock);
 		for (struct swapinfo *sip = swapinfo; sip != NULL;
 		    sip = sip->si_next) {
@@ -1369,7 +1412,7 @@ zvol_pinned_minors(const char *name)
 		}
 		mutex_exit(&swapinfo_lock);
 	}
-	mutex_exit(&zfsdev_state_lock);
+	mutex_exit(&zvol_list_lock);
 
 	return (pinned);
 }
@@ -2977,11 +3020,16 @@ zvol_init(void)
 	VERIFY(ddi_soft_state_init(&zfsdev_state, sizeof (zfs_soft_state_t),
 	    1) == 0);
 	mutex_init(&zfsdev_state_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&zvol_list_lock, NULL, MUTEX_DEFAULT, NULL);
+	list_create(&zvol_list, sizeof (zvol_state_t),
+	    offsetof(zvol_state_t, zv_list_node));
 }
 
 void
 zvol_fini(void)
 {
+	list_destroy(&zvol_list);
+	mutex_destroy(&zvol_list_lock);
 	mutex_destroy(&zfsdev_state_lock);
 	ddi_soft_state_fini(&zfsdev_state);
 }
