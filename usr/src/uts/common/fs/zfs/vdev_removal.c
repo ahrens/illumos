@@ -1819,7 +1819,9 @@ vdev_remove_make_hole_and_free(vdev_t *vd)
 }
 
 /*
- * Remove a log device.  The config lock is held for the specified TXG.
+ * Remove a log device.  The config lock is held for the specified TXG.  If
+ * the pool fails before the removal has synced, returns EIO and leaves the
+ * device in the pool, where it still is on disk.
  */
 static int
 spa_vdev_remove_log(vdev_t *vd, uint64_t *txg)
@@ -1911,6 +1913,17 @@ spa_vdev_remove_log(vdev_t *vd, uint64_t *txg)
 	/* Make sure these changes are sync'ed */
 	spa_vdev_config_exit(spa, NULL, *txg, 0, FTAG);
 	*txg = spa_vdev_config_enter(spa);
+
+	/*
+	 * If the pool has failed, the removal may not have synced: a failed
+	 * pool's spa_sync() takes the device off its dirty lists (see
+	 * vdev_sync_discard()), which leaves its metadata and ZAPs, and
+	 * doesn't commit the txg.  Nothing more will be written, so the disks
+	 * keep the device.  Leave it in the pool, passivated and marked as
+	 * removing, since it has no metaslabs left.
+	 */
+	if (spa_failed(spa))
+		return (SET_ERROR(EIO));
 
 	sysevent_t *ev = spa_event_create(spa, vd, NULL,
 	    ESC_ZFS_VDEV_REMOVE_DEV);
