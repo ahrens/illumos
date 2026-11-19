@@ -1404,7 +1404,12 @@ zvol_pinned_minors(const char *name)
 	mutex_enter(&zvol_list_lock);
 	for (zvol_state_t *zv = list_head(&zvol_list); zv != NULL && !pinned;
 	    zv = list_next(&zvol_list, zv)) {
-		if (zv->zv_total_opens == 0 ||
+		/*
+		 * A failed volume no longer holds its pool: an export of the
+		 * failed pool let go of it, and a new pool of the same name
+		 * may since have been imported.
+		 */
+		if (zv->zv_total_opens == 0 || (zv->zv_flags & ZVOL_FAILED) ||
 		    strncmp(name, zv->zv_name, len) != 0 ||
 		    (zv->zv_name[len] != '/' && zv->zv_name[len] != '@'))
 			continue;
