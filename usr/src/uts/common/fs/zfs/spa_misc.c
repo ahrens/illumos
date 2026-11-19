@@ -120,14 +120,20 @@
  *	The namespace lock must always be taken before the config lock.
  *
  *		spa_namespace_lock	->	spa_namespace_avl_lock
- *		spa_namespace_avl_lock	->	spa_suspend_lock
+ *		spa_namespace_lock	->	spa_suspend_lock
  *		spa_namespace_lock	->	spa_streams_lock
+ *		zfsdev_state_lock	->	spa_namespace_lock
  *
- *	spa_namespace_avl_lock is a leaf lock, held only while adding a spa_t
- *	to or removing it from the namespace AVL tree, and by
- *	spa_exit_fail_by_name(), which has to find a pool to fail even while
- *	a thread sleeps holding spa_namespace_lock.  It holds the pool with
- *	spa_exit_hold(), and fails it after dropping the lock.
+ *	spa_namespace_avl_lock is a leaf lock.  spa_add() and spa_remove()
+ *	take it to add a spa_t to or remove it from the namespace AVL tree,
+ *	and spa_exit_fail_by_name() and spa_shutdown_callb() to find a pool
+ *	to fail or arm even while a thread sleeps holding
+ *	spa_namespace_lock; they hold the pool with spa_exit_hold(), and drop
+ *	the lock before they fail or arm it.  It is also the mutex of
+ *	spa_exit_hold_cv, on which spa_exit_unload_wait() waits for those
+ *	holds to go away, possibly with spa_namespace_lock and
+ *	zfsdev_state_lock held, so a thread that holds a pool with
+ *	spa_exit_hold() takes neither of them.
  *
  *
  * The spa_namespace_lock can be acquired directly and is globally visible.

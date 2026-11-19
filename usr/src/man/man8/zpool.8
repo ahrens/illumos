@@ -1339,9 +1339,12 @@ The pool holding the root file system cannot be exported this way, nor can a
 pool with a volume in use as a dump or swap device, or by COMSTAR; the pool is
 left as it was.
 .Pp
-If the export fails after the pool has failed, for example because a file
-system mounted on top of one of its datasets cannot be unmounted, the pool
-remains failed, and the command can be run again.
+If the export fails after the pool has failed, for example because a
+.Nm zfs Cm send
+or
+.Nm zfs Cm receive
+of one of its datasets is stopped and can't be woken, the pool remains failed,
+and the command can be run again.
 A pool that has already failed
 .Pq its health is Sy FAILED
 can also be exported without
