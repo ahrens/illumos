@@ -662,7 +662,8 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 	int error = 0;
 	tx_state_t *tx = &dp->dp_tx;
 
-	ASSERT0(flags & ~(TXG_WAIT_SIGNAL | TXG_WAIT_SUSPEND));
+	ASSERT0(flags &
+	    ~(TXG_WAIT_SIGNAL | TXG_WAIT_SUSPEND | TXG_WAIT_FAILED));
 	ASSERT(!dsl_pool_config_held(dp));
 
 	mutex_enter(&tx->tx_sync_lock);
@@ -679,7 +680,8 @@ txg_wait_synced_flags(dsl_pool_t *dp, uint64_t txg, txg_wait_flag_t flags)
 	 * else interesting happens, we'll set an error and break out.
 	 */
 	while (tx->tx_synced_txg < txg) {
-		if ((flags & TXG_WAIT_SUSPEND) && spa_failed(dp->dp_spa)) {
+		if ((flags & (TXG_WAIT_SUSPEND | TXG_WAIT_FAILED)) &&
+		    spa_failed(dp->dp_spa)) {
 			error = SET_ERROR(EIO);
 			break;
 		}
@@ -732,6 +734,40 @@ txg_wait_synced(dsl_pool_t *dp, uint64_t txg)
 	int error = txg_wait_synced_flags(dp, txg, TXG_WAIT_NONE);
 
 	VERIFY(error == 0 || spa_failed(dp->dp_spa));
+}
+
+/*
+ * Like txg_wait_synced(), but give up at the deadline (in lbolt; see
+ * spa_exit_deadline()), returning EBUSY.  A failed pool's txgs drain
+ * without being written, but a log block that was issued before the
+ * failure holds its txg open until its write is done (see
+ * zil_lwb_flush_vdevs_done()), which may be never.
+ */
+int
+txg_wait_synced_deadline(dsl_pool_t *dp, uint64_t txg, clock_t deadline)
+{
+	tx_state_t *tx = &dp->dp_tx;
+	int error = 0;
+
+	ASSERT(!dsl_pool_config_held(dp));
+
+	mutex_enter(&tx->tx_sync_lock);
+	ASSERT3U(tx->tx_threads, ==, 2);
+	if (txg == 0)
+		txg = tx->tx_open_txg + TXG_DEFER_SIZE;
+	if (tx->tx_sync_txg_waiting < txg)
+		tx->tx_sync_txg_waiting = txg;
+	while (tx->tx_synced_txg < txg) {
+		cv_broadcast(&tx->tx_sync_more_cv);
+		if (cv_timedwait(&tx->tx_sync_done_cv, &tx->tx_sync_lock,
+		    deadline) == -1 && tx->tx_synced_txg < txg) {
+			error = SET_ERROR(EBUSY);
+			break;
+		}
+	}
+	mutex_exit(&tx->tx_sync_lock);
+
+	return (error);
 }
 
 void

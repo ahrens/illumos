@@ -2565,6 +2565,8 @@ file path=opt/zfs-tests/tests/functional/failmode/forced_export_idle_lofi \
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_import mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_log_removal \
     mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_log_writes \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_mount_races \
     mode=0555
 file \

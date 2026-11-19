@@ -87,6 +87,14 @@ typedef enum {
 	 * If it has failed, return EIO without waiting.
 	 */
 	TXG_WAIT_SUSPEND = (1 << 1),
+
+	/*
+	 * If the pool has failed, or fails while waiting, return EIO, but
+	 * keep waiting on a suspended pool.  For a wait whose caller fails
+	 * anyway once the pool has failed, and that mustn't wait for a txg
+	 * that a log write holds open (see txg_wait_synced_deadline()).
+	 */
+	TXG_WAIT_FAILED = (1 << 2),
 } txg_wait_flag_t;
 
 /*
@@ -127,6 +135,13 @@ extern int txg_wait_synced_flags(struct dsl_pool *dp, uint64_t txg,
  * Shorthand for VERIFY0(txg_wait_synced_flags(dp, TXG_WAIT_NONE))
  */
 extern void txg_wait_synced(struct dsl_pool *dp, uint64_t txg);
+
+/*
+ * Wait for a txg to sync, but only until the deadline (in lbolt); returns
+ * EBUSY then.
+ */
+extern int txg_wait_synced_deadline(struct dsl_pool *dp, uint64_t txg,
+    clock_t deadline);
 
 /*
  * Wake all threads waiting in txg_wait_synced_flags() so they can reevaluate.

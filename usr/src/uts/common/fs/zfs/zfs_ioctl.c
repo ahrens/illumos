@@ -1736,17 +1736,27 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	 * pool fails while we export it, they are still there, so try again
 	 * once.  A hardforce export fails the pool first, whatever its state,
 	 * unless it is the root pool.  All of this waits for the pool's users
-	 * to let go of it until one deadline.
+	 * to let go of it until one deadline, which starts again if the pool
+	 * failed during the export: the export may have reached the deadline
+	 * waiting for the pool to sync, and the volumes' and file systems'
+	 * dirty data needs time to drain.
 	 */
 	if (hardforce && zfs_pool_fail(zc->zc_name) == EBUSY)
 		return (SET_ERROR(EBUSY));
+	boolean_t failed = spa_failed_by_name(zc->zc_name);
 	clock_t deadline = spa_exit_deadline();
 	(void) zfs_fail_mounts(zc->zc_name, deadline);
 	(void) zvol_fail_minors(zc->zc_name, deadline);
 	error = spa_export_by(zc->zc_name, force, hardforce, deadline);
-	if (error == EBUSY && zfs_fail_mounts(zc->zc_name, deadline) +
-	    zvol_fail_minors(zc->zc_name, deadline) != 0)
-		error = spa_export_by(zc->zc_name, force, hardforce, deadline);
+	if (error == EBUSY) {
+		if (!failed)
+			deadline = spa_exit_deadline();
+		if (zfs_fail_mounts(zc->zc_name, deadline) +
+		    zvol_fail_minors(zc->zc_name, deadline) != 0) {
+			error = spa_export_by(zc->zc_name, force, hardforce,
+			    deadline);
+		}
+	}
 	if (error == 0)
 		zvol_remove_minors(zc->zc_name);
 	return (error);

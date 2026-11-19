@@ -1285,11 +1285,13 @@ zvol_remove_minors(const char *name)
  * Let go of an open volume whose pool has failed, so that it no longer holds
  * the pool, which can then be exported: do what the last close would do.
  * From then on, its I/O fails with EIO and its opens with ENXIO, and its
- * minor goes away at the last close.
+ * minor goes away at the last close.  The last close on a failed pool does
+ * this too (see zvol_close()).
  *
- * First wait for its zero thread, for the I/O in progress, and for the log
+ * First wait for its zero thread, for the I/O in progress, for the log
  * writes that reached a device before the pool failed (all of which fail at
- * once otherwise; see zil_failed_wait()), because a device may never answer.
+ * once otherwise; see zil_failed_wait()), and for its dirty data to drain,
+ * which those writes can hold up, because a device may never answer.
  * Every zvol open, close and ioctl needs zfsdev_state_lock, so wait without
  * it, and only until the deadline (see spa_exit_deadline()).  Meanwhile,
  * ZVOL_FAILING keeps new I/O from starting (see zvol_io_enter()), the
@@ -1348,6 +1350,17 @@ zvol_fail(zvol_state_t *zv, clock_t deadline)
 	}
 	if (error == 0)
 		rw_exit(&zv->zv_io_lock);
+	/*
+	 * zvol_last_close() waits for the volume's dirty data to drain, which
+	 * a log write of any file system or volume in the pool holds up (see
+	 * txg_wait_synced_deadline()).  Wait for it here instead, once the
+	 * I/O that could still dirty the volume has finished.  ZVOL_FAILING
+	 * keeps the objset meanwhile: the last close leaves it to us
+	 * (zvol_close_impl()), and the volume isn't removed (zvol_remove_zv()).
+	 */
+	if (error == 0 && dsl_dataset_is_dirty(dmu_objset_ds(zv->zv_objset)))
+		error = txg_wait_synced_deadline(
+		    dmu_objset_pool(zv->zv_objset), 0, deadline);
 
 	mutex_enter(&zfsdev_state_lock);
 	mutex_enter(&zv->zv_state_lock);
@@ -1686,6 +1699,23 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 		txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
 		mutex_enter(&zfsdev_state_lock);
 	}
+
+	/*
+	 * On a failed pool, the last close also waits for the log writes in
+	 * flight (zil_close()), which may never finish.  Fail the volume
+	 * instead (see zvol_fail()), which waits for them without
+	 * zfsdev_state_lock.  zvol_fail() gives up at a deadline, leaving the
+	 * volume open and not failed, and the log can't be closed under its
+	 * writes, so try again until it succeeds; other opens, closes and
+	 * ioctls run while it waits.  A volume that zvol_fail() refuses is
+	 * closed as before, and one that it is already failing is left to it.
+	 */
+	while (zv->zv_total_opens == 1 &&
+	    !(zv->zv_flags & (ZVOL_FAILED | ZVOL_FAILING | ZVOL_EXTERNAL |
+	    ZVOL_DUMPIFIED)) &&
+	    spa_failed(dmu_objset_spa(zv->zv_objset)) &&
+	    zvol_fail(zv, spa_exit_deadline()) == EBUSY)
+		continue;
 
 	zvol_close_impl(zv, otyp);
 

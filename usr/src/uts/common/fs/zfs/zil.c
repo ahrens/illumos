@@ -2937,10 +2937,13 @@ zil_commit(zilog_t *zilog, uint64_t foid)
 	 * zil_commit_itx_assign() below, nor can we write out
 	 * lwbs like would be done in zil_commit_write(). Thus, we
 	 * simply rely on txg_wait_synced() to maintain the necessary
-	 * semantics, and avoid calling those functions altogether.
+	 * semantics, and avoid calling those functions altogether.  On a
+	 * failed pool, the commit fails anyway, so don't wait for a txg that
+	 * may never drain (see TXG_WAIT_FAILED).
 	 */
 	if (zilog->zl_suspend > 0) {
-		txg_wait_synced(zilog->zl_dmu_pool, 0);
+		(void) txg_wait_synced_flags(zilog->zl_dmu_pool, 0,
+		    TXG_WAIT_FAILED);
 		return (spa_failed(zilog->zl_spa) ? SET_ERROR(EIO) : 0);
 	}
 
@@ -2995,11 +2998,15 @@ zil_commit_impl(zilog_t *zilog, uint64_t foid)
 		 * relying on spa_sync() to write out the data this
 		 * thread is waiting on. Obviously this has performance
 		 * implications, but the expectation is for this to be
-		 * an exceptional case, and shouldn't occur often.
+		 * an exceptional case, and shouldn't occur often.  If the
+		 * pool fails, we fail below; stop waiting then, since a log
+		 * write of another dataset can hold the txg open for good,
+		 * and our caller may hold its file system's z_teardown_lock.
 		 */
 		DTRACE_PROBE2(zil__commit__io__error,
 		    zilog_t *, zilog, zil_commit_waiter_t *, zcw);
-		txg_wait_synced(zilog->zl_dmu_pool, 0);
+		(void) txg_wait_synced_flags(zilog->zl_dmu_pool, 0,
+		    TXG_WAIT_FAILED);
 	}
 
 	zil_free_commit_waiter(zcw);
@@ -3257,7 +3264,21 @@ zil_failed_wait(zilog_t *zilog, clock_t timeout)
 
 	ASSERT(spa_failed(zilog->zl_spa));
 
-	mutex_enter(&zilog->zl_issuer_lock);
+	/*
+	 * A commit holds zl_issuer_lock while it issues lwbs, and it can wait
+	 * there for a txg that a log write in flight holds open (zil_create(),
+	 * zil_commit_writer_stall()), so wait for the lock until the deadline
+	 * too.
+	 */
+	if (timeout == 0) {
+		mutex_enter(&zilog->zl_issuer_lock);
+	} else {
+		while (!mutex_tryenter(&zilog->zl_issuer_lock)) {
+			if (ddi_get_lbolt() >= deadline)
+				return (SET_ERROR(EBUSY));
+			delay(MAX(1, MSEC_TO_TICK(10)));
+		}
+	}
 	lwb = zilog->zl_last_lwb_opened;
 	if (lwb != NULL && lwb->lwb_state == LWB_STATE_OPENED)
 		(void) zil_lwb_write_issue(zilog, lwb);
@@ -3288,7 +3309,10 @@ zil_failed_wait(zilog_t *zilog, clock_t timeout)
 /*
  * Close the intent log of a failed pool.  Nothing can be committed: the log
  * is left on disk as it was when the pool failed, and whatever wasn't written
- * by then is discarded.  Wait for the lwbs in flight (see zil_failed_wait()).
+ * by then is discarded.  Wait for the lwbs in flight (see zil_failed_wait()),
+ * with no deadline, since they can't be freed under their writes; callers
+ * that mustn't wait forever, or that hold locks that others need, wait for
+ * them first, with a deadline (zfsvfs_failed_log_wait(), zvol_fail()).
  * None of the lwbs will be cleaned up by zil_sync(), since the pool's txgs
  * are never committed, so free them all here.
  */
