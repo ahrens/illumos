@@ -295,9 +295,11 @@ spa_exit_find(const char *name)
  *
  * A pool whose import hasn't started syncing yet is left alone: the export
  * waits for the import (see spa_lookup()), and fails the pool once it is
- * done (see zfs_ioc_pool_export()).  If the import's own sync suspends, it
- * hangs, as it does without forced exit; a failmode=death pool fails
- * instead, by itself.
+ * done (see spa_export_common()).  If the import's own sync suspends, the
+ * import waits, as it does without forced exit, until a "zpool export -F"
+ * issued once the sync has started, or a reboot, fails the pool; a
+ * failmode=death pool fails instead, by itself.  The import then fails (see
+ * spa_import()).
  *
  * The root pool can't be failed: the system needs it, and it can't be
  * exported.

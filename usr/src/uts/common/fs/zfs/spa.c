@@ -2506,7 +2506,13 @@ spa_load(spa_t *spa, spa_load_state_t state, spa_import_type_t type)
 			spa->spa_loaded_ts.tv_sec = 0;
 			spa->spa_loaded_ts.tv_nsec = 0;
 		}
-		if (error != EBADF) {
+		/*
+		 * A pool that failed while it loaded has posted the one
+		 * ereport that a failure gets (see spa_fail()).  Another
+		 * could have zfs-diagnosis fault it as a pool that can't be
+		 * opened.
+		 */
+		if (error != EBADF && !spa_failed(spa)) {
 			(void) zfs_ereport_post(ereport, spa,
 			    NULL, NULL, NULL, 0, 0);
 		}
@@ -4442,6 +4448,23 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, char **ereport)
 		txg_wait_synced(spa->spa_dsl_pool, spa->spa_claim_max_txg);
 
 		/*
+		 * Now that it syncs, the pool can fail (see spa_fail()): a
+		 * failmode=death pool whose first txgs can't be written, or a
+		 * pool that "zpool export -F" fails, which is what ends this
+		 * wait if those txgs suspended a pool on another failmode.
+		 * Nothing that follows would reach the disks of a failed
+		 * pool, and the initialize and TRIM restarts assert that they
+		 * can read each leaf's ZAP, which it can't unless the ZAP is
+		 * cached, so skip it all.  The load doesn't fail: its caller
+		 * would unload the pool, and the next open would load it
+		 * again, healthy (see spa_activate()).  Instead the pool stays
+		 * loaded and failed until it is exported, like a pool that
+		 * fails later; an import backs out (see spa_import()).
+		 */
+		if (spa_failed(spa))
+			goto loaded;
+
+		/*
 		 * Check if we need to request an update of the config. On the
 		 * next sync, we would update the config stored in vdev labels
 		 * and the cachefile (by default /etc/zfs/zpool.cache).
@@ -4482,6 +4505,10 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, char **ereport)
 		 */
 		dsl_pool_clean_tmp_userrefs(spa->spa_dsl_pool);
 
+		/* The pool may have failed since we checked (see above). */
+		if (spa_failed(spa))
+			goto loaded;
+
 		spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
 		vdev_initialize_restart(spa->spa_root_vdev);
 		vdev_trim_restart(spa->spa_root_vdev);
@@ -4491,10 +4518,10 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, char **ereport)
 
 	zio_handle_import_delay(spa, gethrtime() - load_start);
 
-	spa_import_progress_remove(spa);
 	spa_async_request(spa, SPA_ASYNC_L2CACHE_REBUILD);
-
-	spa_load_note(spa, "LOADED");
+loaded:
+	spa_import_progress_remove(spa);
+	spa_load_note(spa, "LOADED%s", spa_failed(spa) ? ", but failed" : "");
 fail:
 	mutex_enter(&spa_namespace_lock);
 	spa->spa_load_thread = NULL;
@@ -4562,6 +4589,19 @@ spa_load_best(spa_t *spa, spa_load_state_t state, uint64_t max_request,
 		return (load_error);
 	}
 
+	/*
+	 * A load can fail because its pool failed (see spa_fail()), which
+	 * fences off the disks: a read during the load that couldn't fail
+	 * suspended, and so failed, a failmode=death or armed pool.  The
+	 * pool isn't damaged, and mustn't be loaded again: spa_load_retry()
+	 * would undo the failure (see spa_activate()), and in recovery mode
+	 * the retry would rewind the pool.
+	 */
+	if (spa_failed(spa)) {
+		spa_import_progress_remove(spa);
+		return (load_error);
+	}
+
 	if (spa->spa_root_vdev != NULL)
 		config = spa_config_generate(spa, NULL, -1ULL, B_TRUE);
 
@@ -4594,9 +4634,11 @@ spa_load_best(spa_t *spa, spa_load_state_t state, uint64_t max_request,
 
 	/*
 	 * Continue as long as we're finding errors, we're still within
-	 * the acceptable rewind range, and we're still finding uberblocks
+	 * the acceptable rewind range, and we're still finding uberblocks,
+	 * unless a retry failed the pool (see above).
 	 */
-	while (rewind_error && spa->spa_uberblock.ub_txg >= min_txg &&
+	while (rewind_error && !spa_failed(spa) &&
+	    spa->spa_uberblock.ub_txg >= min_txg &&
 	    spa->spa_uberblock.ub_txg <= spa->spa_load_max_txg) {
 		if (spa->spa_load_max_txg < safe_rewind_txg)
 			spa->spa_extreme_rewind = B_TRUE;
@@ -5898,6 +5940,16 @@ spa_import(const char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 	if (props != NULL)
 		spa_configfile_set(spa, props, B_FALSE);
 
+	/*
+	 * A pool that failed while it loaded (see spa_load_impl()), or has
+	 * since, isn't imported.  This is the last point at which the import
+	 * can back out: once the async tasks resume, unloading the pool
+	 * would wait for them with spa_namespace_lock held, which the config
+	 * update task takes.
+	 */
+	if (error == 0 && spa_failed(spa))
+		error = SET_ERROR(EIO);
+
 	if (error != 0 || (props && spa_writeable(spa) &&
 	    (error = spa_prop_set(spa, props)))) {
 		spa_unload(spa);
@@ -5969,9 +6021,17 @@ spa_import(const char *pool, nvlist_t *config, nvlist_t *props, uint64_t flags)
 
 	spa_event_notify(spa, NULL, NULL, ESC_ZFS_POOL_IMPORT);
 
+	/*
+	 * A pool that has failed since we could back out (see above) is
+	 * imported, but the config update above may not have reached its
+	 * disks.  Say so, and leave the pool to be exported, as any failed
+	 * pool is.
+	 */
+	error = spa_failed(spa) ? SET_ERROR(EIO) : 0;
+
 	mutex_exit(&spa_namespace_lock);
 
-	return (0);
+	return (error);
 }
 
 nvlist_t *
@@ -7626,6 +7686,9 @@ spa_vdev_split_mirror(spa_t *spa, char *newname, nvlist_t *config,
 
 	/* create the new pool from the disks of the original pool */
 	error = spa_load(newspa, SPA_LOAD_IMPORT, SPA_IMPORT_ASSEMBLE);
+	/* A new pool that failed while it loaded isn't split off. */
+	if (error == 0 && spa_failed(newspa))
+		error = SET_ERROR(EIO);
 	if (error)
 		goto out;
 
