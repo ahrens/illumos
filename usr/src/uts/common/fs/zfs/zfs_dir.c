@@ -53,6 +53,7 @@
 #include "fs/fs_subr.h"
 #include <sys/zap.h>
 #include <sys/dmu.h>
+#include <sys/spa.h>
 #include <sys/atomic.h>
 #include <sys/zfs_ctldir.h>
 #include <sys/zfs_fuid.h>
@@ -490,8 +491,14 @@ zfs_unlinked_add(znode_t *zp, dmu_tx_t *tx)
 	ASSERT(zp->z_unlinked);
 	ASSERT(zp->z_links == 0);
 
-	VERIFY3U(0, ==,
-	    zap_add_int(zfsvfs->z_os, zfsvfs->z_unlinkedobj, zp->z_id, tx));
+	/*
+	 * On a failed pool, the unlinked set's blocks can't be read unless
+	 * they are cached, and nothing written reaches the disks (see
+	 * dmu_write()).
+	 */
+	int error = zap_add_int(zfsvfs->z_os, zfsvfs->z_unlinkedobj, zp->z_id,
+	    tx);
+	VERIFY(error == 0 || spa_failed(dmu_objset_spa(zfsvfs->z_os)));
 }
 
 /*
@@ -760,9 +767,10 @@ zfs_rmnode(znode_t *zp)
 		zfs_unlinked_add(xzp, tx);
 	}
 
-	/* Remove this znode from the unlinked set */
-	VERIFY3U(0, ==,
-	    zap_remove_int(zfsvfs->z_os, zfsvfs->z_unlinkedobj, zp->z_id, tx));
+	/* Remove this znode from the unlinked set (see zfs_unlinked_add()). */
+	error = zap_remove_int(zfsvfs->z_os, zfsvfs->z_unlinkedobj, zp->z_id,
+	    tx);
+	VERIFY(error == 0 || spa_failed(dmu_objset_spa(zfsvfs->z_os)));
 
 	zfs_znode_delete(zp, tx);
 

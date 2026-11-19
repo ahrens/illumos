@@ -1312,8 +1312,12 @@ dmu_zero(objset_t *os, uint64_t object, uint64_t offset, uint64_t size,
 	if (size == 0)
 		return;
 
-	VERIFY(0 == dmu_buf_hold_array(os, object, offset, size,
-	    FALSE, FTAG, &numbufs, &dbp));
+	/* See dmu_write(). */
+	if (dmu_buf_hold_array(os, object, offset, size,
+	    FALSE, FTAG, &numbufs, &dbp) != 0) {
+		VERIFY(spa_failed(os->os_spa));
+		return;
+	}
 
 	for (i = 0; i < numbufs; i++) {
 		dmu_buf_t *db = dbp[i];
@@ -1781,9 +1785,15 @@ dmu_copy_from_buf(objset_t *os, uint64_t object, uint64_t offset,
 
 	ASSERT3P(srcdb->db_buf, !=, NULL);
 
-	/* hold the db that we want to write to */
-	VERIFY0(dmu_buf_hold(os, object, offset, FTAG, &dst_handle,
-	    DMU_READ_NO_DECRYPT));
+	/*
+	 * Hold the db that we want to write to.  See dmu_write() for why
+	 * this can fail on a failed pool.
+	 */
+	if (dmu_buf_hold(os, object, offset, FTAG, &dst_handle,
+	    DMU_READ_NO_DECRYPT) != 0) {
+		VERIFY(spa_failed(os->os_spa));
+		return;
+	}
 	dstdb = (dmu_buf_impl_t *)dst_handle;
 	datalen = arc_buf_size(srcdb->db_buf);
 
