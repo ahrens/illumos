@@ -2498,6 +2498,9 @@ file path=opt/zfs-tests/tests/functional/failmode/failmode_death_cold_metadata \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_death_enospc \
     mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/failmode/failmode_death_enospc_reexecute \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_death_export_f \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/failmode_death_fails_alone \

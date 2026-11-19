@@ -4853,13 +4853,19 @@ zio_done(zio_t *zio)
 	 * be lost under it.  Reexecute it instead, as a write that suspends the
 	 * pool would be (see zio_suspend()): this time it gets a fake DVA (see
 	 * zio_dva_allocate_fake()), and runs into the fence.
+	 *
+	 * The write gets one more try than zio_reexecute_max allows, so that
+	 * one that used up its retries before the pool failed still gets its
+	 * fake DVA.  A fake allocation can't fail, so one try is enough; the
+	 * bound only keeps a write that keeps failing before its allocation
+	 * from being reexecuted forever.
 	 */
 	if (failed && zio->io_error != 0 && zio->io_type != ZIO_TYPE_READ &&
 	    zio->io_type != ZIO_TYPE_NULL &&
 	    !(zio->io_flags & ZIO_FLAG_CANFAIL)) {
 		if (zio->io_child_type == ZIO_CHILD_LOGICAL &&
 		    IO_IS_ALLOCATING(zio) && BP_GET_NDVAS(bp) == 0 &&
-		    zio->io_reexecute_count < zio_reexecute_max) {
+		    zio->io_reexecute_count <= zio_reexecute_max) {
 			zio->io_reexecute_count++;
 			zio->io_reexecute |= ZIO_REEXECUTE_NOW;
 		} else {
