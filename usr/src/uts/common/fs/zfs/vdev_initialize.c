@@ -726,26 +726,39 @@ vdev_initialize_restart(vdev_t *vd)
 	    vd->vdev_spa->spa_load_thread == curthread);
 	ASSERT(!spa_config_held(vd->vdev_spa, SCL_ALL, RW_WRITER));
 
+	/*
+	 * A failed pool reads only the leaf ZAPs that are cached (see
+	 * dbuf_read_impl()), and nothing that a restarted initialize thread
+	 * writes would reach its disks, so keep the in-core state.  The
+	 * pool can still fail while we walk the tree, so a lookup can
+	 * fail then too.
+	 */
+	if (spa_failed(vd->vdev_spa))
+		return;
+
 	if (vd->vdev_leaf_zap != 0) {
 		mutex_enter(&vd->vdev_initialize_lock);
 		uint64_t initialize_state = VDEV_INITIALIZE_NONE;
 		int err = zap_lookup(vd->vdev_spa->spa_meta_objset,
 		    vd->vdev_leaf_zap, VDEV_LEAF_ZAP_INITIALIZE_STATE,
 		    sizeof (initialize_state), 1, &initialize_state);
-		ASSERT(err == 0 || err == ENOENT);
+		ASSERT(err == 0 || err == ENOENT ||
+		    spa_failed(vd->vdev_spa));
 		vd->vdev_initialize_state = initialize_state;
 
 		uint64_t timestamp = 0;
 		err = zap_lookup(vd->vdev_spa->spa_meta_objset,
 		    vd->vdev_leaf_zap, VDEV_LEAF_ZAP_INITIALIZE_ACTION_TIME,
 		    sizeof (timestamp), 1, &timestamp);
-		ASSERT(err == 0 || err == ENOENT);
+		ASSERT(err == 0 || err == ENOENT ||
+		    spa_failed(vd->vdev_spa));
 		vd->vdev_initialize_action_time = (time_t)timestamp;
 
 		if (vd->vdev_initialize_state == VDEV_INITIALIZE_SUSPENDED ||
 		    vd->vdev_offline) {
 			/* load progress for reporting, but don't resume */
-			VERIFY0(vdev_initialize_load(vd));
+			VERIFY(vdev_initialize_load(vd) == 0 ||
+			    spa_failed(vd->vdev_spa));
 		} else if (vd->vdev_initialize_state ==
 		    VDEV_INITIALIZE_ACTIVE && vdev_writeable(vd) &&
 		    !vd->vdev_top->vdev_removing &&

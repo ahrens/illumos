@@ -1101,30 +1101,44 @@ vdev_trim_restart(vdev_t *vd)
 	    vd->vdev_spa->spa_load_thread == curthread);
 	ASSERT(!spa_config_held(vd->vdev_spa, SCL_ALL, RW_WRITER));
 
+	/*
+	 * A failed pool reads only the leaf ZAPs that are cached (see
+	 * dbuf_read_impl()), and nothing that a restarted TRIM thread
+	 * writes would reach its disks, so keep the in-core state.  The
+	 * pool can still fail while we walk the tree, so a lookup can
+	 * fail then too.
+	 */
+	if (spa_failed(vd->vdev_spa))
+		return;
+
 	if (vd->vdev_leaf_zap != 0) {
 		mutex_enter(&vd->vdev_trim_lock);
 		uint64_t trim_state = VDEV_TRIM_NONE;
 		int err = zap_lookup(vd->vdev_spa->spa_meta_objset,
 		    vd->vdev_leaf_zap, VDEV_LEAF_ZAP_TRIM_STATE,
 		    sizeof (trim_state), 1, &trim_state);
-		ASSERT(err == 0 || err == ENOENT);
+		ASSERT(err == 0 || err == ENOENT ||
+		    spa_failed(vd->vdev_spa));
 		vd->vdev_trim_state = trim_state;
 
 		uint64_t timestamp = 0;
 		err = zap_lookup(vd->vdev_spa->spa_meta_objset,
 		    vd->vdev_leaf_zap, VDEV_LEAF_ZAP_TRIM_ACTION_TIME,
 		    sizeof (timestamp), 1, &timestamp);
-		ASSERT(err == 0 || err == ENOENT);
+		ASSERT(err == 0 || err == ENOENT ||
+		    spa_failed(vd->vdev_spa));
 		vd->vdev_trim_action_time = (time_t)timestamp;
 
 		if (vd->vdev_trim_state == VDEV_TRIM_SUSPENDED ||
 		    vd->vdev_offline) {
 			/* load progress for reporting, but don't resume */
-			VERIFY0(vdev_trim_load(vd));
+			VERIFY(vdev_trim_load(vd) == 0 ||
+			    spa_failed(vd->vdev_spa));
 		} else if (vd->vdev_trim_state == VDEV_TRIM_ACTIVE &&
 		    vdev_writeable(vd) && !vd->vdev_top->vdev_removing &&
 		    vd->vdev_trim_thread == NULL) {
-			VERIFY0(vdev_trim_load(vd));
+			VERIFY(vdev_trim_load(vd) == 0 ||
+			    spa_failed(vd->vdev_spa));
 			vdev_trim(vd, vd->vdev_trim_rate,
 			    vd->vdev_trim_partial, vd->vdev_trim_secure);
 		}
