@@ -2594,6 +2594,11 @@ file path=opt/zfs-tests/tests/functional/failmode/forced_export_slow mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_stuck_vop \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol mode=0555
+file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_closing \
+    mode=0555
+file \
+    path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_closing_continue \
+    mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_continue \
     mode=0555
 file path=opt/zfs-tests/tests/functional/failmode/forced_export_zvol_death \

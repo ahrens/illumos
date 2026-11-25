@@ -109,6 +109,7 @@ static char *zvol_tag = "zvol_tag";
  * e.g., an open doesn't get a spurious EBUSY.
  */
 kmutex_t zfsdev_state_lock;
+static kcondvar_t zvol_close_cv;
 static uint32_t zvol_minors;
 
 /*
@@ -157,6 +158,12 @@ static kmutex_t zvol_list_lock;
  *			Set and cleared with both zfsdev_state_lock and
  *			zv_state_lock held, so either one is enough to test
  *			it.
+ * ZVOL_CLOSING -	zvol_last_close_unlocked() is doing the last close
+ *			without zfsdev_state_lock.  Set and cleared with both
+ *			locks held, like ZVOL_FAILING.  Opens, resizes and
+ *			removals of the volume wait for it to clear (see
+ *			zvol_wait_close()), and zvol_fail_minors() leaves the
+ *			volume to it.
  */
 enum zio_flags {
 	ZVOL_RDONLY		= 1 << 0,
@@ -171,6 +178,7 @@ enum zio_flags {
 	ZVOL_FAILED		= 1 << 8,
 	ZVOL_EXTERNAL		= 1 << 9,
 	ZVOL_FAILING		= 1 << 10,
+	ZVOL_CLOSING		= 1 << 11,
 };
 
 /*
@@ -238,6 +246,7 @@ boolean_t zvol_unmap_sync_enabled = B_FALSE;
 extern int zfs_set_prop_nvlist(const char *, zprop_source_t,
     nvlist_t *, nvlist_t *);
 static int zvol_remove_zv(zvol_state_t *);
+static boolean_t zvol_wait_close(zvol_state_t *);
 static int zvol_get_data(void *arg, uint64_t arg2, lr_write_t *lr, char *buf,
     struct lwb *lwb, zio_t *zio);
 static int zvol_dumpify(zvol_state_t *zv);
@@ -786,9 +795,11 @@ zvol_remove_zv(zvol_state_t *zv)
 	minor_t minor = zv->zv_minor;
 
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+	ASSERT(!(zv->zv_flags & ZVOL_CLOSING));
 	/*
-	 * The zero thread closes its open without zfsdev_state_lock; once we
-	 * have had zv_state_lock, it is done with the volume.
+	 * The zero thread closes an open other than the last one without
+	 * zfsdev_state_lock (see zvol_zero_thread()); once we have had
+	 * zv_state_lock, it is done with the volume.
 	 */
 	mutex_enter(&zv->zv_state_lock);
 	boolean_t busy = zv->zv_total_opens != 0 ||
@@ -831,7 +842,10 @@ zvol_remove_minor(const char *name)
 	int rc;
 
 	mutex_enter(&zfsdev_state_lock);
-	if ((zv = zvol_minor_lookup(name)) == NULL) {
+	do {
+		zv = zvol_minor_lookup(name);
+	} while (zv != NULL && zvol_wait_close(zv));
+	if (zv == NULL) {
 		mutex_exit(&zfsdev_state_lock);
 		return (SET_ERROR(ENXIO));
 	}
@@ -950,6 +964,46 @@ zvol_last_close(zvol_state_t *zv)
 
 	dmu_objset_disown(zv->zv_objset, 1, zv);
 	zv->zv_objset = NULL;
+}
+
+/*
+ * Do the last close without holding zfsdev_state_lock, which every zvol
+ * open, close and ioctl needs: the last close waits for a txg to sync.
+ * Anything that would open, resize or remove this zvol meanwhile waits for
+ * the close to finish (see zvol_wait_close()), and zvol_fail_minors() leaves
+ * the volume to it.  We keep zv_state_lock, which zvol_last_close() needs:
+ * what else takes it either waits for the close first or needs the volume
+ * open.
+ */
+static void
+zvol_last_close_unlocked(zvol_state_t *zv)
+{
+	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
+	ASSERT0(zv->zv_total_opens);
+
+	zv->zv_flags |= ZVOL_CLOSING;
+	mutex_exit(&zfsdev_state_lock);
+	zvol_last_close(zv);
+	mutex_exit(&zv->zv_state_lock);
+	mutex_enter(&zfsdev_state_lock);
+	mutex_enter(&zv->zv_state_lock);
+	zv->zv_flags &= ~ZVOL_CLOSING;
+	cv_broadcast(&zvol_close_cv);
+}
+
+/*
+ * If zv is in its last close, wait for that to finish.  Returns B_TRUE if
+ * we waited, in which case zv may have been removed, so look it up again.
+ */
+static boolean_t
+zvol_wait_close(zvol_state_t *zv)
+{
+	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+	if (!(zv->zv_flags & ZVOL_CLOSING))
+		return (B_FALSE);
+	cv_wait(&zvol_close_cv, &zfsdev_state_lock);
+	return (B_TRUE);
 }
 
 static uint64_t
@@ -1124,9 +1178,29 @@ zvol_zero_thread(void *arg)
 	zv->zv_zero_exit_wanted = B_FALSE;
 	zv->zv_zero_thread = NULL;
 	cv_broadcast(&zv->zv_state_cv);
-	mutex_exit(&zv->zv_state_lock);
 
-	zvol_close_impl(zv, OTYP_INITIALIZING);
+	/*
+	 * Drop our open.  If it is the last one, do the last close as
+	 * zvol_close() would, with zfsdev_state_lock, so that the close itself
+	 * runs without it (see zvol_last_close_unlocked()).  Otherwise drop it
+	 * here, without that lock: it comes before zv_state_lock, and a thread
+	 * that waits for us may hold it (zvol_dumpify(), whose own open means
+	 * that ours isn't the last).  Until we have the lock, our open keeps
+	 * the volume, which is then a raw one, from being closed or removed,
+	 * and from getting another zero thread, which for a raw volume only a
+	 * first open starts (see zvol_prealloc()).
+	 */
+	ASSERT3U(zv->zv_open_count[OTYP_INITIALIZING], ==, 1);
+	if (zv->zv_total_opens > 1) {
+		zv->zv_open_count[OTYP_INITIALIZING]--;
+		zv->zv_total_opens--;
+		mutex_exit(&zv->zv_state_lock);
+	} else {
+		mutex_exit(&zv->zv_state_lock);
+		mutex_enter(&zfsdev_state_lock);
+		zvol_close_impl(zv, OTYP_INITIALIZING);
+		mutex_exit(&zfsdev_state_lock);
+	}
 	thread_exit();
 }
 
@@ -1262,18 +1336,26 @@ zvol_remove_minors(const char *name)
 {
 	zvol_state_t *zv;
 	char *namebuf;
+	size_t len;
 	minor_t minor;
 
 	namebuf = kmem_zalloc(strlen(name) + 2, KM_SLEEP);
 	(void) strncpy(namebuf, name, strlen(name));
 	(void) strcat(namebuf, "/");
+	len = strlen(namebuf);
 	mutex_enter(&zfsdev_state_lock);
 	for (minor = 1; minor <= ZFSDEV_MAX_MINOR; minor++) {
-
-		zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
-		if (zv == NULL)
-			continue;
-		if (strncmp(namebuf, zv->zv_name, strlen(namebuf)) == 0)
+		/*
+		 * Wait only for the named pool's volumes (see
+		 * zvol_wait_close()): another pool's last close waits for
+		 * that pool, which may be suspended.
+		 */
+		do {
+			zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
+		} while (zv != NULL &&
+		    strncmp(namebuf, zv->zv_name, len) == 0 &&
+		    zvol_wait_close(zv));
+		if (zv != NULL && strncmp(namebuf, zv->zv_name, len) == 0)
 			(void) zvol_remove_zv(zv);
 	}
 	kmem_free(namebuf, strlen(name) + 2);
@@ -1311,11 +1393,13 @@ zvol_fail(zvol_state_t *zv, clock_t deadline)
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 
 	mutex_enter(&zv->zv_state_lock);
-	if (zv->zv_total_opens == 0) {
-		/* The zero thread closed the last open, without our lock. */
-		mutex_exit(&zv->zv_state_lock);
-		return (SET_ERROR(ENXIO));
-	}
+	/*
+	 * Our caller saw the volume open, and the last open is closed only
+	 * with zfsdev_state_lock held (see zvol_zero_thread()), so it isn't
+	 * in its last close either.
+	 */
+	ASSERT3U(zv->zv_total_opens, !=, 0);
+	ASSERT(!(zv->zv_flags & ZVOL_CLOSING));
 	if (zv->zv_flags & (ZVOL_EXTERNAL | ZVOL_DUMPIFIED)) {
 		/* See zvol_pinned_minors(). */
 		mutex_exit(&zv->zv_state_lock);
@@ -1364,10 +1448,17 @@ zvol_fail(zvol_state_t *zv, clock_t deadline)
 
 	mutex_enter(&zfsdev_state_lock);
 	mutex_enter(&zv->zv_state_lock);
+	/* ZVOL_FAILING kept the last close, if any, from starting. */
+	ASSERT(!(zv->zv_flags & ZVOL_CLOSING));
 	if (zv->zv_total_opens == 0) {
-		/* The last open went away meanwhile. */
+		/*
+		 * The last open went away meanwhile, so do the last close,
+		 * without zfsdev_state_lock like any other.  ZVOL_CLOSING
+		 * keeps the volume from being removed until we have the lock
+		 * again, for our caller.
+		 */
 		zv->zv_flags &= ~ZVOL_FAILING;
-		zvol_last_close(zv);
+		zvol_last_close_unlocked(zv);
 		error = SET_ERROR(ENXIO);
 	} else if (error == 0) {
 		/* I/O must never see neither flag. */
@@ -1452,7 +1543,15 @@ zvol_fail_minors(const char *name, clock_t deadline)
 	for (minor_t minor = 1; minor <= ZFSDEV_MAX_MINOR; minor++) {
 		zvol_state_t *zv = zfsdev_get_soft_state(minor, ZSST_ZVOL);
 
-		if (zv == NULL || (zv->zv_flags & ZVOL_FAILING) ||
+		/*
+		 * Leave a volume that another thread is failing or closing
+		 * (see zvol_last_close_unlocked()) to it, rather than wait
+		 * for it with no deadline: it lets go of the pool when it is
+		 * done, which the export waits for until the deadline (see
+		 * spa_export_failed_wait()).
+		 */
+		if (zv == NULL ||
+		    (zv->zv_flags & (ZVOL_FAILING | ZVOL_CLOSING)) ||
 		    strncmp(name, zv->zv_name, len) != 0 ||
 		    (zv->zv_name[len] != '/' && zv->zv_name[len] != '@'))
 			continue;
@@ -1532,7 +1631,9 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 		return (error);
 
 	mutex_enter(&zfsdev_state_lock);
-	zv = zvol_minor_lookup(name);
+	do {
+		zv = zvol_minor_lookup(name);
+	} while (zv != NULL && zvol_wait_close(zv));
 
 	if (zv == NULL) {
 		mutex_exit(&zfsdev_state_lock);
@@ -1575,6 +1676,8 @@ zvol_open_impl(zvol_state_t *zv, int flag, int otyp)
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
 
 	mutex_enter(&zv->zv_state_lock);
+	/* Our callers wait for the last close (see zvol_wait_close()). */
+	ASSERT(!(zv->zv_flags & ZVOL_CLOSING));
 	/* A volume being failed may have its last close still to come. */
 	if ((zv->zv_flags & ZVOL_FAILED) ||
 	    ((zv->zv_flags & ZVOL_FAILING) && zv->zv_total_opens == 0)) {
@@ -1613,7 +1716,7 @@ zvol_open_impl(zvol_state_t *zv, int flag, int otyp)
 	return (err);
 out:
 	if (zv->zv_total_opens == 0)
-		zvol_last_close(zv);
+		zvol_last_close_unlocked(zv);
 	mutex_exit(&zv->zv_state_lock);
 	return (err);
 }
@@ -1622,9 +1725,13 @@ out:
 int
 zvol_open(dev_t dev, int flag, int otyp, cred_t *cr)
 {
+	zvol_state_t *zv;
+
 	mutex_enter(&zfsdev_state_lock);
 
-	zvol_state_t *zv = zfsdev_get_soft_state(getminor(dev), ZSST_ZVOL);
+	do {
+		zv = zfsdev_get_soft_state(getminor(dev), ZSST_ZVOL);
+	} while (zv != NULL && zvol_wait_close(zv));
 	if (zv == NULL) {
 		mutex_exit(&zfsdev_state_lock);
 		return (SET_ERROR(ENXIO));
@@ -1639,6 +1746,8 @@ zvol_open(dev_t dev, int flag, int otyp, cred_t *cr)
 static void
 zvol_close_impl(zvol_state_t *zv, int otyp)
 {
+	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
+
 	mutex_enter(&zv->zv_state_lock);
 	if (zv->zv_flags & ZVOL_EXCL) {
 		ASSERT(zv->zv_total_opens == 1);
@@ -1666,7 +1775,7 @@ zvol_close_impl(zvol_state_t *zv, int otyp)
 		 * does it for one that it is waiting on.
 		 */
 		if (!(zv->zv_flags & (ZVOL_FAILED | ZVOL_FAILING)))
-			zvol_last_close(zv);
+			zvol_last_close_unlocked(zv);
 	}
 	mutex_exit(&zv->zv_state_lock);
 }
@@ -1688,31 +1797,13 @@ zvol_close(dev_t dev, int flag, int otyp, cred_t *cr)
 	}
 
 	/*
-	 * The last close waits for the volume's dirty data to be synced (in
-	 * zil_close() and zvol_last_close()), which can take a long time, and
-	 * every zvol open, close and ioctl needs zfsdev_state_lock.  If this
-	 * looks like the last close, wait for the data first without holding
-	 * zfsdev_state_lock, so that zvol_last_close() has nothing to wait
-	 * for.  Our open keeps the volume from being closed or removed in the
-	 * meantime (see zvol_remove_zv()).  If another open comes in, the wait
-	 * was merely unnecessary.
-	 */
-	if (zv->zv_total_opens == 1 &&
-	    !(zv->zv_flags & (ZVOL_RDONLY | ZVOL_FAILED)) &&
-	    dsl_dataset_is_dirty(dmu_objset_ds(zv->zv_objset))) {
-		mutex_exit(&zfsdev_state_lock);
-		txg_wait_synced(dmu_objset_pool(zv->zv_objset), 0);
-		mutex_enter(&zfsdev_state_lock);
-	}
-
-	/*
 	 * On a failed pool, the last close also waits for the log writes in
-	 * flight (zil_close()), which may never finish.  Fail the volume
-	 * instead (see zvol_fail()), which waits for them without
-	 * zfsdev_state_lock.  zvol_fail() gives up at a deadline, leaving the
-	 * volume open and not failed, and the log can't be closed under its
-	 * writes, so try again until it succeeds; other opens, closes and
-	 * ioctls run while it waits.  A volume that zvol_fail() refuses is
+	 * flight (zil_close()), with no deadline, and they may never finish.
+	 * Fail the volume instead (see zvol_fail()), which waits for them only
+	 * until a deadline, leaving the volume open and not failed if they are
+	 * still in flight then.  The log can't be closed under its writes, so
+	 * try again until it succeeds; other opens, closes and ioctls, and the
+	 * export, run while it waits.  A volume that zvol_fail() refuses is
 	 * closed as before, and one that it is already failing is left to it.
 	 */
 	while (zv->zv_total_opens == 1 &&
@@ -3055,6 +3146,7 @@ zvol_init(void)
 	VERIFY(ddi_soft_state_init(&zfsdev_state, sizeof (zfs_soft_state_t),
 	    1) == 0);
 	mutex_init(&zfsdev_state_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&zvol_close_cv, NULL, CV_DEFAULT, NULL);
 	mutex_init(&zvol_list_lock, NULL, MUTEX_DEFAULT, NULL);
 	list_create(&zvol_list, sizeof (zvol_state_t),
 	    offsetof(zvol_state_t, zv_list_node));
@@ -3063,6 +3155,7 @@ zvol_init(void)
 void
 zvol_fini(void)
 {
+	cv_destroy(&zvol_close_cv);
 	list_destroy(&zvol_list);
 	mutex_destroy(&zvol_list_lock);
 	mutex_destroy(&zfsdev_state_lock);
