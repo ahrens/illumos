@@ -1554,8 +1554,10 @@ zfs_domount(vfs_t *vfsp, char *osname)
 teardown:
 	/*
 	 * Give the file system up as an unmount would: zfsvfs_setup() opened
-	 * the log and registered the property callbacks.
+	 * the log and registered the property callbacks, and log replay left
+	 * vnodes in the name cache.
 	 */
+	(void) dnlc_purge_vfsp(vfsp, 0);
 	VERIFY0(zfsvfs_teardown(zfsvfs, B_TRUE, 0));
 	mutex_enter(&zfsvfs->z_os->os_user_ptr_lock);
 	dmu_objset_set_user(zfsvfs->z_os, NULL);
